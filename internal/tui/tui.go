@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"claude-migrate/internal/backup"
 	"claude-migrate/internal/session"
@@ -21,6 +23,31 @@ var (
 	helpStyle         = list.DefaultStyles().HelpStyle.PaddingLeft(4).PaddingBottom(1)
 	checkMark         = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).SetString("[x]")
 	uncheckMark       = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).SetString("[ ]")
+
+	detailBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("170")).
+			Padding(1, 2).
+			MarginLeft(2).
+			Width(76)
+
+	detailTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("170")).
+				MarginBottom(1)
+
+	detailLabelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("243"))
+
+	detailValueStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("255"))
+
+	userMsgStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("39")).
+			Bold(true)
+
+	assistantMsgStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("35"))
 )
 
 type SessionItem struct {
@@ -57,20 +84,27 @@ func (i SessionItem) FilterValue() string {
 }
 
 type Model struct {
-	list       list.Model
-	selected   map[string]bool
-	claudeDir  string
-	outputPath string
-	quitting   bool
-	done       bool
+	list           list.Model
+	selected       map[string]bool
+	claudeDir      string
+	outputPath     string
+	quitting       bool
+	done           bool
+	showingDetails bool
+	detailMessages []session.Message
+	detailSession  *session.Session
+	windowWidth    int
+	windowHeight   int
 }
 
 type keyMap struct {
-	Toggle key.Binding
-	All    key.Binding
-	None   key.Binding
-	Backup key.Binding
-	Quit   key.Binding
+	Toggle  key.Binding
+	All     key.Binding
+	None    key.Binding
+	Backup  key.Binding
+	Quit    key.Binding
+	Info    key.Binding
+	EscInfo key.Binding
 }
 
 var keys = keyMap{
@@ -94,6 +128,13 @@ var keys = keyMap{
 		key.WithKeys("q", "ctrl+c"),
 		key.WithHelp("q", "quit"),
 	),
+	Info: key.NewBinding(
+		key.WithKeys("i"),
+		key.WithHelp("i", "info"),
+	),
+	EscInfo: key.NewBinding(
+		key.WithKeys("esc", "i"),
+	),
 }
 
 func (m Model) Init() tea.Cmd {
@@ -103,15 +144,37 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.windowWidth = msg.Width
+		m.windowHeight = msg.Height
 		m.list.SetWidth(msg.Width)
 		m.list.SetHeight(msg.Height - 4)
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.showingDetails {
+			if key.Matches(msg, keys.EscInfo) {
+				m.showingDetails = false
+				m.detailMessages = nil
+				m.detailSession = nil
+				return m, nil
+			}
+			return m, nil
+		}
+
 		switch {
 		case key.Matches(msg, keys.Quit):
 			m.quitting = true
 			return m, tea.Quit
+
+		case key.Matches(msg, keys.Info):
+			if item, ok := m.list.SelectedItem().(SessionItem); ok {
+				m.showingDetails = true
+				m.detailSession = &item.Session
+				encodedPath := strings.ReplaceAll(item.Session.Directory, "/", "-")
+				sessionPath := filepath.Join(m.claudeDir, "projects", encodedPath, item.Session.ID+".jsonl")
+				m.detailMessages = session.GetLastMessages(sessionPath, 6)
+			}
+			return m, nil
 
 		case key.Matches(msg, keys.Toggle):
 			if item, ok := m.list.SelectedItem().(SessionItem); ok {
@@ -180,6 +243,10 @@ func (m Model) View() string {
 		return fmt.Sprintf("Creating backup of %d sessions...\n", count)
 	}
 
+	if m.showingDetails && m.detailSession != nil {
+		return m.renderDetailsView()
+	}
+
 	count := 0
 	for _, v := range m.selected {
 		if v {
@@ -188,9 +255,71 @@ func (m Model) View() string {
 	}
 
 	header := titleStyle.Render(fmt.Sprintf("Claude Code Sessions (%d selected)", count))
-	help := helpStyle.Render("space: toggle | a: all | n: none | b: backup | q: quit")
+	help := helpStyle.Render("space: toggle | a: all | n: none | b: backup | i: info | q: quit")
 
 	return fmt.Sprintf("%s\n%s\n%s", header, m.list.View(), help)
+}
+
+func (m Model) renderDetailsView() string {
+	sess := m.detailSession
+
+	var sb strings.Builder
+
+	sb.WriteString(detailTitleStyle.Render("Session Details"))
+	sb.WriteString("\n\n")
+
+	sb.WriteString(detailLabelStyle.Render("Directory:  "))
+	sb.WriteString(detailValueStyle.Render(sess.Directory))
+	sb.WriteString("\n")
+
+	sb.WriteString(detailLabelStyle.Render("Session ID: "))
+	sb.WriteString(detailValueStyle.Render(sess.ID))
+	sb.WriteString("\n")
+
+	sb.WriteString(detailLabelStyle.Render("Messages:   "))
+	sb.WriteString(detailValueStyle.Render(fmt.Sprintf("%d", sess.MessageCount)))
+	sb.WriteString("\n")
+
+	sb.WriteString(detailLabelStyle.Render("Size:       "))
+	sb.WriteString(detailValueStyle.Render(utils.HumanSize(sess.SizeBytes)))
+	sb.WriteString("\n")
+
+	sb.WriteString(detailLabelStyle.Render("Last used:  "))
+	sb.WriteString(detailValueStyle.Render(sess.Timestamp.Format("2006-01-02 15:04:05")))
+	sb.WriteString("\n")
+
+	if sess.Model != "" {
+		sb.WriteString(detailLabelStyle.Render("Model:      "))
+		sb.WriteString(detailValueStyle.Render(sess.Model))
+		sb.WriteString("\n")
+	}
+
+	if len(m.detailMessages) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString(detailTitleStyle.Render(fmt.Sprintf("Last %d messages:", len(m.detailMessages))))
+		sb.WriteString("\n\n")
+
+		for _, msg := range m.detailMessages {
+			prefix := userMsgStyle.Render("You: ")
+			if msg.Type == "assistant" {
+				prefix = assistantMsgStyle.Render("Claude: ")
+			}
+
+			content := msg.Content
+			if len(content) > 100 {
+				content = content[:97] + "..."
+			}
+			content = strings.ReplaceAll(content, "\n", " ")
+
+			sb.WriteString(prefix)
+			sb.WriteString(content)
+			sb.WriteString("\n\n")
+		}
+	}
+
+	sb.WriteString(detailLabelStyle.Render("\nPress 'i' or 'esc' to go back"))
+
+	return detailBoxStyle.Render(sb.String())
 }
 
 func RunInteractiveBackup(claudeDir, outputPath string) error {

@@ -115,6 +115,26 @@ func LoadSessions(claudeDir string) ([]Session, error) {
 	return sessions, nil
 }
 
+func extractTextContent(content interface{}) string {
+	if text, ok := content.(string); ok {
+		return text
+	}
+
+	if arr, ok := content.([]interface{}); ok {
+		for _, item := range arr {
+			if obj, ok := item.(map[string]interface{}); ok {
+				if objType, _ := obj["type"].(string); objType == "text" {
+					if text, ok := obj["text"].(string); ok {
+						return text
+					}
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
 func CountMessages(path string) (int, string, string) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -136,7 +156,8 @@ func CountMessages(path string) (int, string, string) {
 
 		if msgType, ok := msg["type"].(string); ok && msgType == "user" {
 			if content, ok := msg["message"].(map[string]interface{}); ok {
-				if text, ok := content["content"].(string); ok && len(text) > 0 {
+				text := extractTextContent(content["content"])
+				if text != "" {
 					if firstPreview == "" {
 						if len(text) > 60 {
 							firstPreview = text[:57] + "..."
@@ -155,4 +176,56 @@ func CountMessages(path string) (int, string, string) {
 	}
 
 	return count, firstPreview, lastPreview
+}
+
+type Message struct {
+	Type      string
+	Content   string
+	Timestamp string
+}
+
+func GetLastMessages(path string, n int) []Message {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var messages []Message
+	decoder := json.NewDecoder(f)
+
+	for {
+		var msg map[string]interface{}
+		if err := decoder.Decode(&msg); err != nil {
+			break
+		}
+
+		msgType, _ := msg["type"].(string)
+		if msgType != "user" && msgType != "assistant" {
+			continue
+		}
+
+		content := ""
+		if msgContent, ok := msg["message"].(map[string]interface{}); ok {
+			content = extractTextContent(msgContent["content"])
+		}
+
+		timestamp := ""
+		if ts, ok := msg["timestamp"].(string); ok {
+			timestamp = ts
+		}
+
+		if content != "" {
+			messages = append(messages, Message{
+				Type:      msgType,
+				Content:   content,
+				Timestamp: timestamp,
+			})
+		}
+	}
+
+	if len(messages) <= n {
+		return messages
+	}
+	return messages[len(messages)-n:]
 }
