@@ -1,0 +1,40 @@
+[package]
+name = "claude-migrate"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Backup, restore and migrate Claude Code sessions across machines with lossless path remapping"
+repository = "https://github.com/vynazevedo/claude-migrate"
+license = "MIT"
+keywords = ["claude", "cli", "backup", "migration", "tui"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "claude-migrate"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+hex = "0.4"
+ratatui = "0.29"
+crossterm = "0.28"
+walkdir = "2"
+anyhow = "1"
+thiserror = "2"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
