@@ -23,34 +23,50 @@ pub struct SessionFiles {
     pub todos: Vec<(String, Vec<u8>)>,
 }
 
-/// In-memory view of a loaded archive: the manifest, per-session files, and
-/// any global `extras/` (relative path under `~/.claude`, bytes).
+/// In-memory view of a loaded archive: the manifest, per-session files, any
+/// global `extras/`, and any global `config/` (each as relative-path/bytes).
 pub struct LoadedBackup {
     pub manifest: Manifest,
     pub data: BTreeMap<String, SessionFiles>,
     pub extras: Vec<(String, Vec<u8>)>,
+    pub config: Vec<(String, Vec<u8>)>,
 }
 
-fn is_path_safe(base: &Path, target: &Path) -> bool {
-    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    // target may not exist yet; resolve lexically against base.
-    let joined = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        base.join(target)
-    };
-    let mut normalized = PathBuf::new();
-    for comp in joined.components() {
+/// Removes `.` and `..` components lexically, without touching the filesystem
+/// (so it is portable and works for paths that do not exist yet).
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
         use std::path::Component::*;
         match comp {
             ParentDir => {
-                normalized.pop();
+                out.pop();
             }
             CurDir => {}
-            other => normalized.push(other.as_os_str()),
+            other => out.push(other.as_os_str()),
         }
     }
-    normalized.starts_with(&base)
+    out
+}
+
+/// True when `target` stays within `base` after resolving `..`. Purely lexical:
+/// `canonicalize` is avoided because it resolves symlinks (macOS temp dirs live
+/// under a symlinked `/var`) and adds verbatim prefixes on Windows, both of
+/// which produce spurious mismatches.
+fn is_path_safe(base: &Path, target: &Path) -> bool {
+    let base_abs = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(base))
+            .unwrap_or_else(|_| base.to_path_buf())
+    };
+    let target_abs = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base_abs.join(target)
+    };
+    normalize_lexical(&target_abs).starts_with(normalize_lexical(&base_abs))
 }
 
 /// Reads and parses the archive into memory. Rejects entries with unsafe
@@ -63,6 +79,7 @@ pub fn load_backup(path: &Path) -> Result<LoadedBackup> {
     let mut manifest: Option<Manifest> = None;
     let mut data: BTreeMap<String, SessionFiles> = BTreeMap::new();
     let mut extras: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut config: Vec<(String, Vec<u8>)> = Vec::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -83,6 +100,13 @@ pub fn load_backup(path: &Path) -> Result<LoadedBackup> {
         if let Some(rel) = name.strip_prefix("extras/") {
             if !rel.is_empty() {
                 extras.push((rel.to_string(), bytes));
+            }
+            continue;
+        }
+
+        if let Some(rel) = name.strip_prefix("config/") {
+            if !rel.is_empty() {
+                config.push((rel.to_string(), bytes));
             }
             continue;
         }
@@ -127,6 +151,7 @@ pub fn load_backup(path: &Path) -> Result<LoadedBackup> {
         manifest,
         data,
         extras,
+        config,
     })
 }
 
@@ -232,6 +257,10 @@ pub struct RestoreOptions {
     pub dry_run: bool,
     pub rewrite_tool_paths: bool,
     pub restore_history: bool,
+    /// Apply the archived global config bundle, if present.
+    pub apply_config: bool,
+    /// Overwrite existing config files / MCP servers instead of keeping them.
+    pub overwrite_config: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,7 +470,12 @@ mod tests {
     #[test]
     fn path_safe_rejects_traversal() {
         let base = std::env::temp_dir();
+        // a child path is safe even when base is under a symlink (macOS /var)
+        // or has no verbatim prefix (Windows) - this is fully lexical now.
         assert!(is_path_safe(&base, &base.join("projects/x")));
-        assert!(!is_path_safe(&base, Path::new("/etc/passwd")));
+        // `..` that escapes base is rejected
+        assert!(!is_path_safe(&base, &base.join("../../etc/passwd")));
+        // an unrelated absolute path is rejected
+        assert!(!is_path_safe(&base, Path::new("/some/other/root")));
     }
 }
