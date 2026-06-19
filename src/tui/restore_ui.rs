@@ -41,6 +41,7 @@ struct RestoreApp {
     rows: Vec<MapRow>,
     focus: usize,
     results: Option<Results>,
+    extras_restored: Option<usize>,
     cancelled: bool,
 }
 
@@ -69,6 +70,7 @@ impl RestoreApp {
             rows: Vec::new(),
             focus: 0,
             results: None,
+            extras_restored: None,
             cancelled: false,
         }
     }
@@ -147,6 +149,13 @@ impl RestoreApp {
         let sessions = self.selected_sessions();
         let results = restore::restore_sessions(&sessions, &self.loaded.data, &opts, |_, _, _| {})?;
         self.results = Some(results);
+        if !self.loaded.extras.is_empty() {
+            self.extras_restored = Some(restore::restore_extras(
+                &self.claude_dir,
+                &self.loaded,
+                self.dry_run,
+            ));
+        }
         self.step = Step::Done;
         Ok(())
     }
@@ -374,6 +383,9 @@ impl RestoreApp {
             lines.push(Line::from(format!(
                 "JSONL lines with rewritten cwd: {rewritten}"
             )));
+            if let Some(n) = self.extras_restored {
+                lines.push(Line::from(format!("Extras restored: {n} files")));
+            }
             for d in &r.details {
                 if let Some(c) = &d.case_collision {
                     lines.push(Line::from(Span::styled(

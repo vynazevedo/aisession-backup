@@ -33,6 +33,9 @@ enum Commands {
         /// Output file path (default: claude-backup-<timestamp>.tar.gz).
         #[arg(short, long)]
         output: Option<String>,
+        /// Also archive global state: shell-snapshots, file-history, plans.
+        #[arg(long)]
+        full: bool,
     },
     /// Restore sessions from a backup, remapping paths as needed.
     Restore {
@@ -72,7 +75,7 @@ pub fn run() -> Result<()> {
     crate::tui::set_verbose(cli.verbose);
 
     match cli.command {
-        Commands::Backup { output } => cmd_backup(output),
+        Commands::Backup { output, full } => cmd_backup(output, full),
         Commands::Restore {
             backup_file,
             dest,
@@ -106,7 +109,7 @@ pub fn expand_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn cmd_backup(output: Option<String>) -> Result<()> {
+fn cmd_backup(output: Option<String>, full: bool) -> Result<()> {
     let claude_dir = expand_path("~/.claude");
     let output = output.unwrap_or_else(|| {
         format!(
@@ -114,7 +117,7 @@ fn cmd_backup(output: Option<String>) -> Result<()> {
             chrono::Local::now().format("%Y%m%d-%H%M%S")
         )
     });
-    crate::tui::run_backup(&claude_dir, Path::new(&output))
+    crate::tui::run_backup(&claude_dir, Path::new(&output), full)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -171,6 +174,11 @@ fn cmd_restore(
     )?;
 
     print_results(&results, dry_run);
+
+    if !loaded.extras.is_empty() {
+        let n = restore::restore_extras(&opts.claude_dir, &loaded, dry_run);
+        println!("  Extras restored: {n} files (shell-snapshots, file-history, plans)");
+    }
     Ok(())
 }
 

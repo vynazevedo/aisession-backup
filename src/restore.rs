@@ -23,10 +23,12 @@ pub struct SessionFiles {
     pub todos: Vec<(String, Vec<u8>)>,
 }
 
-/// In-memory view of a loaded archive: the manifest plus per-session files.
+/// In-memory view of a loaded archive: the manifest, per-session files, and
+/// any global `extras/` (relative path under `~/.claude`, bytes).
 pub struct LoadedBackup {
     pub manifest: Manifest,
     pub data: BTreeMap<String, SessionFiles>,
+    pub extras: Vec<(String, Vec<u8>)>,
 }
 
 fn is_path_safe(base: &Path, target: &Path) -> bool {
@@ -60,6 +62,7 @@ pub fn load_backup(path: &Path) -> Result<LoadedBackup> {
 
     let mut manifest: Option<Manifest> = None;
     let mut data: BTreeMap<String, SessionFiles> = BTreeMap::new();
+    let mut extras: Vec<(String, Vec<u8>)> = Vec::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -74,6 +77,13 @@ pub fn load_backup(path: &Path) -> Result<LoadedBackup> {
 
         if name == "manifest.json" {
             manifest = Some(serde_json::from_slice(&bytes).context("parsing manifest.json")?);
+            continue;
+        }
+
+        if let Some(rel) = name.strip_prefix("extras/") {
+            if !rel.is_empty() {
+                extras.push((rel.to_string(), bytes));
+            }
             continue;
         }
 
@@ -113,7 +123,37 @@ pub fn load_backup(path: &Path) -> Result<LoadedBackup> {
         anyhow::bail!("invalid backup: no sessions in manifest");
     }
 
-    Ok(LoadedBackup { manifest, data })
+    Ok(LoadedBackup {
+        manifest,
+        data,
+        extras,
+    })
+}
+
+/// Writes archived `extras/` back under `claude_dir`, never clobbering an
+/// existing file. Returns the number of files written. Extras are auxiliary
+/// state and are restored verbatim (paths inside are not remapped).
+pub fn restore_extras(claude_dir: &Path, backup: &LoadedBackup, dry_run: bool) -> usize {
+    let mut written = 0;
+    for (rel, bytes) in &backup.extras {
+        let dest = claude_dir.join(rel);
+        if !is_path_safe(claude_dir, &dest) || dest.exists() {
+            continue;
+        }
+        if dry_run {
+            written += 1;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        if fs::write(&dest, bytes).is_ok() {
+            written += 1;
+        }
+    }
+    written
 }
 
 /// Re-hashes the actual archived bytes and checks them against the per-artifact

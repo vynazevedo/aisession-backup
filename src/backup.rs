@@ -144,8 +144,20 @@ fn write_entry<W: Write>(builder: &mut tar::Builder<W>, name: &str, data: &[u8])
     Ok(())
 }
 
-/// Creates the archive at `output` for the selected sessions.
-pub fn create(selected: &[DiscoveredSession], output: &Path) -> Result<Manifest> {
+/// Global auxiliary directories archived under `extras/` when `--full` is set.
+/// They are session-adjacent state (shell snapshots referenced by absolute
+/// path in the JSONL, file-history undo data, plan-mode notes) that is not
+/// tied to a single session id, so it is archived wholesale and verbatim.
+pub const EXTRA_DIRS: &[&str] = &["shell-snapshots", "file-history", "plans"];
+
+/// Creates the archive at `output` for the selected sessions. When
+/// `include_extras` is set, the global `EXTRA_DIRS` are archived too.
+pub fn create(
+    selected: &[DiscoveredSession],
+    output: &Path,
+    claude_dir: &Path,
+    include_extras: bool,
+) -> Result<Manifest> {
     let (manifest, files) = plan(selected)?;
 
     let out_file =
@@ -167,9 +179,46 @@ pub fn create(selected: &[DiscoveredSession], output: &Path) -> Result<Manifest>
         builder.append_data(&mut header, archive_name, file)?;
     }
 
+    if include_extras {
+        archive_extras(&mut builder, claude_dir)?;
+    }
+
     let encoder = builder.into_inner()?;
     encoder.finish()?;
     Ok(manifest)
+}
+
+/// Walks each `EXTRA_DIRS` entry and appends its files under `extras/<dir>/...`.
+fn archive_extras<W: Write>(builder: &mut tar::Builder<W>, claude_dir: &Path) -> Result<()> {
+    for dir in EXTRA_DIRS {
+        let base = claude_dir.join(dir);
+        if !base.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&base)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let rel = match path.strip_prefix(claude_dir) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let archive_name = format!("extras/{}", rel.to_string_lossy().replace('\\', "/"));
+            let mut header = tar::Header::new_gnu();
+            let meta = std::fs::metadata(path)?;
+            header.set_size(meta.len());
+            header.set_mode(0o644);
+            header.set_mtime(Utc::now().timestamp() as u64);
+            header.set_cksum();
+            let file = File::open(path)?;
+            builder.append_data(&mut header, &archive_name, file)?;
+        }
+    }
+    Ok(())
 }
 
 /// Verifies that a manifest's recorded global checksum matches its artifacts.

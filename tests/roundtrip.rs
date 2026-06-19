@@ -73,7 +73,7 @@ fn full_roundtrip_linux_to_macos() {
     );
 
     // backup
-    let manifest = backup::create(&discovered, &archive).unwrap();
+    let manifest = backup::create(&discovered, &archive, &src, false).unwrap();
     assert_eq!(manifest.schema_version, 2);
     assert!(backup::manifest_self_consistent(&manifest));
 
@@ -138,6 +138,44 @@ fn full_roundtrip_linux_to_macos() {
 }
 
 #[test]
+fn full_backup_includes_and_restores_extras() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src/.claude");
+    let dst = tmp.path().join("dst/.claude");
+    let archive = tmp.path().join("backup.tar.gz");
+    build_source(&src);
+
+    // global auxiliary state
+    write(
+        &src.join("shell-snapshots").join("snapshot-zsh-1.sh"),
+        b"export FOO=bar\n",
+    );
+    write(&src.join("plans").join("nice-plan.md"), b"# plan\n");
+    write(
+        &src.join("file-history").join("abc").join("0.json"),
+        b"{\"v\":1}",
+    );
+
+    let discovered = discover::load_sessions(&src).unwrap();
+    backup::create(&discovered, &archive, &src, true).unwrap();
+    let loaded = restore::load_backup(&archive).unwrap();
+    assert_eq!(loaded.extras.len(), 3, "three extra files archived");
+
+    let n = restore::restore_extras(&dst, &loaded, false);
+    assert_eq!(n, 3, "three extra files restored");
+    assert!(dst
+        .join("shell-snapshots")
+        .join("snapshot-zsh-1.sh")
+        .exists());
+    assert!(dst.join("plans").join("nice-plan.md").exists());
+    assert!(dst.join("file-history").join("abc").join("0.json").exists());
+
+    // re-running does not clobber existing extras
+    let again = restore::restore_extras(&dst, &loaded, false);
+    assert_eq!(again, 0, "existing extras are not overwritten");
+}
+
+#[test]
 fn duplicate_restore_is_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src/.claude");
@@ -146,7 +184,7 @@ fn duplicate_restore_is_skipped() {
     build_source(&src);
 
     let discovered = discover::load_sessions(&src).unwrap();
-    backup::create(&discovered, &archive).unwrap();
+    backup::create(&discovered, &archive, &src, false).unwrap();
     let loaded = restore::load_backup(&archive).unwrap();
 
     let opts = restore::RestoreOptions {

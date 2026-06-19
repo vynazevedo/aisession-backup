@@ -198,7 +198,7 @@ impl BackupApp {
     }
 }
 
-pub fn run_backup(claude_dir: &Path, output: &Path) -> Result<()> {
+pub fn run_backup(claude_dir: &Path, output: &Path, include_extras: bool) -> Result<()> {
     let sessions = discover::load_sessions(claude_dir)?;
     if sessions.is_empty() {
         println!("No sessions found in {}", claude_dir.display());
@@ -220,12 +220,13 @@ pub fn run_backup(claude_dir: &Path, output: &Path) -> Result<()> {
     }
 
     println!("Creating backup of {} sessions...", selected.len());
-    let manifest = backup::create(&selected, output)?;
+    let manifest = backup::create(&selected, output, claude_dir, include_extras)?;
     println!(
-        "Backup written to {} ({} sessions, {}).",
+        "Backup written to {} ({} sessions, {}{}).",
         output.display(),
         manifest.sessions.len(),
-        human_size(manifest.total_size)
+        human_size(manifest.total_size),
+        if include_extras { ", with extras" } else { "" }
     );
     Ok(())
 }
