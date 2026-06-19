@@ -39,6 +39,50 @@ forma estruturada para o novo path.
 
 ## Instalação
 
+### Binário pré-compilado (recomendado)
+
+Cada release publica binários prontos. Baixe o da sua plataforma em
+[Releases](https://github.com/vynazevedo/claude-migrate/releases/latest).
+
+| Plataforma | Arquivo |
+|------------|---------|
+| Linux x86_64 | `claude-migrate-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `claude-migrate-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `claude-migrate-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `claude-migrate-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `claude-migrate-x86_64-pc-windows-msvc.zip` |
+
+**Linux / macOS** (ajuste o nome do arquivo conforme a sua plataforma):
+
+```bash
+# exemplo: Linux x86_64
+curl -L -o claude-migrate.tar.gz \
+  https://github.com/vynazevedo/claude-migrate/releases/latest/download/claude-migrate-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf claude-migrate.tar.gz
+chmod +x claude-migrate
+sudo mv claude-migrate /usr/local/bin/
+
+claude-migrate version
+```
+
+No **macOS**, se o Gatekeeper bloquear o binário (não está assinado), libere com:
+
+```bash
+xattr -d com.apple.quarantine claude-migrate
+```
+
+**Windows** (PowerShell):
+
+```powershell
+Invoke-WebRequest -Uri "https://github.com/vynazevedo/claude-migrate/releases/latest/download/claude-migrate-x86_64-pc-windows-msvc.zip" -OutFile claude-migrate.zip
+Expand-Archive claude-migrate.zip -DestinationPath .
+# mova claude-migrate.exe para uma pasta no PATH
+```
+
+### Compilar do código
+
+Requer Rust 1.74+.
+
 ```bash
 git clone https://github.com/vynazevedo/claude-migrate
 cd claude-migrate
@@ -46,8 +90,11 @@ cargo build --release
 # binário em target/release/claude-migrate
 ```
 
-Binários por plataforma são publicados em cada release (Linux x86_64/aarch64,
-macOS Intel/Apple Silicon, Windows x86_64).
+Ou direto via cargo:
+
+```bash
+cargo install --git https://github.com/vynazevedo/claude-migrate
+```
 
 ---
 
