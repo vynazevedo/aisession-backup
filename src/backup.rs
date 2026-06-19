@@ -150,13 +150,25 @@ fn write_entry<W: Write>(builder: &mut tar::Builder<W>, name: &str, data: &[u8])
 /// tied to a single session id, so it is archived wholesale and verbatim.
 pub const EXTRA_DIRS: &[&str] = &["shell-snapshots", "file-history", "plans"];
 
-/// Creates the archive at `output` for the selected sessions. When
-/// `include_extras` is set, the global `EXTRA_DIRS` are archived too.
+/// What to include in a backup beyond the selected sessions.
+#[derive(Default, Clone, Copy)]
+pub struct BackupOptions {
+    /// Archive the global `EXTRA_DIRS` (shell-snapshots, file-history, plans).
+    pub include_extras: bool,
+    /// Archive the global config (settings, CLAUDE.md, plugins, MCP servers).
+    pub include_config: bool,
+    /// When archiving config, also include login credentials (sensitive).
+    pub include_credentials: bool,
+}
+
+/// Creates the archive at `output` for the selected sessions, plus whatever
+/// `opts` requests. Returns the manifest and whether secret-bearing config was
+/// included (so the caller can warn).
 pub fn create(
     selected: &[DiscoveredSession],
     output: &Path,
     claude_dir: &Path,
-    include_extras: bool,
+    opts: BackupOptions,
 ) -> Result<Manifest> {
     let (manifest, files) = plan(selected)?;
 
@@ -179,13 +191,26 @@ pub fn create(
         builder.append_data(&mut header, archive_name, file)?;
     }
 
-    if include_extras {
+    if opts.include_extras {
         archive_extras(&mut builder, claude_dir)?;
+    }
+
+    if opts.include_config {
+        let bundle = crate::config::collect(claude_dir, opts.include_credentials);
+        for (name, bytes) in &bundle.files {
+            write_entry(&mut builder, &format!("config/{name}"), bytes)?;
+        }
     }
 
     let encoder = builder.into_inner()?;
     encoder.finish()?;
     Ok(manifest)
+}
+
+/// Reports whether a config backup of `claude_dir` would contain secrets, so
+/// the CLI can warn before writing the archive.
+pub fn config_has_secrets(claude_dir: &Path, include_credentials: bool) -> bool {
+    crate::config::collect(claude_dir, include_credentials).has_secrets
 }
 
 /// Walks each `EXTRA_DIRS` entry and appends its files under `extras/<dir>/...`.

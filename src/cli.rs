@@ -36,6 +36,15 @@ enum Commands {
         /// Also archive global state: shell-snapshots, file-history, plans.
         #[arg(long)]
         full: bool,
+        /// Also archive global config: settings, CLAUDE.md, plugins, MCP servers.
+        #[arg(long)]
+        config: bool,
+        /// With config, also include login credentials (sensitive).
+        #[arg(long)]
+        include_credentials: bool,
+        /// Shorthand for --full --config.
+        #[arg(long)]
+        all: bool,
     },
     /// Restore sessions from a backup, remapping paths as needed.
     Restore {
@@ -62,6 +71,12 @@ enum Commands {
         /// Do not verify archive checksums before restoring.
         #[arg(long)]
         no_verify_checksum: bool,
+        /// Apply the archived global config bundle, if present.
+        #[arg(long)]
+        config: bool,
+        /// With --config, overwrite existing config files and MCP servers.
+        #[arg(long)]
+        overwrite_config: bool,
     },
     /// List sessions on disk, or inside a backup file.
     List {
@@ -75,7 +90,20 @@ pub fn run() -> Result<()> {
     crate::tui::set_verbose(cli.verbose);
 
     match cli.command {
-        Commands::Backup { output, full } => cmd_backup(output, full),
+        Commands::Backup {
+            output,
+            full,
+            config,
+            include_credentials,
+            all,
+        } => {
+            let opts = backup::BackupOptions {
+                include_extras: full || all,
+                include_config: config || all || include_credentials,
+                include_credentials,
+            };
+            cmd_backup(output, opts)
+        }
         Commands::Restore {
             backup_file,
             dest,
@@ -85,18 +113,36 @@ pub fn run() -> Result<()> {
             rewrite_tool_paths,
             restore_history,
             no_verify_checksum,
-        } => cmd_restore(
-            &backup_file,
-            &dest,
-            mappings.as_deref(),
+            config,
+            overwrite_config,
+        } => cmd_restore(RestoreArgs {
+            backup_file,
+            dest,
+            mappings,
             dry_run,
             force,
             rewrite_tool_paths,
             restore_history,
             no_verify_checksum,
-        ),
+            apply_config: config,
+            overwrite_config,
+        }),
         Commands::List { backup_file } => cmd_list(backup_file.as_deref()),
     }
+}
+
+/// Parsed arguments for the restore command, to avoid a long parameter list.
+struct RestoreArgs {
+    backup_file: String,
+    dest: String,
+    mappings: Option<String>,
+    dry_run: bool,
+    force: bool,
+    rewrite_tool_paths: bool,
+    restore_history: bool,
+    no_verify_checksum: bool,
+    apply_config: bool,
+    overwrite_config: bool,
 }
 
 /// Expands a leading `~/` to the user's home directory.
@@ -109,7 +155,7 @@ pub fn expand_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn cmd_backup(output: Option<String>, full: bool) -> Result<()> {
+fn cmd_backup(output: Option<String>, opts: backup::BackupOptions) -> Result<()> {
     let claude_dir = expand_path("~/.claude");
     let output = output.unwrap_or_else(|| {
         format!(
@@ -117,49 +163,51 @@ fn cmd_backup(output: Option<String>, full: bool) -> Result<()> {
             chrono::Local::now().format("%Y%m%d-%H%M%S")
         )
     });
-    crate::tui::run_backup(&claude_dir, Path::new(&output), full)
+    if opts.include_config && backup::config_has_secrets(&claude_dir, opts.include_credentials) {
+        eprintln!(
+            "Warning: this backup includes config with secrets (MCP keys{}). Store and transfer it securely.",
+            if opts.include_credentials { " and login credentials" } else { "" }
+        );
+    }
+    crate::tui::run_backup(&claude_dir, Path::new(&output), opts)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_restore(
-    backup_file: &str,
-    dest: &str,
-    mappings: Option<&str>,
-    dry_run: bool,
-    force: bool,
-    rewrite_tool_paths: bool,
-    restore_history: bool,
-    no_verify_checksum: bool,
-) -> Result<()> {
-    let claude_dir = expand_path(dest);
-    let backup_path = PathBuf::from(backup_file);
+fn cmd_restore(args: RestoreArgs) -> Result<()> {
+    let claude_dir = expand_path(&args.dest);
+    let backup_path = PathBuf::from(&args.backup_file);
 
     // Interactive path unless the user passed mappings or --force.
-    if mappings.is_none() && !force {
+    if args.mappings.is_none() && !args.force {
         return crate::tui::run_restore(
             &backup_path,
             &claude_dir,
-            dry_run,
-            rewrite_tool_paths,
-            restore_history,
-            no_verify_checksum,
+            crate::tui::RestoreFlags {
+                dry_run: args.dry_run,
+                rewrite_tool_paths: args.rewrite_tool_paths,
+                restore_history: args.restore_history,
+                no_verify_checksum: args.no_verify_checksum,
+                apply_config: args.apply_config,
+                overwrite_config: args.overwrite_config,
+            },
         );
     }
 
-    let parsed = parse_mappings(mappings.unwrap_or(""))?;
+    let parsed = parse_mappings(args.mappings.as_deref().unwrap_or(""))?;
 
     let loaded = restore::load_backup(&backup_path)?;
-    verify_or_bail(&loaded, no_verify_checksum)?;
+    verify_or_bail(&loaded, args.no_verify_checksum)?;
 
     let opts = RestoreOptions {
         claude_dir,
         mappings: parsed,
-        dry_run,
-        rewrite_tool_paths,
-        restore_history,
+        dry_run: args.dry_run,
+        rewrite_tool_paths: args.rewrite_tool_paths,
+        restore_history: args.restore_history,
+        apply_config: args.apply_config,
+        overwrite_config: args.overwrite_config,
     };
 
-    if dry_run {
+    if args.dry_run {
         println!("=== DRY RUN ===");
     }
     println!("Restoring {} sessions...\n", loaded.manifest.sessions.len());
@@ -173,11 +221,26 @@ fn cmd_restore(
         },
     )?;
 
-    print_results(&results, dry_run);
+    print_results(&results, args.dry_run);
 
     if !loaded.extras.is_empty() {
-        let n = restore::restore_extras(&opts.claude_dir, &loaded, dry_run);
+        let n = restore::restore_extras(&opts.claude_dir, &loaded, args.dry_run);
         println!("  Extras restored: {n} files (shell-snapshots, file-history, plans)");
+    }
+
+    if opts.apply_config && !loaded.config.is_empty() {
+        let report = crate::config::restore_config(
+            &opts.claude_dir,
+            &loaded.config,
+            opts.overwrite_config,
+            args.dry_run,
+        );
+        println!(
+            "  Config: {} files written, {} kept, {} MCP servers merged",
+            report.written, report.skipped, report.mcp_merged
+        );
+    } else if !loaded.config.is_empty() {
+        println!("  Config bundle present in archive; pass --config to apply it.");
     }
     Ok(())
 }

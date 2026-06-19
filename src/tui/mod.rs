@@ -17,6 +17,17 @@ use ratatui::prelude::*;
 pub use backup_ui::run_backup;
 pub use restore_ui::run_restore;
 
+/// Restore options coming from the CLI into the interactive flow.
+#[derive(Clone, Copy)]
+pub struct RestoreFlags {
+    pub dry_run: bool,
+    pub rewrite_tool_paths: bool,
+    pub restore_history: bool,
+    pub no_verify_checksum: bool,
+    pub apply_config: bool,
+    pub overwrite_config: bool,
+}
+
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_verbose(v: bool) {

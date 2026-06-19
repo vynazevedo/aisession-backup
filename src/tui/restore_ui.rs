@@ -32,9 +32,7 @@ struct MapRow {
 struct RestoreApp {
     loaded: LoadedBackup,
     claude_dir: std::path::PathBuf,
-    dry_run: bool,
-    rewrite_tool_paths: bool,
-    restore_history: bool,
+    flags: super::RestoreFlags,
     selected: Vec<bool>,
     state: ListState,
     step: Step,
@@ -42,17 +40,12 @@ struct RestoreApp {
     focus: usize,
     results: Option<Results>,
     extras_restored: Option<usize>,
+    config_restored: Option<(usize, usize, usize)>,
     cancelled: bool,
 }
 
 impl RestoreApp {
-    fn new(
-        loaded: LoadedBackup,
-        claude_dir: &Path,
-        dry_run: bool,
-        rewrite_tool_paths: bool,
-        restore_history: bool,
-    ) -> Self {
+    fn new(loaded: LoadedBackup, claude_dir: &Path, flags: super::RestoreFlags) -> Self {
         let n = loaded.manifest.sessions.len();
         let mut state = ListState::default();
         if n > 0 {
@@ -61,9 +54,7 @@ impl RestoreApp {
         Self {
             loaded,
             claude_dir: claude_dir.to_path_buf(),
-            dry_run,
-            rewrite_tool_paths,
-            restore_history,
+            flags,
             selected: vec![false; n],
             state,
             step: Step::Select,
@@ -71,6 +62,7 @@ impl RestoreApp {
             focus: 0,
             results: None,
             extras_restored: None,
+            config_restored: None,
             cancelled: false,
         }
     }
@@ -142,9 +134,11 @@ impl RestoreApp {
         let opts = RestoreOptions {
             claude_dir: self.claude_dir.clone(),
             mappings: self.mappings(),
-            dry_run: self.dry_run,
-            rewrite_tool_paths: self.rewrite_tool_paths,
-            restore_history: self.restore_history,
+            dry_run: self.flags.dry_run,
+            rewrite_tool_paths: self.flags.rewrite_tool_paths,
+            restore_history: self.flags.restore_history,
+            apply_config: self.flags.apply_config,
+            overwrite_config: self.flags.overwrite_config,
         };
         let sessions = self.selected_sessions();
         let results = restore::restore_sessions(&sessions, &self.loaded.data, &opts, |_, _, _| {})?;
@@ -153,8 +147,17 @@ impl RestoreApp {
             self.extras_restored = Some(restore::restore_extras(
                 &self.claude_dir,
                 &self.loaded,
-                self.dry_run,
+                self.flags.dry_run,
             ));
+        }
+        if self.flags.apply_config && !self.loaded.config.is_empty() {
+            let r = crate::config::restore_config(
+                &self.claude_dir,
+                &self.loaded.config,
+                self.flags.overwrite_config,
+                self.flags.dry_run,
+            );
+            self.config_restored = Some((r.written, r.skipped, r.mcp_merged));
         }
         self.step = Step::Done;
         Ok(())
@@ -316,7 +319,7 @@ impl RestoreApp {
 
     fn draw_preview(&mut self, f: &mut Frame) {
         let chunks = vchunks(f.area(), &[2, 0, 2]);
-        let title = Paragraph::new(if self.dry_run {
+        let title = Paragraph::new(if self.flags.dry_run {
             "Preview (DRY RUN)"
         } else {
             "Preview"
@@ -369,7 +372,7 @@ impl RestoreApp {
 
         let mut lines: Vec<Line> = Vec::new();
         if let Some(r) = &self.results {
-            if self.dry_run {
+            if self.flags.dry_run {
                 lines.push(Line::from(Span::styled(
                     "DRY RUN - no changes written",
                     Style::default().fg(Color::Yellow),
@@ -385,6 +388,11 @@ impl RestoreApp {
             )));
             if let Some(n) = self.extras_restored {
                 lines.push(Line::from(format!("Extras restored: {n} files")));
+            }
+            if let Some((w, s, m)) = self.config_restored {
+                lines.push(Line::from(format!(
+                    "Config: {w} files written, {s} kept, {m} MCP servers merged"
+                )));
             }
             for d in &r.details {
                 if let Some(c) = &d.case_collision {
@@ -445,14 +453,11 @@ fn help(text: &str) -> Paragraph<'_> {
 pub fn run_restore(
     backup_path: &Path,
     claude_dir: &Path,
-    dry_run: bool,
-    rewrite_tool_paths: bool,
-    restore_history: bool,
-    no_verify_checksum: bool,
+    flags: super::RestoreFlags,
 ) -> Result<()> {
     let loaded = restore::load_backup(backup_path)?;
 
-    if !no_verify_checksum {
+    if !flags.no_verify_checksum {
         let report = restore::verify_checksums(&loaded);
         if report.skipped {
             eprintln!("Note: v1 backup has no per-artifact checksums; skipping verification.");
@@ -470,13 +475,7 @@ pub fn run_restore(
         }
     }
 
-    let mut app = RestoreApp::new(
-        loaded,
-        claude_dir,
-        dry_run,
-        rewrite_tool_paths,
-        restore_history,
-    );
+    let mut app = RestoreApp::new(loaded, claude_dir, flags);
     with_terminal(|t| app.run(t))?;
 
     if app.cancelled {

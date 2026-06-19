@@ -73,7 +73,13 @@ fn full_roundtrip_linux_to_macos() {
     );
 
     // backup
-    let manifest = backup::create(&discovered, &archive, &src, false).unwrap();
+    let manifest = backup::create(
+        &discovered,
+        &archive,
+        &src,
+        backup::BackupOptions::default(),
+    )
+    .unwrap();
     assert_eq!(manifest.schema_version, 2);
     assert!(backup::manifest_self_consistent(&manifest));
 
@@ -95,6 +101,8 @@ fn full_roundtrip_linux_to_macos() {
         dry_run: false,
         rewrite_tool_paths: true,
         restore_history: false,
+        apply_config: false,
+        overwrite_config: false,
     };
     let results =
         restore::restore_sessions(&loaded.manifest.sessions, &loaded.data, &opts, |_, _, _| {})
@@ -157,7 +165,16 @@ fn full_backup_includes_and_restores_extras() {
     );
 
     let discovered = discover::load_sessions(&src).unwrap();
-    backup::create(&discovered, &archive, &src, true).unwrap();
+    backup::create(
+        &discovered,
+        &archive,
+        &src,
+        backup::BackupOptions {
+            include_extras: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let loaded = restore::load_backup(&archive).unwrap();
     assert_eq!(loaded.extras.len(), 3, "three extra files archived");
 
@@ -184,7 +201,13 @@ fn duplicate_restore_is_skipped() {
     build_source(&src);
 
     let discovered = discover::load_sessions(&src).unwrap();
-    backup::create(&discovered, &archive, &src, false).unwrap();
+    backup::create(
+        &discovered,
+        &archive,
+        &src,
+        backup::BackupOptions::default(),
+    )
+    .unwrap();
     let loaded = restore::load_backup(&archive).unwrap();
 
     let opts = restore::RestoreOptions {
@@ -193,6 +216,8 @@ fn duplicate_restore_is_skipped() {
         dry_run: false,
         rewrite_tool_paths: false,
         restore_history: false,
+        apply_config: false,
+        overwrite_config: false,
     };
     let first =
         restore::restore_sessions(&loaded.manifest.sessions, &loaded.data, &opts, |_, _, _| {})
