@@ -100,7 +100,17 @@ claude-migrate restore sessoes.tar.gz
 claude-migrate backup                 # TUI, nome de arquivo automático
 claude-migrate backup -o meu.tar.gz   # saída específica
 claude-migrate backup --full          # inclui shell-snapshots, file-history, plans
+claude-migrate backup --config        # inclui config global (settings, plugins, MCP)
+claude-migrate backup --all           # sessões + extras + config
 ```
+
+| Flag | Descrição |
+|------|-----------|
+| `-o, --output` | Caminho do arquivo de saída |
+| `--full` | Inclui `shell-snapshots`, `file-history`, `plans` |
+| `--config` | Inclui config global: settings, `CLAUDE.md`, plugins, MCP servers |
+| `--include-credentials` | Com `--config`, inclui também credenciais de login (sensível) |
+| `--all` | Atalho para `--full --config` |
 
 Controles da TUI: setas ou `j`/`k` navegar, `space` selecionar, `a` todas,
 `n` nenhuma, `/` filtrar, `b`/`enter` criar backup, `q` sair.
@@ -123,6 +133,8 @@ claude-migrate restore meu.tar.gz -f                    # sem TUI, sem mapeament
 | `--rewrite-tool-paths` | Reescreve tambem paths absolutos em chamadas de ferramenta |
 | `--restore-history` | Acrescenta entradas ao `history.jsonl` |
 | `--no-verify-checksum` | Não verifica checksum antes de restaurar |
+| `--config` | Aplica o pacote de config global presente no backup |
+| `--overwrite-config` | Com `--config`, sobrescreve config e MCP existentes |
 
 ---
 
@@ -148,6 +160,69 @@ sobrescrever.
 
 ---
 
+## Migrando para um diretório diferente
+
+O Claude Code indexa as sessões pelo diretório de trabalho: `claude --resume`
+lista apenas o que está em `~/.claude/projects/<encode(cwd_atual)>/`. Logo,
+mover uma sessão para um path diferente funciona desde que você forneça o
+mapeamento - a ferramenta recalcula o diretório encoded de destino e reescreve
+o `cwd` dentro do JSONL.
+
+```bash
+# exportou em /home/vinicius/projects/app (Linux)
+# no Mac o projeto vive em /Users/vini/dev/app
+claude-migrate restore sessoes.tar.gz \
+  -m "/home/vinicius/projects:/Users/vini/dev"
+
+cd /Users/vini/dev/app
+claude --resume        # a sessão migrada aparece
+```
+
+Pontos importantes:
+
+- Forneça o mapeamento sempre que o diretório mudar; sem ele a sessão cai sob o
+  path antigo.
+- Rode `claude --resume` de dentro do novo diretório.
+- Para continuar trabalhando (não só ler o histórico), tenha o código do
+  projeto no novo path.
+- Use `--dry-run` para conferir o `encoded:` de destino antes de escrever.
+- Re-restaurar com outro mapeamento é seguro: cria a cópia no novo encoded e
+  pula a antiga, sem perder nada.
+
+---
+
+## Configuração global (MCP, settings)
+
+O objetivo da ferramenta é trocar de computador sem recomeçar. Com `--config`,
+o backup também carrega sua configuração global:
+
+- `settings.json`, `settings.local.json`, `CLAUDE.md`
+- arquivos de config dos plugins
+- os servidores MCP registrados (`mcpServers` do `~/.claude.json`)
+
+```bash
+# origem
+claude-migrate backup --all -o tudo.tar.gz
+
+# destino: aplica sessões + extras + config
+claude-migrate restore tudo.tar.gz --config
+```
+
+No restore, os servidores MCP são **mesclados** no `~/.claude.json` do destino
+sem apagar o que já existe (use `--overwrite-config` para sobrescrever). Os
+arquivos de config só são escritos se ainda não existirem, salvo
+`--overwrite-config`.
+
+Atenção a segredos:
+
+- Definições de MCP podem conter API keys; um backup com `--config` passa a
+  conter segredos. Transfira e armazene o arquivo com cuidado.
+- As credenciais de login (`.credentials.json`, `oauthAccount`) ficam **de
+  fora por padrão**. Inclua apenas com `--include-credentials`, ciente de que
+  isso carrega o seu login do Claude.
+
+---
+
 ## Estrutura do backup
 
 ```
@@ -158,10 +233,15 @@ backup.tar.gz
 │       ├── <session-id>.jsonl
 │       ├── env/<arquivo>.json
 │       └── todos/<arquivo>.json
-└── extras/                      (apenas com --full)
-    ├── shell-snapshots/...
-    ├── file-history/...
-    └── plans/...
+├── extras/                      (apenas com --full)
+│   ├── shell-snapshots/...
+│   ├── file-history/...
+│   └── plans/...
+└── config/                      (apenas com --config)
+    ├── settings.json
+    ├── CLAUDE.md
+    ├── plugins/...
+    └── mcp-servers.json
 ```
 
 O `manifest.json` (schema v2) registra OS de origem, versão do Claude Code, e
