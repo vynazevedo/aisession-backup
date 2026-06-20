@@ -149,11 +149,15 @@ claude-migrate backup -o meu.tar.gz   # saída específica
 claude-migrate backup --full          # inclui shell-snapshots, file-history, plans
 claude-migrate backup --config        # inclui config global (settings, plugins, MCP)
 claude-migrate backup --all           # sessões + extras + config
+
+# não-interativo (scriptável/cron): todas as sessões cujo cwd contém o texto
+claude-migrate backup --match "/home/u/projeto" -o projeto.tar.gz
 ```
 
 | Flag | Descrição |
 |------|-----------|
 | `-o, --output` | Caminho do arquivo de saída |
+| `--match <SUBSTR>` | Não-interativo: faz backup de todas as sessões cujo cwd contém `SUBSTR` |
 | `--full` | Inclui `shell-snapshots`, `file-history`, `plans` |
 | `--config` | Inclui config global: settings, `CLAUDE.md`, plugins, MCP servers |
 | `--include-credentials` | Com `--config`, inclui também credenciais de login (sensível) |
