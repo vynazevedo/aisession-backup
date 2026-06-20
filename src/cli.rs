@@ -86,6 +86,8 @@ enum Commands {
         /// Optional backup file; omit to list local sessions.
         backup_file: Option<String>,
     },
+    /// Print version information.
+    Version,
 }
 
 pub fn run() -> Result<()> {
@@ -132,6 +134,10 @@ pub fn run() -> Result<()> {
             overwrite_config,
         }),
         Commands::List { backup_file } => cmd_list(backup_file.as_deref()),
+        Commands::Version => {
+            println!("claude-migrate {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
     }
 }
 
