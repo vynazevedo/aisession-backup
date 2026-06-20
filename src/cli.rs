@@ -42,6 +42,9 @@ enum Commands {
         /// With config, also include login credentials (sensitive).
         #[arg(long)]
         include_credentials: bool,
+        /// Non-interactive: back up all sessions whose cwd contains this text.
+        #[arg(long = "match", value_name = "SUBSTR")]
+        match_path: Option<String>,
         /// Shorthand for --full --config.
         #[arg(long)]
         all: bool,
@@ -95,6 +98,7 @@ pub fn run() -> Result<()> {
             full,
             config,
             include_credentials,
+            match_path,
             all,
         } => {
             let opts = backup::BackupOptions {
@@ -102,7 +106,7 @@ pub fn run() -> Result<()> {
                 include_config: config || all || include_credentials,
                 include_credentials,
             };
-            cmd_backup(output, opts)
+            cmd_backup(output, opts, match_path.as_deref())
         }
         Commands::Restore {
             backup_file,
@@ -155,7 +159,11 @@ pub fn expand_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn cmd_backup(output: Option<String>, opts: backup::BackupOptions) -> Result<()> {
+fn cmd_backup(
+    output: Option<String>,
+    opts: backup::BackupOptions,
+    match_path: Option<&str>,
+) -> Result<()> {
     let claude_dir = expand_path("~/.claude");
     let output = output.unwrap_or_else(|| {
         format!(
@@ -169,7 +177,57 @@ fn cmd_backup(output: Option<String>, opts: backup::BackupOptions) -> Result<()>
             if opts.include_credentials { " and login credentials" } else { "" }
         );
     }
-    crate::tui::run_backup(&claude_dir, Path::new(&output), opts)
+
+    match match_path {
+        Some(substr) => backup_non_interactive(&claude_dir, Path::new(&output), opts, substr),
+        None => crate::tui::run_backup(&claude_dir, Path::new(&output), opts),
+    }
+}
+
+/// Non-interactive backup of every session whose cwd contains `substr`.
+fn backup_non_interactive(
+    claude_dir: &Path,
+    output: &Path,
+    opts: backup::BackupOptions,
+    substr: &str,
+) -> Result<()> {
+    let sessions = discover::load_sessions(claude_dir).context("scanning sessions")?;
+    let selected: Vec<_> = sessions
+        .into_iter()
+        .filter(|d| d.session.cwd.contains(substr))
+        .collect();
+
+    if selected.is_empty() {
+        println!("No sessions match '{substr}'.");
+        return Ok(());
+    }
+
+    println!(
+        "Backing up {} session(s) matching '{}'...",
+        selected.len(),
+        substr
+    );
+    let manifest = backup::create(&selected, output, claude_dir, opts)?;
+    let mut tags = Vec::new();
+    if opts.include_extras {
+        tags.push("extras");
+    }
+    if opts.include_config {
+        tags.push("config");
+    }
+    let suffix = if tags.is_empty() {
+        String::new()
+    } else {
+        format!(", with {}", tags.join(" + "))
+    };
+    println!(
+        "Backup written to {} ({} sessions, {}{}).",
+        output.display(),
+        manifest.sessions.len(),
+        human_size(manifest.total_size),
+        suffix
+    );
+    Ok(())
 }
 
 fn cmd_restore(args: RestoreArgs) -> Result<()> {
