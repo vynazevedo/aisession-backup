@@ -20,13 +20,36 @@ pub fn apply_longest_mapping(path: &str, mappings: &BTreeMap<String, String>) ->
     if best_src.is_empty() {
         return path.to_string();
     }
-    format!("{}{}", best_dst, &path[best_src.len()..])
+    let rest = &path[best_src.len()..];
+    if rest.split(['/', '\\']).any(|part| part == "..") {
+        return path.to_string();
+    }
+    match (is_windows_path(best_src), is_windows_path(best_dst)) {
+        (true, false) => format!("{best_dst}{}", rest.replace('\\', "/")),
+        (false, true) if best_dst.contains('\\') => {
+            format!("{best_dst}{}", rest.replace('/', "\\"))
+        }
+        _ => format!("{best_dst}{rest}"),
+    }
+}
+
+fn is_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 /// True when `prefix` is a path-boundary prefix of `path` (so `/a/b` matches
 /// `/a/b` and `/a/b/c` but not `/a/bc`).
 fn is_prefix(prefix: &str, path: &str) -> bool {
-    if !path.starts_with(prefix) {
+    let same_prefix = path.starts_with(prefix)
+        || (is_windows_path(prefix)
+            && path.len() >= prefix.len()
+            && path
+                .bytes()
+                .zip(prefix.bytes())
+                .all(|(a, b)| a == b || (matches!(a, b'/' | b'\\') && matches!(b, b'/' | b'\\'))));
+    if !same_prefix || !path.is_char_boundary(prefix.len()) {
         return false;
     }
     let rest = &path[prefix.len()..];
@@ -244,7 +267,11 @@ pub fn rewrite_jsonl(
 
 /// Cheap pre-filter: does any mapping source prefix appear as a substring?
 fn mappings_touch_line(line: &str, mappings: &BTreeMap<String, String>) -> bool {
-    mappings.keys().any(|src| line.contains(src.as_str()))
+    line.contains("\\/")
+        || line.contains("\\u")
+        || mappings
+            .keys()
+            .any(|src| is_windows_path(src) || line.contains(src.as_str()))
 }
 
 fn rewrite_value(
@@ -399,6 +426,27 @@ mod tests {
         // untouched control line preserved verbatim
         assert!(out.contains("{\"type\":\"mode\",\"mode\":\"normal\"}"));
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn rewrite_jsonl_handles_windows_source_cwd() {
+        let line = serde_json::json!({"cwd": "C:\\Users\\win\\proj"}).to_string();
+        let m = BTreeMap::from([("C:\\Users\\win".to_string(), "/home/linux".to_string())]);
+        let (out, stats) = rewrite_jsonl(&line, &m, false);
+        assert_eq!(stats.lines_changed, 1);
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["cwd"], "/home/linux/proj");
+    }
+
+    #[test]
+    fn mapping_converts_separators_only_across_platforms() {
+        let to_windows = BTreeMap::from([("/home/u".to_string(), "C:\\Users\\u".to_string())]);
+        assert_eq!(
+            apply_longest_mapping("/home/u/a/b", &to_windows),
+            "C:\\Users\\u\\a\\b"
+        );
+        let posix = BTreeMap::from([("/a".to_string(), "/b".to_string())]);
+        assert_eq!(apply_longest_mapping("/a/x\\y", &posix), "/b/x\\y");
     }
 
     #[test]
