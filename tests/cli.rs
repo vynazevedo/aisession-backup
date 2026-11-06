@@ -2,20 +2,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use claude_migrate::claudepath;
-use claude_migrate::cli::{
+use aisession_backup::claudepath;
+use aisession_backup::cli::{
     parse_mappings, EXIT_CONFIRM_REQUIRED, EXIT_OK, EXIT_PLAN_REFUSED, EXIT_USAGE,
     EXIT_VERIFY_FAILED,
 };
-use claude_migrate::discover::DiscoveredSession;
-use claude_migrate::model::{Manifest, Session, SCHEMA_VERSION};
-use claude_migrate::plan::{Action, Plan, PlannedOp, Risk};
-use claude_migrate::provider::{FileClass, Item, ItemFile, ItemKind, ProviderId};
-use claude_migrate::tui::{
+use aisession_backup::discover::DiscoveredSession;
+use aisession_backup::model::{Manifest, Session, SCHEMA_VERSION};
+use aisession_backup::plan::{Action, Plan, PlannedOp, Risk};
+use aisession_backup::provider::{FileClass, Item, ItemFile, ItemKind, ProviderId};
+use aisession_backup::tui::{
     check_tty, install_panic_hook, BackupApp, BackupStep, HomeOutcome, HomeScreen, HomeState,
     ProviderEntry, RestoreApp, RestoreFlags, RestoreStep,
 };
-use claude_migrate::ui;
+use aisession_backup::ui;
 use ratatui::crossterm::event::KeyCode;
 
 struct TestEnv {
@@ -75,16 +75,18 @@ impl TestEnv {
     }
 
     fn cmd(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_claude-migrate"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_aisession-backup"));
         c.current_dir(&self.root)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("CODEX_HOME", &self.codex_dir)
             .env("MAESTRI_HOME", &self.maestri_dir)
-            .env("CLAUDE_MIGRATE_DATA_DIR", &self.data_dir)
+            .env("AISESSION_BACKUP_DATA_DIR", &self.data_dir)
             .env("NO_COLOR", "1")
+            .env_remove("AISESSION_BACKUP_PASSPHRASE")
             .env_remove("CLAUDE_MIGRATE_PASSPHRASE")
+            .env_remove("CLAUDE_MIGRATE_DATA_DIR")
             .env_remove("MAESTRI_SOCKET");
         c
     }
@@ -161,7 +163,7 @@ fn no_args_non_tty_prints_help_and_usage_error_exits_2() {
     let out = env.run(&[]);
     assert_eq!(code_of(&out), EXIT_OK);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Usage:") || stdout.contains("claude-migrate"));
+    assert!(stdout.contains("Usage:") || stdout.contains("aisession-backup"));
 
     let bad = env.run(&["--not-a-valid-flag"]);
     assert_eq!(code_of(&bad), EXIT_USAGE);
@@ -172,11 +174,11 @@ fn version_and_completions_commands_succeed() {
     let env = TestEnv::new();
     let ver = env.run(&["version"]);
     assert_eq!(code_of(&ver), EXIT_OK);
-    assert!(String::from_utf8_lossy(&ver.stdout).contains("claude-migrate"));
+    assert!(String::from_utf8_lossy(&ver.stdout).contains("aisession-backup"));
 
     let comp = env.run(&["completions", "bash"]);
     assert_eq!(code_of(&comp), EXIT_OK);
-    assert!(String::from_utf8_lossy(&comp.stdout).contains("claude-migrate"));
+    assert!(String::from_utf8_lossy(&comp.stdout).contains("aisession-backup"));
 }
 
 #[test]
@@ -309,7 +311,10 @@ fn encrypted_backup_verify_and_exec_config_refusal() {
 
     let out = env
         .cmd()
-        .env("CLAUDE_MIGRATE_PASSPHRASE", "correct-horse-battery-staple")
+        .env(
+            "AISESSION_BACKUP_PASSPHRASE",
+            "correct-horse-battery-staple",
+        )
         .args([
             "backup",
             "--config",
@@ -325,7 +330,7 @@ fn encrypted_backup_verify_and_exec_config_refusal() {
 
     let wrong = env
         .cmd()
-        .env("CLAUDE_MIGRATE_PASSPHRASE", "wrong-passphrase")
+        .env("AISESSION_BACKUP_PASSPHRASE", "wrong-passphrase")
         .args(["verify", enc_str])
         .output()
         .unwrap();
@@ -338,7 +343,10 @@ fn encrypted_backup_verify_and_exec_config_refusal() {
 
     let skipped_exec = env
         .cmd()
-        .env("CLAUDE_MIGRATE_PASSPHRASE", "correct-horse-battery-staple")
+        .env(
+            "AISESSION_BACKUP_PASSPHRASE",
+            "correct-horse-battery-staple",
+        )
         .args([
             "restore",
             enc_str,
@@ -355,7 +363,10 @@ fn encrypted_backup_verify_and_exec_config_refusal() {
 
     let allowed = env
         .cmd()
-        .env("CLAUDE_MIGRATE_PASSPHRASE", "correct-horse-battery-staple")
+        .env(
+            "AISESSION_BACKUP_PASSPHRASE",
+            "correct-horse-battery-staple",
+        )
         .args([
             "restore",
             enc_str,
@@ -609,7 +620,7 @@ fn tui_restore_request_applies_only_the_selected_sessions() {
     let env = TestEnv::new();
     let archive = multi_provider_archive(&env);
     let staged =
-        claude_migrate::archive::stage(&archive, &claude_migrate::engine::Passphrase::None)
+        aisession_backup::archive::stage(&archive, &aisession_backup::engine::Passphrase::None)
             .unwrap();
     let dest = env.root.join("tui/.claude");
     let mut app = RestoreApp::new(
@@ -626,9 +637,9 @@ fn tui_restore_request_applies_only_the_selected_sessions() {
     let wanted = app.sessions()[0].id.clone();
     let other = app.sessions()[1].id.clone();
     app.selected[0] = true;
-    let prepared = claude_migrate::engine::prepare_restore(app.build_restore_request()).unwrap();
+    let prepared = aisession_backup::engine::prepare_restore(app.build_restore_request()).unwrap();
     assert!(!prepared.plan.has_refusals(), "{:?}", prepared.plan);
-    claude_migrate::engine::apply_restore(prepared).unwrap();
+    aisession_backup::engine::apply_restore(prepared).unwrap();
     let names: Vec<String> = tree_snapshot(&dest)
         .into_iter()
         .map(|(path, _)| path.display().to_string())
@@ -646,7 +657,7 @@ fn failed_plan_blocks_confirmation() {
 
 #[test]
 fn backup_report_warns_about_secrets_and_changes() {
-    let report = claude_migrate::engine::BackupReport {
+    let report = aisession_backup::engine::BackupReport {
         output: PathBuf::from("/tmp/a.tar.gz"),
         encrypted: false,
         sessions: 1,
@@ -692,7 +703,7 @@ fn tui_preview_toggles_recompute_the_plan_and_explain_refusals() {
     assert!(app.flags.allow_running);
     assert!(app.plan.is_none());
     assert!(app.preview_help().contains("allow-running:on"));
-    app.rows = vec![claude_migrate::tui::MapRow {
+    app.rows = vec![aisession_backup::tui::MapRow {
         root: "/a".into(),
         count: 1,
         value: "relative".into(),
@@ -701,4 +712,62 @@ fn tui_preview_toggles_recompute_the_plan_and_explain_refusals() {
     app.handle_key(KeyCode::Enter);
     assert_eq!(app.step, RestoreStep::Mapping);
     assert!(app.mapping_error.is_some());
+}
+
+#[test]
+fn legacy_env_and_journal_directory_keep_working() {
+    let env = TestEnv::new();
+    env.write_claude_session("legacy-s1", "/tmp/legacy", "hello");
+    let archive = env.root.join("legacy.tar.gz");
+    let archive_arg = archive.to_str().unwrap();
+    let backup = env.run(&["backup", "--all", "--output", archive_arg, "--yes"]);
+    assert_eq!(code_of(&backup), EXIT_OK);
+
+    let dest = env.root.join("restored/.claude");
+    let restore = env.run(&[
+        "restore",
+        archive_arg,
+        "--dest",
+        dest.to_str().unwrap(),
+        "--allow-running",
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(
+        code_of(&restore),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&restore.stdout).unwrap();
+    let id = report["journal_id"].as_str().unwrap();
+
+    fs::rename(
+        env.data_dir.join("aisession-backup"),
+        env.data_dir.join("claude-migrate"),
+    )
+    .unwrap();
+
+    let restored = dest
+        .join("projects")
+        .join(claudepath::encode("/tmp/legacy"))
+        .join("legacy-s1.jsonl");
+    assert!(restored.exists());
+
+    let legacy_run = |args: &[&str]| {
+        env.cmd()
+            .args(args)
+            .env_remove("AISESSION_BACKUP_DATA_DIR")
+            .env("CLAUDE_MIGRATE_DATA_DIR", &env.data_dir)
+            .output()
+            .unwrap()
+    };
+
+    let history = legacy_run(&["history", "--json"]);
+    assert_eq!(code_of(&history), EXIT_OK);
+    assert!(String::from_utf8_lossy(&history.stdout).contains(id));
+
+    let rollback = legacy_run(&["rollback", id, "--yes"]);
+    assert_eq!(code_of(&rollback), EXIT_OK);
+    assert!(!restored.exists());
 }

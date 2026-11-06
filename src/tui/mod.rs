@@ -500,7 +500,7 @@ impl HomeState {
         match self.screen {
             HomeScreen::Providers => {
                 let header = Paragraph::new(format!(
-                    "claude-migrate Home | {} item(s) selected across providers",
+                    "aisession-backup Home | {} item(s) selected across providers",
                     self.total_selected_items()
                 ))
                 .style(Style::default().add_modifier(Modifier::BOLD));

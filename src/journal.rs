@@ -27,11 +27,11 @@ pub struct Journal {
 }
 
 fn root() -> Result<PathBuf> {
-    let base = std::env::var_os("CLAUDE_MIGRATE_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(dirs::data_local_dir)
-        .context("no data directory")?;
-    Ok(base.join("claude-migrate/journal"))
+    Ok(crate::archive::data_dir()?.join("aisession-backup/journal"))
+}
+
+fn legacy_root() -> Result<PathBuf> {
+    Ok(crate::archive::data_dir()?.join("claude-migrate/journal"))
 }
 
 #[cfg(test)]
@@ -201,7 +201,14 @@ impl Journal {
 
 fn load(id: &str) -> Result<Journal> {
     safety::validate_id(id)?;
-    let root = safety::safe_join(&root()?, id)?;
+    let current = root()?;
+    let legacy = legacy_root()?;
+    let base = if !current.join(id).exists() && legacy.join(id).exists() {
+        legacy
+    } else {
+        current
+    };
+    let root = safety::safe_join(&base, id)?;
     let path = safety::safe_join(&root, "journal.json")?;
     let mut journal: Journal = serde_json::from_reader(std::fs::File::open(path)?)?;
     if journal.id != id {
@@ -211,17 +218,22 @@ fn load(id: &str) -> Result<Journal> {
     Ok(journal)
 }
 pub fn list() -> Result<Vec<JournalEntry>> {
-    let root = root()?;
-    if !root.exists() {
-        return Ok(Vec::new());
+    let mut ids = std::collections::BTreeSet::new();
+    for root in [root()?, legacy_root()?] {
+        if !root.exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let id = entry.file_name();
+                ids.insert(id.to_str().context("invalid journal id")?.to_owned());
+            }
+        }
     }
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let id = entry.file_name();
-            entries.push(load(id.to_str().context("invalid journal id")?)?.entry());
-        }
+    for id in ids {
+        entries.push(load(&id)?.entry());
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.created_at));
     Ok(entries)

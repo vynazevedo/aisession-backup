@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use claude_migrate::{backup, claudepath, discover, engine};
+use aisession_backup::{backup, claudepath, discover, engine};
 
 const SID: &str = "11111111-1111-1111-1111-111111111111";
 const OLD_CWD: &str = "/mnt/e/workspace/alianca_divergente/proj";
@@ -58,7 +58,7 @@ fn isolated(name: &str, test: impl FnOnce(&Path)) {
         .args(["--exact", name])
         .env("CM_ROUNDTRIP_CASE", name)
         .env("CM_ROUNDTRIP_ROOT", temp.path())
-        .env("CLAUDE_MIGRATE_DATA_DIR", temp.path().join("data"))
+        .env("AISESSION_BACKUP_DATA_DIR", temp.path().join("data"))
         .status()
         .unwrap();
     assert!(status.success());
@@ -220,7 +220,7 @@ fn duplicate_restore_is_skipped() {
             .ops
             .iter()
             .any(|op| op.dest.ends_with(format!("{SID}.jsonl"))
-                && matches!(op.action, claude_migrate::plan::Action::Skip(_))));
+                && matches!(op.action, aisession_backup::plan::Action::Skip(_))));
         let second = engine::apply_restore(prepared).unwrap();
         assert_eq!(second.written, 0);
         assert_eq!(
@@ -237,14 +237,14 @@ fn restores_independent_v2_archive_fixture() {
         let bytes = br#"{"cwd":"/legacy/project","type":"user"}"#;
         let sha = hex::encode(Sha256::digest(bytes));
         let checksum = hex::encode(Sha256::digest(format!("legacy/legacy.jsonl:{sha}\n")));
-        let manifest: claude_migrate::model::Manifest = serde_json::from_value(serde_json::json!({
+        let manifest: aisession_backup::model::Manifest = serde_json::from_value(serde_json::json!({
             "schema_version":2,"created_at":"2026-01-01T00:00:00Z", "checksum":checksum,
             "sessions":[{"id":"legacy","cwd":"/legacy/project","timestamp":"2026-01-01T00:00:00Z","artifacts":[{"kind":"session","logical_name":"legacy.jsonl","sha256":sha,"size":bytes.len()}]}]
         })).unwrap();
         let source = root.join("legacy.jsonl");
         fs::write(&source, bytes).unwrap();
         let archive = root.join("backup.tar.gz");
-        claude_migrate::archive::write(
+        aisession_backup::archive::write(
             &archive,
             false,
             &manifest,

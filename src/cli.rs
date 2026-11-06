@@ -63,7 +63,7 @@ pub fn exit_code(err: &anyhow::Error) -> u8 {
 
 #[derive(Parser)]
 #[command(
-    name = "claude-migrate",
+    name = "aisession-backup",
     version,
     about = "Backup, restore and migrate AI coding sessions across machines"
 )]
@@ -403,11 +403,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::List { backup_file, json } => cmd_list(backup_file.as_deref(), json),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
-            clap_complete::generate(shell, &mut cmd, "claude-migrate", &mut io::stdout());
+            clap_complete::generate(shell, &mut cmd, "aisession-backup", &mut io::stdout());
             Ok(())
         }
         Commands::Version => {
-            println!("claude-migrate {}", env!("CARGO_PKG_VERSION"));
+            println!("aisession-backup {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
@@ -601,18 +601,22 @@ pub fn parse_providers(raw: Option<&str>, default_claude: bool) -> Result<(bool,
     Ok((false, out))
 }
 
+fn env_passphrase() -> Option<String> {
+    crate::archive::env_setting("PASSPHRASE")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
+}
+
 fn resolve_encrypt_passphrase(encrypt: bool) -> Result<Passphrase> {
     if !encrypt {
         return Ok(Passphrase::None);
     }
-    if let Ok(val) = std::env::var("CLAUDE_MIGRATE_PASSPHRASE") {
-        if !val.is_empty() {
-            return Ok(Passphrase::Value(val));
-        }
+    if let Some(val) = env_passphrase() {
+        return Ok(Passphrase::Value(val));
     }
     if !io::stdin().is_terminal() {
         bail!(
-            "encryption passphrase required: set CLAUDE_MIGRATE_PASSPHRASE in non-interactive mode"
+            "encryption passphrase required: set AISESSION_BACKUP_PASSPHRASE in non-interactive mode"
         );
     }
     let first = rpassword::prompt_password("Enter passphrase: ")
@@ -640,10 +644,8 @@ fn is_archive_encrypted(path: &Path) -> bool {
 }
 
 pub(crate) fn resolve_decrypt_passphrase(path: &Path) -> Result<Passphrase> {
-    if let Ok(val) = std::env::var("CLAUDE_MIGRATE_PASSPHRASE") {
-        if !val.is_empty() {
-            return Ok(Passphrase::Value(val));
-        }
+    if let Some(val) = env_passphrase() {
+        return Ok(Passphrase::Value(val));
     }
     if is_archive_encrypted(path) && io::stdin().is_terminal() {
         let pass =

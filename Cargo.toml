@@ -1,17 +1,17 @@
 [package]
-name = "claude-migrate"
+name = "aisession-backup"
 version = "3.0.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Backup, restore and migrate AI coding tool sessions and config across machines with plans, rollback and path remapping"
-repository = "https://github.com/vynazevedo/claude-migrate"
+repository = "https://github.com/vynazevedo/aisession-backup"
 license = "MIT"
-keywords = ["claude", "cli", "backup", "migration", "tui"]
+keywords = ["ai", "session", "backup", "migration", "cli"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 
 [[bin]]
-name = "claude-migrate"
+name = "aisession-backup"
 path = "src/main.rs"
 
 [dependencies]

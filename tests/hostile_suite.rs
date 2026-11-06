@@ -8,18 +8,18 @@ use std::time::Duration;
 
 use sha2::Digest;
 
-use claude_migrate::archive::{MAX_ENTRIES, MAX_ENTRY_SIZE};
-use claude_migrate::cli::{parse_provider_homes, EXIT_OK, EXIT_PLAN_REFUSED};
-use claude_migrate::engine::{
+use aisession_backup::archive::{MAX_ENTRIES, MAX_ENTRY_SIZE};
+use aisession_backup::cli::{parse_provider_homes, EXIT_OK, EXIT_PLAN_REFUSED};
+use aisession_backup::engine::{
     apply_restore, audit_selection, list_journal, plan_backup, plan_rollback, prepare_restore,
     read_manifest, rollback, run_backup, verify_archive, BackupRequest, ClaudeSelection,
     Passphrase, ProviderSelection, RestoreRequest,
 };
-use claude_migrate::plan::{Action, Plan};
-use claude_migrate::provider::{FileClass, ItemKind, Provider, ProviderId, ScanOptions};
-use claude_migrate::remap::{apply_longest_mapping, rewrite_jsonl};
-use claude_migrate::safety::{atomic_write, WriteMode};
-use claude_migrate::tui::{MapRow, RestoreApp, RestoreFlags, RestoreStep};
+use aisession_backup::plan::{Action, Plan};
+use aisession_backup::provider::{FileClass, ItemKind, Provider, ProviderId, ScanOptions};
+use aisession_backup::remap::{apply_longest_mapping, rewrite_jsonl};
+use aisession_backup::safety::{atomic_write, WriteMode};
+use aisession_backup::tui::{MapRow, RestoreApp, RestoreFlags, RestoreStep};
 use ratatui::crossterm::event::KeyCode;
 
 static ENV: Mutex<()> = Mutex::new(());
@@ -31,7 +31,7 @@ fn isolate(root: &Path) -> MutexGuard<'static, ()> {
         ("USERPROFILE", root.join("home")),
         ("XDG_CONFIG_HOME", root.join("config")),
         ("XDG_DATA_HOME", root.join("data-home")),
-        ("CLAUDE_MIGRATE_DATA_DIR", root.join("migrate-data")),
+        ("AISESSION_BACKUP_DATA_DIR", root.join("migrate-data")),
         ("CLAUDE_CONFIG_DIR", root.join("claude-config")),
         ("CODEX_HOME", root.join("codex-home")),
         ("MAESTRI_HOME", root.join("not-a-maestri-home")),
@@ -98,7 +98,7 @@ fn put_rel(home: &Path, rel: &str, bytes: &[u8]) {
 }
 
 fn put_session(home: &Path, id: &str, cwd: &str, content: &str) {
-    let encoded = claude_migrate::claudepath::encode(cwd);
+    let encoded = aisession_backup::claudepath::encode(cwd);
     put_rel(
         home,
         &format!("projects/{encoded}/{id}.jsonl"),
@@ -570,7 +570,7 @@ fn legitimate_double_dot_filename_is_not_treated_as_traversal() {
     assert!(!prepared.plan.has_refusals(), "{:?}", prepared.plan);
     let applied = apply_restore(prepared).unwrap();
     assert!(applied.failed.is_empty(), "{applied:?}");
-    let encoded = claude_migrate::claudepath::encode("/work/app");
+    let encoded = aisession_backup::claudepath::encode("/work/app");
     let restored = dest.join(format!("projects/{encoded}/foo..bar.jsonl"));
     assert!(restored.is_file(), "legitimate name was dropped");
     let bytes = fs::read(&restored).unwrap();
@@ -599,8 +599,8 @@ fn oversized_entry_and_entry_count_are_rejected_by_the_public_limits() {
         .to_string();
     assert!(error.contains("maximum entry size"), "{error}");
 
-    std::env::set_var("CLAUDE_MIGRATE_MAX_ARCHIVE_BYTES", "1024");
-    let _limit = EnvGuard("CLAUDE_MIGRATE_MAX_ARCHIVE_BYTES");
+    std::env::set_var("AISESSION_BACKUP_MAX_ARCHIVE_BYTES", "1024");
+    let _limit = EnvGuard("AISESSION_BACKUP_MAX_ARCHIVE_BYTES");
     let total = tmp.path().join("total.tar.gz");
     let mut header = tar::Header::new_gnu();
     header.set_path("manifest.json").unwrap();
@@ -695,7 +695,7 @@ fn deep_tool_result_names_survive_verification() {
     let id = "sess-long";
     let cwd = "/work/app";
     put_session(&home, id, cwd, "parent");
-    let encoded = claude_migrate::claudepath::encode(cwd);
+    let encoded = aisession_backup::claudepath::encode(cwd);
     let long_name = "r".repeat(120);
     put_rel(
         &home,
@@ -729,7 +729,7 @@ fn subagents_are_artifacts_not_extra_sessions() {
     let home = tmp.path().join("source/.claude");
     let cwd = "/work/app";
     put_session(&home, "parent-sess", cwd, "parent");
-    let encoded = claude_migrate::claudepath::encode(cwd);
+    let encoded = aisession_backup::claudepath::encode(cwd);
     put_rel(
         &home,
         &format!("projects/{encoded}/parent-sess/subagents/child.jsonl"),
@@ -804,7 +804,7 @@ fn hooks_mcp_and_plugins_are_refused_without_allow_exec_config() {
     assert!(!dest.join("settings.local.json").exists());
     assert!(!dest.join("plugins/config.json").exists());
     assert!(!dest.parent().unwrap().join(".claude.json").exists());
-    let encoded = claude_migrate::claudepath::encode("/work/app");
+    let encoded = aisession_backup::claudepath::encode("/work/app");
     assert!(dest
         .join(format!("projects/{encoded}/sess-benign.jsonl"))
         .is_file());
@@ -1012,7 +1012,7 @@ fn rollback_restores_preimages_and_keeps_files_changed_since() {
     let cwd = "/work/app";
     let id = "sess-benign";
     put_session(&home, id, cwd, "original-body");
-    let encoded = claude_migrate::claudepath::encode(cwd);
+    let encoded = aisession_backup::claudepath::encode(cwd);
     put_rel(
         &home,
         &format!("session-env/{id}/env.json"),
@@ -1179,7 +1179,7 @@ fn symlink_ancestor_of_the_destination_is_not_followed() {
     put_session(&home, "sess-benign", "/work/app", "hi");
     let request = backup_request(tmp.path(), &home);
     run_backup(&request).unwrap();
-    let encoded = claude_migrate::claudepath::encode("/work/app");
+    let encoded = aisession_backup::claudepath::encode("/work/app");
 
     let real = tmp.path().join("real");
     fs::create_dir_all(&real).unwrap();
@@ -1243,7 +1243,7 @@ fn provider_symlinked_walk_root_is_not_followed() {
     let secret = b"SYNTHETIC_PROVIDER_WALK_SECRET_vigia";
     fs::write(outside.join("secret.jsonl"), secret).unwrap();
     std::os::unix::fs::symlink(&outside, home.join("rules")).unwrap();
-    let inventory = claude_migrate::provider::codex::Codex
+    let inventory = aisession_backup::provider::codex::Codex
         .scan(&home, &ScanOptions::default())
         .unwrap();
     let rels: Vec<&str> = inventory
@@ -1285,14 +1285,14 @@ fn backup_does_not_follow_symlinked_memory_or_settings() {
     let cwd = "/work/app";
     let id = "sess-benign";
     put_session(&home, id, cwd, "hi");
-    let encoded = claude_migrate::claudepath::encode(cwd);
+    let encoded = aisession_backup::claudepath::encode(cwd);
     let outside = tmp.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
     let secret = b"SYNTHETIC_MEMORY_SECRET_vigia";
     fs::write(outside.join("secret.txt"), secret).unwrap();
     std::os::unix::fs::symlink(&outside, home.join(format!("projects/{encoded}/memory"))).unwrap();
     std::os::unix::fs::symlink(outside.join("secret.txt"), home.join("settings.json")).unwrap();
-    let bundle = claude_migrate::config::collect(&home, false);
+    let bundle = aisession_backup::config::collect(&home, false);
     assert!(
         bundle.files.iter().all(|(_, bytes)| bytes != secret),
         "settings symlink was archived"
@@ -1613,7 +1613,7 @@ fn legacy_restore_sessions_reject_hostile_ids_and_do_not_escape() {
     );
     let applied = apply_restore(prepared).unwrap();
     assert!(applied.failed.is_empty(), "{applied:?}");
-    let encoded = claude_migrate::claudepath::encode("/work/app");
+    let encoded = aisession_backup::claudepath::encode("/work/app");
     let restored = skipped_dest.join(format!("projects/{encoded}/sess-ok.jsonl"));
     let bytes = fs::read(&restored).unwrap();
     assert!(
@@ -1795,7 +1795,7 @@ fn maestri_sidebar_cannot_launder_credentials_into_the_default_scan() {
         r#"{"app":"Maestri","files":{"sidebarLayout":"license.json"}}"#,
     )
     .unwrap();
-    let inventory = claude_migrate::provider::maestri::Maestri
+    let inventory = aisession_backup::provider::maestri::Maestri
         .scan(&home, &ScanOptions::default())
         .unwrap();
     let rels: Vec<&str> = inventory
@@ -1822,7 +1822,7 @@ fn maestri_sidebar_cannot_launder_credentials_into_the_default_scan() {
 #[test]
 fn codex_toml_rewrite_rejects_injected_newlines() {
     let mappings = BTreeMap::from([("/old".to_string(), "/new\nowned = true\n".to_string())]);
-    let Ok(out) = claude_migrate::provider::codex::Codex.rewrite(
+    let Ok(out) = aisession_backup::provider::codex::Codex.rewrite(
         "config.toml",
         b"[projects.\"/old/app\"]\ntrust_level = \"trusted\"\n",
         &mappings,
@@ -1841,7 +1841,7 @@ fn codex_toml_rewrite_rejects_injected_newlines() {
 #[test]
 fn gemini_project_root_rewrite_rejects_control_characters() {
     let mappings = BTreeMap::from([("/old".to_string(), "/new\nssh-ed25519 AAAA".to_string())]);
-    let Ok(out) = claude_migrate::provider::gemini::Gemini.rewrite(
+    let Ok(out) = aisession_backup::provider::gemini::Gemini.rewrite(
         "tmp/app/.project_root",
         b"/old/a\n",
         &mappings,
@@ -1864,7 +1864,7 @@ fn gemini_trust_key_collision_does_not_drop_a_decision() {
         ("/old/a".to_string(), "/shared".to_string()),
         ("/old/b".to_string(), "/shared".to_string()),
     ]);
-    let Ok(out) = claude_migrate::provider::gemini::Gemini.rewrite(
+    let Ok(out) = aisession_backup::provider::gemini::Gemini.rewrite(
         "trustedFolders.json",
         br#"{"/old/a":"TRUST_FOLDER","/old/b":"BLOCK"}"#,
         &mappings,
@@ -2163,18 +2163,18 @@ fn guard_snapshot(root: &Path) -> BTreeMap<String, BTreeMap<String, String>> {
 
 fn run_cli(root: &Path, args: &[&str]) -> std::process::Output {
     let home = root.join("home");
-    Command::new(env!("CARGO_BIN_EXE_claude-migrate"))
+    Command::new(env!("CARGO_BIN_EXE_aisession-backup"))
         .current_dir(root)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data-home"))
-        .env("CLAUDE_MIGRATE_DATA_DIR", root.join("migrate-data"))
+        .env("AISESSION_BACKUP_DATA_DIR", root.join("migrate-data"))
         .env("CLAUDE_CONFIG_DIR", root.join("claude-config"))
         .env("CODEX_HOME", root.join("codex-home"))
         .env("MAESTRI_HOME", root.join("not-a-maestri-home"))
         .env("NO_COLOR", "1")
-        .env_remove("CLAUDE_MIGRATE_PASSPHRASE")
+        .env_remove("AISESSION_BACKUP_PASSPHRASE")
         .env_remove("MAESTRI_SOCKET")
         .args(args)
         .output()
@@ -2220,7 +2220,7 @@ fn mapping_app(root: &Path, value: &str) -> RestoreApp {
 }
 
 fn downgrade_exec_class(archive: &Path, output: &Path) {
-    let staged = claude_migrate::archive::stage(archive, &Passphrase::None).unwrap();
+    let staged = aisession_backup::archive::stage(archive, &Passphrase::None).unwrap();
     assert!(staged.report.ok(), "{:?}", staged.report);
     let mut manifest = staged.manifest.clone();
     let mut changed = 0;
@@ -2245,7 +2245,7 @@ fn downgrade_exec_class(archive: &Path, output: &Path) {
         .filter(|(name, _)| name.as_str() != "manifest.json")
         .map(|(name, path)| (name.clone(), path.clone()))
         .collect();
-    claude_migrate::archive::write(output, false, &manifest, &files, &Passphrase::None).unwrap();
+    aisession_backup::archive::write(output, false, &manifest, &files, &Passphrase::None).unwrap();
     let report = verify_archive(output, &Passphrase::None).unwrap();
     assert!(report.ok(), "downgraded archive did not verify: {report:?}");
 }
@@ -2426,7 +2426,7 @@ fn restore_ui_preview_keys_rebuild_before_confirm() {
     request.claude.as_mut().unwrap().include_config = true;
     run_backup(&request).unwrap();
     let dest = tmp.path().join("ui-dest");
-    let staged = claude_migrate::archive::stage(&request.output, &Passphrase::None).unwrap();
+    let staged = aisession_backup::archive::stage(&request.output, &Passphrase::None).unwrap();
     assert!(staged.report.ok(), "{:?}", staged.report);
     let mut app = RestoreApp::new(
         staged.manifest,
@@ -2511,7 +2511,7 @@ fn restore_ui_preview_keys_rebuild_before_confirm() {
     assert!(app.plan.is_none(), "mapping enter kept the previous plan");
     assert!(!app.confirmed);
     let third = prepare_restore(app.build_restore_request()).unwrap();
-    let encoded = claude_migrate::claudepath::encode(&changed.display().to_string());
+    let encoded = aisession_backup::claudepath::encode(&changed.display().to_string());
     assert!(
         third
             .plan
@@ -2793,7 +2793,7 @@ fn provider_home_symlink_below_the_base_is_not_written() {
     request.claude = None;
     request.providers = vec![selection(ProviderId::Codex, &src)];
     run_backup(&request).unwrap();
-    let staged = claude_migrate::archive::stage(&request.output, &Passphrase::None).unwrap();
+    let staged = aisession_backup::archive::stage(&request.output, &Passphrase::None).unwrap();
     assert!(staged.report.ok(), "{:?}", staged.report);
     assert!(staged.manifest.providers.iter().any(|provider| {
         provider
