@@ -3,6 +3,8 @@
 
 # Backups gerados pela ferramenta
 *.tar.gz
+*.tar.gz.age
+.claude-migrate-snapshot-*/
 
 # IDE e editor
 .vscode/

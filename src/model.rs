@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Current backup manifest schema version. v1 was the original Go format
 /// (path derived from the encoded directory name); v2 stores the real `cwd`
 /// extracted from the JSONL plus per-artifact checksums.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// A single file belonging to a session inside the archive, stored under
 /// `sessions/<session-id>/<logical_name>`.
@@ -27,6 +27,8 @@ pub enum ArtifactKind {
     Session,
     Env,
     Todos,
+    Project,
+    Memory,
 }
 
 /// Metadata for one Claude Code session.
@@ -76,7 +78,14 @@ pub struct Manifest {
     pub source_os: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_version: Option<String>,
+    #[serde(default)]
     pub sessions: Vec<Session>,
+    #[serde(default)]
+    pub providers: Vec<ProviderManifest>,
+    #[serde(default)]
+    pub extras: Vec<FileDigest>,
+    #[serde(default)]
+    pub config: Vec<FileDigest>,
     /// SHA-256 over the manifest-independent content (see `backup`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub checksum: String,
@@ -87,5 +96,57 @@ pub struct Manifest {
 impl Manifest {
     pub fn is_v1(&self) -> bool {
         self.schema_version < 2
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDigest {
+    pub rel: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderManifest {
+    pub id: crate::provider::ProviderId,
+    #[serde(default)]
+    pub source_home: String,
+    #[serde(default)]
+    pub items: Vec<ArchivedItem>,
+    #[serde(default)]
+    pub files: Vec<FileDigest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedItem {
+    pub id: String,
+    pub kind: crate::provider::ItemKind,
+    pub label: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub files: Vec<ArchivedFile>,
+}
+
+impl ArchivedItem {
+    pub fn total_size(&self) -> u64 {
+        self.files.iter().map(|file| file.size).sum()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedFile {
+    #[serde(flatten)]
+    pub file: crate::provider::ItemFile,
+    #[serde(default)]
+    pub sha256: String,
+}
+
+impl std::ops::Deref for ArchivedFile {
+    type Target = crate::provider::ItemFile;
+    fn deref(&self) -> &Self::Target {
+        &self.file
     }
 }

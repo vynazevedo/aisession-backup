@@ -1,47 +1,45 @@
 # claude-migrate
 
-Backup, restore e migração de sessões do Claude Code entre máquinas, sem perda
-e com remapeamento preciso de paths.
+Backup, restore e migração de sessões e configuração de ferramentas de IA para
+terminal entre máquinas, com plano prévio, rollback e remapeamento preciso de
+paths.
 
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![version](https://img.shields.io/badge/version-2.0.0-success?style=flat-square)](Cargo.toml)
+[![version](https://img.shields.io/badge/version-3.0.0-success?style=flat-square)](Cargo.toml)
 [![CI](https://img.shields.io/github/actions/workflow/status/vynazevedo/claude-migrate/ci.yml?style=flat-square&label=CI&branch=main)](https://github.com/vynazevedo/claude-migrate/actions/workflows/ci.yml)
-[![rust](https://img.shields.io/badge/rust-1.74%2B-orange?style=flat-square)](https://www.rust-lang.org)
-[![Claude Code](https://img.shields.io/badge/Claude%20Code-compatible-8A2BE2?style=flat-square)](https://docs.anthropic.com/claude-code)
+[![rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square)](https://www.rust-lang.org)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square)](#instalação)
-
-Mova suas conversas do Claude Code do Windows para o Mac, do Mac para o Linux,
-do WSL para qualquer lugar - ajustando diretórios e nomenclaturas com precisão
-absoluta, incluindo caracteres especiais e diferenças de case.
 
 ---
 
-## Por que existe
+## Provedores suportados
 
-O Claude Code guarda cada sessão em `~/.claude/projects/<encoded>/`, onde
-`<encoded>` é o diretório de trabalho com cada caractere nao-alfanumérico
-substituido por `-`. Essa transformação **perde informação**:
+| Provedor | Id | O que entra no backup | Paths remapeados no restore |
+|----------|----|-----------------------|-----------------------------|
+| Claude Code | `claude` | Sessões, subagentes, memória, extras e config | `cwd` de cada linha do JSONL e diretório encoded |
+| Codex CLI | `codex` | Rollouts e `config.toml` | `cwd` e workspaces dos rollouts, projetos do `config.toml` |
+| Grok CLI | `grok` | Sessões por diretório | Diretório da sessão, `info.cwd` e `git_root_dir` |
+| Gemini CLI | `gemini` | Chats, `projects.json` e `trustedFolders.json` | `.project_root`, `projects.json` e `trustedFolders.json` |
+| Antigravity CLI | `agy` | Conversas, `brain/`, histórico e settings | `history.jsonl` e `trustedWorkspaces` |
+| Maestri | `maestri` | Workspaces, notas, preferências e layout | `workingDirectory` dos workspaces e terminais |
+| OpenCode | `opencode` | `storage/` | Nenhum: cópia literal, formato não validado |
 
-| Diretório real | Encoded em disco | Pode ter vindo de |
-|----------------|------------------|-------------------|
-| `/work/claude-migrate` | `-work-claude-migrate` | `claude-migrate`, `claude_migrate`, `claude.migrate` |
-| `/home/u/.config` | `-home-u--config` | `.config`, `-config` |
-| `/work/alianca_divergente` | `-work-alianca-divergente` | `alianca_divergente`, `alianca-divergente` |
+Limitações conhecidas:
 
-Qualquer ferramenta que reconstrua o path a partir do nome do diretório
-corrompe o destino (a versão anterior transformava `claude-migrate` em
-`claude/migrate`). `claude-migrate` resolve isso lendo o `cwd` real de dentro
-do JSONL da sessão - a unica fonte de verdade - e nunca decodifica o nome do
-diretório. No restore, o `cwd` embutido em cada linha do JSONL é reescrito de
-forma estruturada para o novo path.
+- Conversas do Antigravity (`conversations/*.db`) e bancos SQLite do Codex são
+  copiados sem reescrita interna. Eles continuam citando os paths antigos, e o
+  índice de threads do Codex não é atualizado.
+- Diretórios do Gemini identificados por hash continuam sob o hash antigo.
+- Um banco SQLite em uso pode ser copiado em estado intermediário. Para esses
+  arquivos, feche a ferramenta antes do backup.
 
 ---
 
 ## Instalação
 
-### Binário pré-compilado (recomendado)
+### Binário pré-compilado
 
-Cada release publica binários prontos. Baixe o da sua plataforma em
+Baixe o arquivo da sua plataforma em
 [Releases](https://github.com/vynazevedo/claude-migrate/releases/latest).
 
 | Plataforma | Arquivo |
@@ -52,45 +50,23 @@ Cada release publica binários prontos. Baixe o da sua plataforma em
 | macOS Intel | `claude-migrate-x86_64-apple-darwin.tar.gz` |
 | Windows x86_64 | `claude-migrate-x86_64-pc-windows-msvc.zip` |
 
-**Linux / macOS** (ajuste o nome do arquivo conforme a sua plataforma):
-
 ```bash
-# exemplo: Linux x86_64
 curl -L -o claude-migrate.tar.gz \
   https://github.com/vynazevedo/claude-migrate/releases/latest/download/claude-migrate-x86_64-unknown-linux-gnu.tar.gz
 tar -xzf claude-migrate.tar.gz
 chmod +x claude-migrate
 sudo mv claude-migrate /usr/local/bin/
-
-claude-migrate version
 ```
 
-No **macOS**, se o Gatekeeper bloquear o binário (não está assinado), libere com:
+No macOS, se o Gatekeeper bloquear o binário não assinado:
 
 ```bash
 xattr -d com.apple.quarantine claude-migrate
 ```
 
-**Windows** (PowerShell):
-
-```powershell
-Invoke-WebRequest -Uri "https://github.com/vynazevedo/claude-migrate/releases/latest/download/claude-migrate-x86_64-pc-windows-msvc.zip" -OutFile claude-migrate.zip
-Expand-Archive claude-migrate.zip -DestinationPath .
-# mova claude-migrate.exe para uma pasta no PATH
-```
-
 ### Compilar do código
 
-Requer Rust 1.74+.
-
-```bash
-git clone https://github.com/vynazevedo/claude-migrate
-cd claude-migrate
-cargo build --release
-# binário em target/release/claude-migrate
-```
-
-Ou direto via cargo:
+Requer Rust 1.85 ou superior.
 
 ```bash
 cargo install --git https://github.com/vynazevedo/claude-migrate
@@ -98,37 +74,29 @@ cargo install --git https://github.com/vynazevedo/claude-migrate
 
 ---
 
-## Quick Start
+## Início rápido
 
 ```bash
-# 1. Na máquina de origem: backup interativo
-claude-migrate backup -o sessoes.tar.gz
+# Na origem: veja o que foi detectado e procure segredos
+claude-migrate doctor
+claude-migrate audit --provider all
 
-# 2. Transfira sessoes.tar.gz para a outra máquina (scp, pendrive, nuvem)
+# Confira o plano e gere um backup criptografado
+claude-migrate backup --provider all --encrypt -o tudo.tar.gz.age --dry-run
+claude-migrate backup --provider all --encrypt -o tudo.tar.gz.age
 
-# 3. Na máquina de destino: preview do que seria restaurado
-claude-migrate restore sessoes.tar.gz --dry-run
+# No destino: confira o plano e restaure
+claude-migrate verify tudo.tar.gz.age
+claude-migrate restore tudo.tar.gz.age -m "/home/u:/Users/u" --dry-run
+claude-migrate restore tudo.tar.gz.age -m "/home/u:/Users/u"
 
-# 4. Restaure (a TUI sugere o mapeamento de paths conforme o OS)
-claude-migrate restore sessoes.tar.gz
+# Se precisar desfazer
+claude-migrate history
+claude-migrate rollback <ID>
 ```
 
----
-
-## Como funciona
-
-1. **Descoberta** - varre `~/.claude/projects/**/*.jsonl` e lê o `cwd` real, o
-   `sessionId`, o branch git e a versão de dentro de cada JSONL.
-2. **Correlação** - reune os artefatos da sessão por prefixo de id:
-   `session-env/<id>*` e `todos/<id>*`, inclusive os de sub-agente
-   (`<id>-agent-<id>.json`).
-3. **Empacotamento** - grava um `.tar.gz` com manifesto v2 e SHA-256 por
-   artefato.
-4. **Verificação** - no restore, recalcula o hash de cada arquivo e compara com
-   o manifesto antes de escrever.
-5. **Remapeamento** - aplica o mapeamento de path pelo prefixo mais longo,
-   recalcula o diretório encoded de destino e reescreve o `cwd` linha a linha
-   dentro do JSONL.
+Sem argumentos em um terminal, `claude-migrate` abre a interface interativa.
+Sem terminal, mostra a ajuda.
 
 ---
 
@@ -136,217 +104,238 @@ claude-migrate restore sessoes.tar.gz
 
 | Comando | Descrição |
 |---------|-----------|
-| `backup` | Seleciona sessões na TUI e gera o `.tar.gz` |
-| `restore <arquivo>` | Restaura sessões com remapeamento de paths |
-| `list [arquivo]` | Lista sessões locais, ou dentro de um backup |
+| `doctor` | Provedores detectados, paths, tamanhos e processos em execução |
+| `scan` | Inventário de sessões, configs e workspaces |
+| `audit` | Procura tokens nos arquivos selecionados, sem exibir os valores |
+| `backup` | Gera o arquivo de backup |
+| `verify <arquivo>` | Confere integridade, checksums e segurança das entradas |
+| `list [arquivo]` | Lista sessões locais ou de um arquivo |
+| `restore <arquivo>` | Restaura sessões e itens de provedores |
+| `history` | Lista os restores registrados no journal |
+| `rollback <id>` | Desfaz um restore |
+| `completions <shell>` | Gera autocomplete para bash, zsh, fish, elvish ou powershell |
 | `version` | Mostra a versão |
+
+`doctor`, `scan`, `audit`, `backup`, `verify`, `list`, `restore`, `history` e
+`rollback` aceitam `--json`.
 
 ### backup
 
-```bash
-claude-migrate backup                 # TUI, nome de arquivo automático
-claude-migrate backup -o meu.tar.gz   # saída específica
-claude-migrate backup --full          # inclui shell-snapshots, file-history, plans
-claude-migrate backup --config        # inclui config global (settings, plugins, MCP)
-claude-migrate backup --all           # sessões + extras + config
-
-# não-interativo (scriptável/cron): todas as sessões cujo cwd contém o texto
-claude-migrate backup --match "/home/u/projeto" -o projeto.tar.gz
-```
+Sem `--provider`, o backup considera só o Claude Code.
 
 | Flag | Descrição |
 |------|-----------|
-| `-o, --output` | Caminho do arquivo de saída |
-| `--match <SUBSTR>` | Não-interativo: faz backup de todas as sessões cujo cwd contém `SUBSTR` |
-| `--full` | Inclui `shell-snapshots`, `file-history`, `plans` |
-| `--config` | Inclui config global: settings, `CLAUDE.md`, plugins, MCP servers |
-| `--include-credentials` | Com `--config`, inclui também credenciais de login (sensível) |
+| `-p, --provider` | Lista separada por vírgula, ou `all` |
+| `--match <SUBSTR>` | Só itens cujo `cwd` contém `SUBSTR` |
+| `--full` | Inclui diretórios auxiliares do Claude |
+| `--config` | Inclui configuração global |
 | `--all` | Atalho para `--full --config` |
-
-Controles da TUI: setas ou `j`/`k` navegar, `space` selecionar, `a` todas,
-`n` nenhuma, `/` filtrar, `b`/`enter` criar backup, `q` sair.
+| `--include-state` | Inclui bancos de estado e histórico dos provedores |
+| `--include-credentials` | Inclui credenciais de login. Exige `--encrypt` |
+| `--encrypt` | Criptografa com senha usando age |
+| `-o, --output` | Arquivo de saída |
+| `--overwrite` | Permite substituir um arquivo de saída existente |
+| `--dry-run` | Mostra o plano e sai sem escrever |
+| `-y, --yes` | Dispensa a confirmação |
 
 ### restore
 
-```bash
-claude-migrate restore meu.tar.gz                       # TUI interativa
-claude-migrate restore meu.tar.gz --dry-run             # preview, sem escrever
-claude-migrate restore meu.tar.gz -m "/home/u:/Users/u" # mapeamento direto
-claude-migrate restore meu.tar.gz -f                    # sem TUI, sem mapeamento
-```
-
 | Flag | Descrição |
 |------|-----------|
-| `-m, --mappings` | Mapeamentos `origem:destino` separados por vírgula |
-| `-d, --dest` | Diretório Claude destino (default `~/.claude`) |
-| `--dry-run` | Mostra o que seria feito sem escrever |
-| `-f, --force` | Pula a TUI (restore nao-interativo) |
-| `--rewrite-tool-paths` | Reescreve tambem paths absolutos em chamadas de ferramenta |
-| `--restore-history` | Acrescenta entradas ao `history.jsonl` |
-| `--no-verify-checksum` | Não verifica checksum antes de restaurar |
-| `--config` | Aplica o pacote de config global presente no backup |
-| `--overwrite-config` | Com `--config`, sobrescreve config e MCP existentes |
+| `-d, --dest` | Diretório de destino do Claude |
+| `--provider-home <ID=PATH>` | Destino de um provedor. Pode ser repetida |
+| `-m, --mappings` | Pares `origem:destino` separados por vírgula |
+| `-p, --provider` | Restaura só os provedores indicados |
+| `--dry-run` | Mostra o plano e sai sem escrever |
+| `-y, --yes` | Dispensa a confirmação |
+| `--config` | Aplica a configuração global do arquivo |
+| `--overwrite` | Permite sobrescrever arquivos e entradas de config |
+| `--allow-exec-config` | Permite config capaz de executar código |
+| `--allow-credentials` | Permite restaurar credenciais |
+| `--allow-running` | Permite restaurar com o provedor em execução |
+| `--rewrite-tool-paths` | Reescreve paths dentro de chamadas de ferramenta |
+| `--restore-history` | Acrescenta as sessões ao `history.jsonl` |
+| `--no-verify-checksum` | Ignora a verificação prévia do arquivo |
+
+Sem `--dest`, cada provedor vai para o diretório real dele. Com `--dest`, nenhum
+outro provedor usa o diretório real por padrão: o plano recusa os que não têm
+`--provider-home`, a menos que `--provider` os deixe de fora.
+
+```bash
+# Restaura tudo em um diretório de teste
+claude-migrate restore tudo.tar.gz.age \
+  --dest /tmp/teste/.claude \
+  --provider-home codex=/tmp/teste/.codex \
+  --provider-home maestri=/tmp/teste/.maestri \
+  --dry-run
+
+# Restaura só o Claude em outro diretório
+claude-migrate restore tudo.tar.gz.age --dest /tmp/teste/.claude --provider claude
+```
+
+### Interface interativa
+
+Na tela inicial, escolha provedores e itens e tecle `b` para o backup ou `r`
+para o restore. Toda escrita passa por uma tela com o plano real.
+
+No restore, o plano é recalculado a cada mudança, e o plano confirmado é o que
+será executado:
+
+| Tecla | Ação na tela de plano |
+|-------|-----------------------|
+| `enter` ou `y` | Executa. Fica bloqueado enquanto houver `REFUSE` |
+| `r` | Liga ou desliga `allow-running` |
+| `x` | Liga ou desliga `exec-config` |
+| `c` | Liga ou desliga `credentials` |
+| `o` | Liga ou desliga `overwrite` |
+| `esc` | Volta ao mapeamento |
+| `q` | Sai sem escrever |
+
+O backup criptografado e a seleção de credenciais estão disponíveis apenas na
+linha de comando. Na interface, o restore seleciona sessões do Claude
+individualmente, e os itens dos outros provedores aparecem no plano como um
+conjunto.
+
+---
+
+## Segurança
+
+O fluxo prioriza não perder dados e não executar nada inesperado:
+
+- **Plano primeiro.** `--dry-run` mostra o plano que a execução real usa. Cada
+  operação traz ação (`create`, `overwrite`, `merge`, `skip`, `REFUSE`) e risco
+  (`normal`, `SENSITIVE`, `EXECUTES_CODE`).
+- **Confirmação.** Sem terminal e sem `--yes`, nada é escrito e o código de
+  saída é 3.
+- **Rollback.** Cada restore grava um journal com o conteúdo anterior.
+- **Escrita atômica e privada.** Arquivos com modo 0600 e diretórios com 0700
+  em Unix.
+- **Arquivo hostil.** Entradas com path traversal, symlinks abaixo do destino,
+  tipos especiais e tamanhos acima dos limites são rejeitados.
+- **Credenciais.** Ficam de fora por padrão, entram só com `--encrypt` e voltam
+  só com `--allow-credentials`.
+- **Config executável.** Hooks e comandos de terminal são pulados sem
+  `--allow-exec-config`. O plano informa o motivo.
+- **Saída limpa.** Sequências de controle vindas de manifestos são removidas
+  antes da exibição.
+- **Senha fora do argv.** Use o prompt ou `CLAUDE_MIGRATE_PASSPHRASE`.
+
+O que essas proteções não garantem:
+
+- Os checksums de um arquivo sem criptografia detectam corrupção, mas não
+  adulteração. Quem altera o arquivo pode recalculá-los. Só restaure arquivos
+  de origem confiável.
+- O detector de segredos usa padrões conhecidos e pode deixar passar outros
+  formatos. Sessões costumam conter segredos colados em conversas, então prefira
+  `--encrypt`.
+- A detecção de provedor em execução compara nomes de processo e funciona apenas
+  no Linux. Em outros sistemas, feche as ferramentas antes do restore.
+
+### Códigos de saída
+
+| Código | Significado |
+|--------|-------------|
+| 0 | Sucesso |
+| 1 | Erro |
+| 2 | Uso incorreto |
+| 3 | Confirmação necessária ou recusada |
+| 4 | Verificação do arquivo falhou |
+| 5 | O plano contém recusas |
+
+### Variáveis de ambiente
+
+| Variável | Uso |
+|----------|-----|
+| `CLAUDE_CONFIG_DIR` | Diretório do Claude |
+| `CODEX_HOME` | Diretório do Codex |
+| `MAESTRI_HOME` | Diretório do Maestri |
+| `CLAUDE_MIGRATE_PASSPHRASE` | Senha em modo não interativo |
+| `CLAUDE_MIGRATE_DATA_DIR` | Base do journal de restores |
+| `CLAUDE_MIGRATE_MAX_ARCHIVE_BYTES` | Limite do tamanho total extraído |
+| `NO_COLOR` | Desativa cores |
 
 ---
 
 ## Mapeamento de paths
 
-Formato `origem:destino`, aplicado pelo prefixo mais longo que casa:
+O formato é `origem:destino`, aplicado pelo prefixo mais longo que casa em uma
+fronteira de diretório. Entre Windows e POSIX, os separadores do restante do
+path são convertidos.
 
 ```bash
-# Linux/WSL -> macOS
 -m "/home/user:/Users/user"
-
-# WSL mount -> macOS
 -m "/mnt/e/workspace:/Users/user/workspace"
-
-# Múltiplos
+-m "C:\Users\user:/home/user"
 -m "/home/u/work:/Users/u/work,/home/u/pessoal:/Users/u/pessoal"
 ```
 
-Na TUI os roots de projeto são detectados automaticamente e o destino é
-sugerido conforme o OS de origem e destino. Em destinos case-insensitive
-(macOS APFS, Windows), colisões de case são detectadas e avisadas antes de
-sobrescrever.
+O Claude Code localiza sessões pelo diretório atual. Depois de migrar, rode
+`claude --resume` de dentro do novo diretório.
+
+O path original vem do `cwd` gravado em cada sessão, nunca do nome do diretório
+encoded, porque essa codificação perde informação: `/work/a_b` e `/work/a-b`
+geram o mesmo nome.
 
 ---
 
-## Migrando para um diretório diferente
-
-O Claude Code indexa as sessões pelo diretório de trabalho: `claude --resume`
-lista apenas o que está em `~/.claude/projects/<encode(cwd_atual)>/`. Logo,
-mover uma sessão para um path diferente funciona desde que você forneça o
-mapeamento - a ferramenta recalcula o diretório encoded de destino e reescreve
-o `cwd` dentro do JSONL.
-
-```bash
-# exportou em /home/vinicius/projects/app (Linux)
-# no Mac o projeto vive em /Users/vini/dev/app
-claude-migrate restore sessoes.tar.gz \
-  -m "/home/vinicius/projects:/Users/vini/dev"
-
-cd /Users/vini/dev/app
-claude --resume        # a sessão migrada aparece
-```
-
-Pontos importantes:
-
-- Forneça o mapeamento sempre que o diretório mudar; sem ele a sessão cai sob o
-  path antigo.
-- Rode `claude --resume` de dentro do novo diretório.
-- Para continuar trabalhando (não só ler o histórico), tenha o código do
-  projeto no novo path.
-- Use `--dry-run` para conferir o `encoded:` de destino antes de escrever.
-- Re-restaurar com outro mapeamento é seguro: cria a cópia no novo encoded e
-  pula a antiga, sem perder nada.
-
----
-
-## Configuração global (MCP, settings)
-
-O objetivo da ferramenta é trocar de computador sem recomeçar. Com `--config`,
-o backup também carrega sua configuração global:
-
-- `settings.json`, `settings.local.json`, `CLAUDE.md`
-- arquivos de config dos plugins
-- os servidores MCP registrados (`mcpServers` do `~/.claude.json`)
-
-```bash
-# origem
-claude-migrate backup --all -o tudo.tar.gz
-
-# destino: aplica sessões + extras + config
-claude-migrate restore tudo.tar.gz --config
-```
-
-No restore, os servidores MCP são **mesclados** no `~/.claude.json` do destino
-sem apagar o que já existe (use `--overwrite-config` para sobrescrever). Os
-arquivos de config só são escritos se ainda não existirem, salvo
-`--overwrite-config`.
-
-Atenção a segredos:
-
-- Definições de MCP podem conter API keys; um backup com `--config` passa a
-  conter segredos. Transfira e armazene o arquivo com cuidado.
-- As credenciais de login (`.credentials.json`, `oauthAccount`) ficam **de
-  fora por padrão**. Inclua apenas com `--include-credentials`, ciente de que
-  isso carrega o seu login do Claude.
-
----
-
-## Estrutura do backup
+## Formato do arquivo
 
 ```
 backup.tar.gz
 ├── manifest.json
-├── sessions/
-│   └── <session-id>/
-│       ├── <session-id>.jsonl
-│       ├── env/<arquivo>.json
-│       └── todos/<arquivo>.json
-├── extras/                      (apenas com --full)
-│   ├── shell-snapshots/...
-│   ├── file-history/...
-│   └── plans/...
-└── config/                      (apenas com --config)
-    ├── settings.json
-    ├── CLAUDE.md
-    ├── plugins/...
-    └── mcp-servers.json
+├── sessions/<session-id>/...
+├── extras/...
+├── config/...
+└── providers/<id>/...
 ```
 
-O `manifest.json` (schema v2) registra OS de origem, versão do Claude Code, e
-para cada sessão o `cwd` real e o SHA-256 de cada artefato.
+O manifesto (schema v3) registra origem e SHA-256 de cada arquivo. Arquivos
+criptografados são o mesmo `tar.gz` dentro de um envelope age. Arquivos v1 e v2
+continuam legíveis.
 
 ---
 
 ## Desenvolvimento
 
 ```bash
-cargo test                  # 23 testes (unit + roundtrip de integração)
-cargo clippy --all-targets  # lint
-cargo fmt                   # formatação
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
-
-Layout:
 
 | Módulo | Responsabilidade |
 |--------|------------------|
-| `claudepath` | Encode canônico de path (sem decode, por ser lossy) |
-| `discover` | Descoberta de sessões via `cwd` do JSONL |
-| `remap` | Mapeamento de path e rewrite estruturado do JSONL |
-| `backup` | Empacotamento `.tar.gz` + checksum |
-| `restore` | Restore + verificação + colisão de case |
-| `cli` | Interface de linha de comando (clap) |
-| `tui` | Interface interativa (ratatui) |
+| `engine` | Planejamento, backup, restore, rollback e auditoria |
+| `archive` | Leitura e escrita do arquivo, limites e verificação |
+| `crypto` | Envelope age com senha |
+| `journal` | Registro de restores e pré-imagens para rollback |
+| `safety` | Validação de paths e escrita atômica |
+| `secrets` | Detecção de tokens em streaming |
+| `plan` | Ações, riscos e resumo do plano |
+| `provider` | Adaptadores de cada ferramenta |
+| `remap` | Mapeamento de paths e reescrita de JSONL |
+| `discover`, `backup`, `config`, `claudepath`, `model` | Domínio do Claude Code e manifesto |
+| `cli`, `ui`, `tui` | Linha de comando, formatação e interface interativa |
 
 ---
 
-## Troubleshooting
+## Solução de problemas
 
-- **Sessão nao aparece após restore** - confirme que rodou `claude --resume` no
-  diretório de destino correto, e cheque `~/.claude/projects/` pelo nome
-  encoded mostrado no preview.
-- **Sessão pulada (skipped)** - já existe no destino; o restore nunca
-  sobrescreve. Use `--dry-run` para inspecionar.
-- **Falha de checksum** - o backup está corrompido ou truncado; gere de novo.
-  Para forçar, use `--no-verify-checksum`.
-
----
-
-## Roadmap
-
-- v2.0 (atual) - descoberta via JSONL, manifesto v2 com checksum, remapeamento
-  estruturado de `cwd`, backup `--full`, TUI, compatibilidade de leitura v1.
-- v2.1 - publicação em crates.io e Homebrew, instalação por binário.
-- v2.2 - rewrite opcional de paths em todos os artefatos com relatório
-  detalhado de diff.
+- **`provider may be running`**: feche a ferramenta. Se aceitar o risco, use
+  `--allow-running` ou a tecla `r` na interface.
+- **`provider destination not specified`**: há itens desse provedor no arquivo e
+  você usou `--dest`. Informe `--provider-home` ou filtre com `--provider`.
+- **Item `skip`**: o motivo aparece no plano. Normalmente falta uma permissão
+  explícita ou o arquivo já existe.
+- **Sessão não aparece após o restore**: rode `claude --resume` no diretório
+  mapeado e confira o destino com `--dry-run`.
+- **`verify` retorna 4**: o arquivo está corrompido, truncado, ou a senha está
+  errada.
 
 ---
 
-## Licença e suporte
+## Licença
 
-MIT - veja [LICENSE](LICENSE).
+MIT. Veja [LICENSE](LICENSE).
 
 - Issues: https://github.com/vynazevedo/claude-migrate/issues
-- Repositório: https://github.com/vynazevedo/claude-migrate

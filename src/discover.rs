@@ -226,11 +226,15 @@ pub fn load_sessions(claude_dir: &Path) -> Result<Vec<DiscoveredSession>> {
     }
 
     for entry in walkdir::WalkDir::new(&projects)
+        .follow_root_links(false)
         .into_iter()
         .filter_map(Result::ok)
     {
         let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        if entry.depth() != 2
+            || !entry.file_type().is_file()
+            || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+        {
             continue;
         }
 
@@ -239,6 +243,7 @@ pub fn load_sessions(claude_dir: &Path) -> Result<Vec<DiscoveredSession>> {
             None => continue,
         };
 
+        crate::archive::ensure_regular(path)?;
         let meta = read_meta(path);
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let timestamp = meta.timestamp.unwrap_or_else(|| file_mtime_utc(path));
@@ -257,7 +262,29 @@ pub fn load_sessions(claude_dir: &Path) -> Result<Vec<DiscoveredSession>> {
             artifacts: Vec::new(),
         };
 
-        let companions = collect_companion_artifacts(claude_dir, &session_id);
+        crate::safety::validate_id(&session_id)?;
+        let mut companions = collect_companion_artifacts(claude_dir, &session_id);
+        for (kind, root) in [
+            (
+                ArtifactKind::Env,
+                claude_dir.join("session-env").join(&session_id),
+            ),
+            (
+                ArtifactKind::Project,
+                path.parent().unwrap().join(&session_id),
+            ),
+            (ArtifactKind::Memory, path.parent().unwrap().join("memory")),
+        ] {
+            if !root.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&root).follow_root_links(false) {
+                let entry = entry?;
+                if entry.file_type().is_file() {
+                    companions.push((kind, entry.into_path()));
+                }
+            }
+        }
 
         discovered.push(DiscoveredSession {
             session,
