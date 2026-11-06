@@ -2,8 +2,8 @@
 name = "claude-migrate"
 version = "2.0.0"
 edition = "2021"
-rust-version = "1.74"
-description = "Backup, restore and migrate Claude Code sessions across machines with lossless path remapping"
+rust-version = "1.85"
+description = "Backup, restore and migrate AI coding tool sessions and config across machines with plans, rollback and path remapping"
 repository = "https://github.com/vynazevedo/claude-migrate"
 license = "MIT"
 keywords = ["claude", "cli", "backup", "migration", "tui"]
@@ -29,9 +29,12 @@ anyhow = "1"
 thiserror = "2"
 dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
-
-[dev-dependencies]
 tempfile = "3"
+regex = "1"
+age = "0.11"
+rpassword = "7"
+clap_complete = "4"
+owo-colors = { version = "4", features = ["supports-colors"] }
 
 [profile.release]
 strip = true
