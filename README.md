@@ -270,7 +270,8 @@ O projeto se chamava `claude-migrate`. Na v3:
 - **Journal.** `history` e `rollback` continuam lendo os restores do diretório
   antigo. Os novos ficam em `aisession-backup/journal`.
 - **Arquivos.** Backups gerados pela v2 podem ser verificados e restaurados. Novos
-  backups usam o schema v3, que a v2 não lê.
+  backups usam o schema v3: restaure-os com a v3, porque a v2 não verifica a versão
+  do schema e não trata os itens de `providers/`.
 - **Compilação.** O mínimo agora é Rust 1.85.
 
 ---
