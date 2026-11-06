@@ -4,6 +4,9 @@ Backup, restore e migração de sessões e configuração de ferramentas de IA p
 terminal entre máquinas, com plano prévio, rollback e remapeamento preciso de
 paths.
 
+AI session backup and migration for terminal coding tools: Claude Code, Codex,
+Grok, Gemini, Antigravity, Maestri and OpenCode.
+
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![version](https://img.shields.io/badge/version-3.0.0-success?style=flat-square)](Cargo.toml)
 [![CI](https://img.shields.io/github/actions/workflow/status/vynazevedo/aisession-backup/ci.yml?style=flat-square&label=CI&branch=main)](https://github.com/vynazevedo/aisession-backup/actions/workflows/ci.yml)
@@ -254,9 +257,21 @@ O que essas proteções não garantem:
 | `AISESSION_BACKUP_MAX_ARCHIVE_BYTES` | Limite do tamanho total extraído |
 | `NO_COLOR` | Desativa cores |
 
-O projeto se chamava `claude-migrate`. As variáveis `CLAUDE_MIGRATE_*` continuam
-aceitas quando a equivalente `AISESSION_BACKUP_*` não está definida, e `history` e
-`rollback` continuam lendo o journal do diretório antigo.
+---
+
+## Atualizando da v2
+
+O projeto se chamava `claude-migrate`. Na v3:
+
+- **Binário.** O comando agora é `aisession-backup`. Atualize scripts e aliases, e
+  gere de novo o autocomplete com `completions`.
+- **Variáveis.** `CLAUDE_MIGRATE_*` continuam aceitas quando a equivalente
+  `AISESSION_BACKUP_*` não está definida.
+- **Journal.** `history` e `rollback` continuam lendo os restores do diretório
+  antigo. Os novos ficam em `aisession-backup/journal`.
+- **Arquivos.** Backups gerados pela v2 podem ser verificados e restaurados. Novos
+  backups usam o schema v3, que a v2 não lê.
+- **Compilação.** O mínimo agora é Rust 1.85.
 
 ---
 
@@ -294,8 +309,9 @@ backup.tar.gz
 ```
 
 O manifesto (schema v3) registra origem e SHA-256 de cada arquivo. Arquivos
-criptografados são o mesmo `tar.gz` dentro de um envelope age. Arquivos v1 e v2
-continuam legíveis.
+criptografados são o mesmo `tar.gz` dentro de um envelope age. Arquivos v2
+continuam legíveis. O código ainda aceita o schema v1, mas essa leitura não foi
+testada com um arquivo real daquela versão.
 
 ---
 
@@ -306,6 +322,9 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+O CI roda os testes em Linux, macOS e Windows. O teste de provedor em execução só
+existe no Linux, a única plataforma com essa detecção.
 
 | Módulo | Responsabilidade |
 |--------|------------------|
