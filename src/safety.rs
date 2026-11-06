@@ -107,6 +107,27 @@ pub fn set_private(file: &File) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn long_path(path: &Path) -> Result<PathBuf> {
+    let absolute =
+        std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
+    let Some(text) = absolute.to_str() else {
+        return Ok(absolute);
+    };
+    if text.starts_with(r"\\?\") || text.starts_with(r"\\.\") {
+        return Ok(absolute);
+    }
+    Ok(match text.strip_prefix(r"\\") {
+        Some(unc) => PathBuf::from(format!(r"\\?\UNC\{unc}")),
+        None => PathBuf::from(format!(r"\\?\{text}")),
+    })
+}
+
+#[cfg(not(windows))]
+fn long_path(path: &Path) -> Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
 pub fn atomic_write_from<R: Read>(
     base: &Path,
     rel: &str,
@@ -114,7 +135,8 @@ pub fn atomic_write_from<R: Read>(
     mode: WriteMode,
 ) -> Result<u64> {
     let dest = safe_join(base, rel)?;
-    let parent = dest
+    let target = long_path(&dest)?;
+    let parent = target
         .parent()
         .ok_or_else(|| anyhow!("no parent for {}", dest.display()))?;
     create_private_dirs(parent)?;
@@ -126,11 +148,11 @@ pub fn atomic_write_from<R: Read>(
     temp.as_file().sync_all()?;
     match mode {
         WriteMode::CreateNew => {
-            temp.persist_noclobber(&dest)
+            temp.persist_noclobber(&target)
                 .map_err(|err| anyhow!("writing {}: {}", dest.display(), err.error))?;
         }
         WriteMode::Replace => {
-            temp.persist(&dest)
+            temp.persist(&target)
                 .map_err(|err| anyhow!("writing {}: {}", dest.display(), err.error))?;
         }
     }
@@ -157,6 +179,19 @@ pub fn create_private_new(path: &Path) -> Result<File> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn long_path_uses_the_verbatim_prefix() {
+        assert_eq!(
+            super::long_path(std::path::Path::new(r"C:\a/b")).unwrap(),
+            std::path::PathBuf::from(r"\\?\C:\a\b")
+        );
+        assert_eq!(
+            super::long_path(std::path::Path::new(r"\\host\share\a")).unwrap(),
+            std::path::PathBuf::from(r"\\?\UNC\host\share\a")
+        );
+    }
+
     use super::*;
 
     #[test]

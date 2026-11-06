@@ -14,24 +14,28 @@ pub const MAX_ENTRY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 pub const MAX_TOTAL_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 1_000_000;
 
+pub fn env_setting(suffix: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("AISESSION_BACKUP_{suffix}"))
+        .or_else(|| std::env::var_os(format!("CLAUDE_MIGRATE_{suffix}")))
+}
+
 pub fn total_limit() -> Result<u64> {
-    match std::env::var("CLAUDE_MIGRATE_MAX_ARCHIVE_BYTES") {
-        Ok(value) => {
-            let limit = value
-                .parse::<u64>()
-                .context("CLAUDE_MIGRATE_MAX_ARCHIVE_BYTES must be a positive integer")?;
-            if limit == 0 || limit == u64::MAX {
-                bail!("invalid archive size limit")
-            }
-            Ok(limit)
-        }
-        Err(std::env::VarError::NotPresent) => Ok(MAX_TOTAL_SIZE),
-        Err(error) => Err(error.into()),
+    let Some(value) = env_setting("MAX_ARCHIVE_BYTES") else {
+        return Ok(MAX_TOTAL_SIZE);
+    };
+    let limit = value
+        .to_str()
+        .context("AISESSION_BACKUP_MAX_ARCHIVE_BYTES must be valid unicode")?
+        .parse::<u64>()
+        .context("AISESSION_BACKUP_MAX_ARCHIVE_BYTES must be a positive integer")?;
+    if limit == 0 || limit == u64::MAX {
+        bail!("invalid archive size limit")
     }
+    Ok(limit)
 }
 
 pub fn data_dir() -> Result<PathBuf> {
-    std::env::var_os("CLAUDE_MIGRATE_DATA_DIR")
+    env_setting("DATA_DIR")
         .map(PathBuf::from)
         .or_else(dirs::data_local_dir)
         .context("no data directory")
@@ -39,7 +43,7 @@ pub fn data_dir() -> Result<PathBuf> {
 
 pub fn staging_dir() -> Result<tempfile::TempDir> {
     let base = data_dir()?;
-    let root = safety::safe_join(&base, "claude-migrate/staging")?;
+    let root = safety::safe_join(&base, "aisession-backup/staging")?;
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -599,7 +603,7 @@ mod tests {
             {
                 let staged = stage(&plain, &Passphrase::None).unwrap();
                 staging_path = staged.staging.path().to_path_buf();
-                assert!(staging_path.starts_with(root.join("data/claude-migrate/staging")));
+                assert!(staging_path.starts_with(root.join("data/aisession-backup/staging")));
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -626,8 +630,8 @@ mod tests {
                 "archive::tests::configured_small_total_limit_and_private_staging_location",
             ])
             .env(CHILD, temp.path())
-            .env("CLAUDE_MIGRATE_MAX_ARCHIVE_BYTES", "1024")
-            .env("CLAUDE_MIGRATE_DATA_DIR", temp.path().join("data"))
+            .env("AISESSION_BACKUP_MAX_ARCHIVE_BYTES", "1024")
+            .env("AISESSION_BACKUP_DATA_DIR", temp.path().join("data"))
             .status()
             .unwrap();
         assert!(status.success());
@@ -655,7 +659,7 @@ mod tests {
             .env(CHILD, temp.path())
             .env("TMPDIR", missing_tmp)
             .env(
-                "CLAUDE_MIGRATE_MAX_ARCHIVE_BYTES",
+                "AISESSION_BACKUP_MAX_ARCHIVE_BYTES",
                 (MAX_TOTAL_SIZE * 2).to_string(),
             )
             .status()

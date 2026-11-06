@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn existing_dash_is_preserved_as_dash() {
-        assert_eq!(encode("/x/claude-migrate"), "-x-claude-migrate");
+        assert_eq!(encode("/x/aisession-backup"), "-x-aisession-backup");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# claude-migrate
+# aisession-backup
 
 Backup, restore e migração de sessões e configuração de ferramentas de IA para
 terminal entre máquinas, com plano prévio, rollback e remapeamento preciso de
@@ -6,7 +6,7 @@ paths.
 
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![version](https://img.shields.io/badge/version-3.0.0-success?style=flat-square)](Cargo.toml)
-[![CI](https://img.shields.io/github/actions/workflow/status/vynazevedo/claude-migrate/ci.yml?style=flat-square&label=CI&branch=main)](https://github.com/vynazevedo/claude-migrate/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/vynazevedo/aisession-backup/ci.yml?style=flat-square&label=CI&branch=main)](https://github.com/vynazevedo/aisession-backup/actions/workflows/ci.yml)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square)](https://www.rust-lang.org)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square)](#instalação)
 
@@ -40,28 +40,28 @@ Limitações conhecidas:
 ### Binário pré-compilado
 
 Baixe o arquivo da sua plataforma em
-[Releases](https://github.com/vynazevedo/claude-migrate/releases/latest).
+[Releases](https://github.com/vynazevedo/aisession-backup/releases/latest).
 
 | Plataforma | Arquivo |
 |------------|---------|
-| Linux x86_64 | `claude-migrate-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64 | `claude-migrate-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `claude-migrate-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `claude-migrate-x86_64-apple-darwin.tar.gz` |
-| Windows x86_64 | `claude-migrate-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 | `aisession-backup-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `aisession-backup-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `aisession-backup-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `aisession-backup-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `aisession-backup-x86_64-pc-windows-msvc.zip` |
 
 ```bash
-curl -L -o claude-migrate.tar.gz \
-  https://github.com/vynazevedo/claude-migrate/releases/latest/download/claude-migrate-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf claude-migrate.tar.gz
-chmod +x claude-migrate
-sudo mv claude-migrate /usr/local/bin/
+curl -L -o aisession-backup.tar.gz \
+  https://github.com/vynazevedo/aisession-backup/releases/latest/download/aisession-backup-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf aisession-backup.tar.gz
+chmod +x aisession-backup
+sudo mv aisession-backup /usr/local/bin/
 ```
 
 No macOS, se o Gatekeeper bloquear o binário não assinado:
 
 ```bash
-xattr -d com.apple.quarantine claude-migrate
+xattr -d com.apple.quarantine aisession-backup
 ```
 
 ### Compilar do código
@@ -69,7 +69,7 @@ xattr -d com.apple.quarantine claude-migrate
 Requer Rust 1.85 ou superior.
 
 ```bash
-cargo install --git https://github.com/vynazevedo/claude-migrate
+cargo install --git https://github.com/vynazevedo/aisession-backup
 ```
 
 ---
@@ -78,24 +78,24 @@ cargo install --git https://github.com/vynazevedo/claude-migrate
 
 ```bash
 # Na origem: veja o que foi detectado e procure segredos
-claude-migrate doctor
-claude-migrate audit --provider all
+aisession-backup doctor
+aisession-backup audit --provider all
 
 # Confira o plano e gere um backup criptografado
-claude-migrate backup --provider all --encrypt -o tudo.tar.gz.age --dry-run
-claude-migrate backup --provider all --encrypt -o tudo.tar.gz.age
+aisession-backup backup --provider all --encrypt -o tudo.tar.gz.age --dry-run
+aisession-backup backup --provider all --encrypt -o tudo.tar.gz.age
 
 # No destino: confira o plano e restaure
-claude-migrate verify tudo.tar.gz.age
-claude-migrate restore tudo.tar.gz.age -m "/home/u:/Users/u" --dry-run
-claude-migrate restore tudo.tar.gz.age -m "/home/u:/Users/u"
+aisession-backup verify tudo.tar.gz.age
+aisession-backup restore tudo.tar.gz.age -m "/home/u:/Users/u" --dry-run
+aisession-backup restore tudo.tar.gz.age -m "/home/u:/Users/u"
 
 # Se precisar desfazer
-claude-migrate history
-claude-migrate rollback <ID>
+aisession-backup history
+aisession-backup rollback <ID>
 ```
 
-Sem argumentos em um terminal, `claude-migrate` abre a interface interativa.
+Sem argumentos em um terminal, `aisession-backup` abre a interface interativa.
 Sem terminal, mostra a ajuda.
 
 ---
@@ -163,14 +163,14 @@ outro provedor usa o diretório real por padrão: o plano recusa os que não tê
 
 ```bash
 # Restaura tudo em um diretório de teste
-claude-migrate restore tudo.tar.gz.age \
+aisession-backup restore tudo.tar.gz.age \
   --dest /tmp/teste/.claude \
   --provider-home codex=/tmp/teste/.codex \
   --provider-home maestri=/tmp/teste/.maestri \
   --dry-run
 
 # Restaura só o Claude em outro diretório
-claude-migrate restore tudo.tar.gz.age --dest /tmp/teste/.claude --provider claude
+aisession-backup restore tudo.tar.gz.age --dest /tmp/teste/.claude --provider claude
 ```
 
 ### Interface interativa
@@ -218,7 +218,7 @@ O fluxo prioriza não perder dados e não executar nada inesperado:
   `--allow-exec-config`. O plano informa o motivo.
 - **Saída limpa.** Sequências de controle vindas de manifestos são removidas
   antes da exibição.
-- **Senha fora do argv.** Use o prompt ou `CLAUDE_MIGRATE_PASSPHRASE`.
+- **Senha fora do argv.** Use o prompt ou `AISESSION_BACKUP_PASSPHRASE`.
 
 O que essas proteções não garantem:
 
@@ -249,10 +249,14 @@ O que essas proteções não garantem:
 | `CLAUDE_CONFIG_DIR` | Diretório do Claude |
 | `CODEX_HOME` | Diretório do Codex |
 | `MAESTRI_HOME` | Diretório do Maestri |
-| `CLAUDE_MIGRATE_PASSPHRASE` | Senha em modo não interativo |
-| `CLAUDE_MIGRATE_DATA_DIR` | Base do journal de restores |
-| `CLAUDE_MIGRATE_MAX_ARCHIVE_BYTES` | Limite do tamanho total extraído |
+| `AISESSION_BACKUP_PASSPHRASE` | Senha em modo não interativo |
+| `AISESSION_BACKUP_DATA_DIR` | Base do journal de restores |
+| `AISESSION_BACKUP_MAX_ARCHIVE_BYTES` | Limite do tamanho total extraído |
 | `NO_COLOR` | Desativa cores |
+
+O projeto se chamava `claude-migrate`. As variáveis `CLAUDE_MIGRATE_*` continuam
+aceitas quando a equivalente `AISESSION_BACKUP_*` não está definida, e `history` e
+`rollback` continuam lendo o journal do diretório antigo.
 
 ---
 
@@ -338,4 +342,4 @@ cargo fmt --check
 
 MIT. Veja [LICENSE](LICENSE).
 
-- Issues: https://github.com/vynazevedo/claude-migrate/issues
+- Issues: https://github.com/vynazevedo/aisession-backup/issues

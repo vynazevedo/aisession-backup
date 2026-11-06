@@ -348,23 +348,17 @@ impl HomeState {
                 if let Some(entry) = self.providers.get_mut(self.provider_cursor) {
                     let all_selected =
                         !entry.selected.is_empty() && entry.selected.iter().all(|&b| b);
-                    for b in &mut entry.selected {
-                        *b = !all_selected;
-                    }
+                    entry.selected.fill(!all_selected);
                 }
             }
             KeyCode::Char('a') => {
                 for entry in &mut self.providers {
-                    for b in &mut entry.selected {
-                        *b = true;
-                    }
+                    entry.selected.fill(true);
                 }
             }
             KeyCode::Char('n') => {
                 for entry in &mut self.providers {
-                    for b in &mut entry.selected {
-                        *b = false;
-                    }
+                    entry.selected.fill(false);
                 }
             }
             KeyCode::Char('b') if self.total_selected_items() > 0 => {
@@ -506,7 +500,7 @@ impl HomeState {
         match self.screen {
             HomeScreen::Providers => {
                 let header = Paragraph::new(format!(
-                    "claude-migrate Home | {} item(s) selected across providers",
+                    "aisession-backup Home | {} item(s) selected across providers",
                     self.total_selected_items()
                 ))
                 .style(Style::default().add_modifier(Modifier::BOLD));

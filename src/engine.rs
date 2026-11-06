@@ -325,7 +325,7 @@ fn run_backup_after_scan(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
     let mut builder = tempfile::Builder::new();
-    builder.prefix(".claude-migrate-snapshot-");
+    builder.prefix(".aisession-backup-snapshot-");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2134,7 +2134,7 @@ mod tests {
             .unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with(".claude-migrate-snapshot-")));
+            .starts_with(".aisession-backup-snapshot-")));
     }
 
     #[test]

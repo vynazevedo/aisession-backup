@@ -4,6 +4,7 @@
 # Backups gerados pela ferramenta
 *.tar.gz
 *.tar.gz.age
+.aisession-backup-snapshot-*/
 .claude-migrate-snapshot-*/
 
 # IDE e editor

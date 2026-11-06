@@ -1,14 +1,14 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    claude_migrate::tui::install_panic_hook();
-    if let Err(err) = claude_migrate::cli::run() {
-        let code = claude_migrate::cli::exit_code(&err);
+    aisession_backup::tui::install_panic_hook();
+    if let Err(err) = aisession_backup::cli::run() {
+        let code = aisession_backup::cli::exit_code(&err);
         let msg = format!("{err:#}");
         if !msg.is_empty() {
             eprintln!("error: {msg}");
         }
         return ExitCode::from(code);
     }
-    ExitCode::from(claude_migrate::cli::EXIT_OK)
+    ExitCode::from(aisession_backup::cli::EXIT_OK)
 }

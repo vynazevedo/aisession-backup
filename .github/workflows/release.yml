@@ -48,17 +48,17 @@ jobs:
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
         run: |
-          bin=target/${{ matrix.target }}/release/claude-migrate
-          tar -czf claude-migrate-${{ matrix.target }}.tar.gz -C "$(dirname "$bin")" claude-migrate
+          bin=target/${{ matrix.target }}/release/aisession-backup
+          tar -czf aisession-backup-${{ matrix.target }}.tar.gz -C "$(dirname "$bin")" aisession-backup
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/claude-migrate.exe -DestinationPath claude-migrate-${{ matrix.target }}.zip
+          Compress-Archive -Path target/${{ matrix.target }}/release/aisession-backup.exe -DestinationPath aisession-backup-${{ matrix.target }}.zip
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            claude-migrate-${{ matrix.target }}.tar.gz
-            claude-migrate-${{ matrix.target }}.zip
+            aisession-backup-${{ matrix.target }}.tar.gz
+            aisession-backup-${{ matrix.target }}.zip
           fail_on_unmatched_files: false
