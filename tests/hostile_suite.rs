@@ -696,7 +696,7 @@ fn deep_tool_result_names_survive_verification() {
     let cwd = "/work/app";
     put_session(&home, id, cwd, "parent");
     let encoded = aisession_backup::claudepath::encode(cwd);
-    let long_name = "r".repeat(120);
+    let long_name = "r".repeat(180);
     put_rel(
         &home,
         &format!("projects/{encoded}/{id}/tool-results/{long_name}.bin"),

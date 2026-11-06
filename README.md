@@ -335,8 +335,6 @@ cargo fmt --check
   mapeado e confira o destino com `--dry-run`.
 - **`verify` retorna 4**: o arquivo está corrompido, truncado, ou a senha está
   errada.
-- **`writing ...: os error 3` no Windows**: o path de destino pode ter passado de 260
-  caracteres. Restaure em um diretório com path mais curto usando `--dest`.
 
 ---
 
