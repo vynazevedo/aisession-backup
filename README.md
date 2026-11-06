@@ -67,6 +67,18 @@ No macOS, se o Gatekeeper bloquear o binário não assinado:
 xattr -d com.apple.quarantine aisession-backup
 ```
 
+No Windows, em PowerShell:
+
+```powershell
+Invoke-WebRequest -OutFile aisession-backup.zip `
+  https://github.com/vynazevedo/aisession-backup/releases/latest/download/aisession-backup-x86_64-pc-windows-msvc.zip
+Expand-Archive aisession-backup.zip -DestinationPath .
+.\aisession-backup.exe version
+```
+
+Coloque o `aisession-backup.exe` em uma pasta do `PATH` para usar os comandos abaixo
+sem o `.\`.
+
 ### Compilar do código
 
 Requer Rust 1.85 ou superior.
@@ -100,6 +112,154 @@ aisession-backup rollback <ID>
 
 Sem argumentos em um terminal, `aisession-backup` abre a interface interativa.
 Sem terminal, mostra a ajuda.
+
+---
+
+## Migrando entre Linux, macOS e Windows
+
+O arquivo de backup é portátil: pode ser gerado em qualquer um dos três sistemas e
+restaurado em qualquer outro, criptografado ou não. O que muda de um sistema para o
+outro são os paths, e por isso o restore precisa de `-m`.
+
+### Passo a passo
+
+1. **Na origem, gere o backup.** O comando é o mesmo nos três sistemas:
+
+   ```bash
+   aisession-backup backup --provider all --encrypt -o tudo.tar.gz.age
+   ```
+
+2. **Copie o arquivo para o destino**, por `scp`, pen drive ou nuvem.
+3. **No destino, instale o `aisession-backup` e leve o código dos seus projetos.** A
+   ferramenta migra as sessões, não os repositórios. Clone cada projeto no path que
+   ele terá no destino.
+4. **Veja os paths originais.** Copie deles a parte de origem do mapeamento:
+
+   ```bash
+   aisession-backup verify tudo.tar.gz.age
+   aisession-backup list tudo.tar.gz.age
+   ```
+
+5. **Confira o plano.** Na saída de `--dry-run`, a coluna `DESTINATION` precisa
+   mostrar o path novo, e `REWRITES` não pode estar zerada nos arquivos que citam
+   paths:
+
+   ```bash
+   aisession-backup restore tudo.tar.gz.age -m '/Users/ana:/home/ana' --dry-run
+   ```
+
+6. **Feche as ferramentas de IA e restaure:**
+
+   ```bash
+   aisession-backup restore tudo.tar.gz.age -m '/Users/ana:/home/ana'
+   ```
+
+7. **Retome a sessão de dentro do novo diretório do projeto**, por exemplo com
+   `claude --resume`. Se algo der errado, `history` e `rollback` desfazem o restore.
+
+### Qual mapeamento usar
+
+Troque `ana` pelos seus usuários de origem e destino. As aspas simples funcionam em
+bash, zsh e PowerShell. No `cmd.exe`, use aspas duplas.
+
+| De | Para | Mapeamento |
+|----|------|------------|
+| macOS | Linux | `-m '/Users/ana:/home/ana'` |
+| macOS | Windows | `-m '/Users/ana:C:\Users\ana'` |
+| Linux | macOS | `-m '/home/ana:/Users/ana'` |
+| Linux | Windows | `-m '/home/ana:C:\Users\ana'` |
+| Windows | macOS | `-m 'C:\Users\ana:/Users/ana'` |
+| Windows | Linux | `-m 'C:\Users\ana:/home/ana'` |
+| WSL | Windows | `-m '/mnt/c/Users/ana:C:\Users\ana'` |
+| Windows | WSL | `-m 'C:\Users\ana:/mnt/c/Users/ana'` |
+
+Com projetos fora da pasta do usuário, separe os pares por vírgula:
+
+```bash
+aisession-backup restore tudo.tar.gz.age \
+  -m 'C:\Users\ana:/home/ana,D:\trabalho:/home/ana/trabalho' --dry-run
+```
+
+### Regras do mapeamento
+
+- **Mapeamento que não casa não gera erro.** O restore termina com sucesso e mantém o
+  path antigo, e a sessão não aparece no novo diretório. Por isso, confira o
+  `--dry-run` antes.
+- **Maiúsculas e minúsculas importam.** `c:\users\ana` não casa com `C:\Users\ana`.
+  Copie a origem exatamente como aparece em `list`.
+- **Vale o prefixo mais longo**, sempre em uma fronteira de diretório: `/home/ana` não
+  casa com `/home/anabela`.
+- **Os dois lados precisam ser absolutos**, e o destino não aceita `..`.
+- **Paths com vírgula não podem ser mapeados**, porque a vírgula separa os pares.
+- **Separadores são convertidos no restante do path.** Com
+  `C:\Users\ana:/home/ana`, `C:\Users\ana\app` vira `/home/ana/app`.
+- **No destino Windows, use `\`.** Um destino com `/`, como `C:/Users/ana`, é gravado
+  assim mesmo no `cwd` das sessões.
+
+### Onde os dados são restaurados
+
+Sem `--dest`, cada provedor vai para o diretório padrão dele, relativo à pasta do
+usuário (`~` no Linux e no macOS, `%USERPROFILE%` no Windows). `doctor` mostra os
+paths detectados na máquina.
+
+| Provedor | Diretório |
+|----------|-----------|
+| Claude Code | `~/.claude`, ou `CLAUDE_CONFIG_DIR` |
+| Codex CLI | `~/.codex`, ou `CODEX_HOME` |
+| Grok CLI | `~/.grok` |
+| Gemini CLI e Antigravity CLI | `~/.gemini` |
+| Maestri | `~/.maestri`, ou `MAESTRI_HOME` |
+| OpenCode | `~/.local/share/opencode` |
+
+No WSL, o Maestri instalado no Windows é encontrado em `/mnt/c/Users/<usuário>` se
+houver um único candidato. Para escolher outro diretório, defina `MAESTRI_HOME`.
+
+Em modo não interativo, a senha vem de `AISESSION_BACKUP_PASSPHRASE`:
+
+```bash
+export AISESSION_BACKUP_PASSPHRASE='sua senha'
+```
+
+```powershell
+$env:AISESSION_BACKUP_PASSPHRASE = 'sua senha'
+```
+
+### O que não é convertido
+
+- **Config global.** `--config` copia os valores como estão, sem aplicar `-m`. Hooks,
+  variáveis e comandos continuam com os paths da origem, e um script de shell de
+  macOS ou Linux não roda no Windows. Revise o arquivo depois do restore.
+- **`settings.json` com hooks.** Sem `--allow-exec-config`, o arquivo é pulado inteiro,
+  inclusive as demais opções dele. Só permita depois de ler o que ele executa.
+- **Credenciais.** Costumam ser ligadas à conta e à máquina, então o caminho normal é
+  fazer login de novo no destino. No macOS, o Claude Code guarda o login no Keychain,
+  fora dos arquivos que entram no backup.
+- **Bancos e conversas opacas.** Veja as
+  [limitações por provedor](#provedores-suportados).
+
+### Diferenças entre os sistemas
+
+| Assunto | Linux | macOS | Windows |
+|---------|-------|-------|---------|
+| Permissões privadas (0600 e 0700) | Sim | Sim | Não: valem as permissões herdadas da pasta |
+| Detecção de provedor em execução | Sim | Não: feche as ferramentas antes | Não: feche as ferramentas antes |
+| Sistema de arquivos | Normalmente diferencia maiúsculas | Normalmente não diferencia | Normalmente não diferencia |
+
+No Windows, prefira um arquivo criptografado e uma pasta acessível só ao seu usuário.
+
+### O que já foi verificado
+
+O CI gera, em Linux, macOS e Windows reais, um backup criptografado de sessões do
+Claude Code e do Codex com o `cwd` de cada sistema, e também um com paths de WSL.
+Depois, cada arquivo passa por `verify`, `--dry-run`, restore e `rollback` nos três
+sistemas.
+
+Ainda não foram cobertos entre sistemas diferentes:
+
+- arquivos de Grok, Gemini, Antigravity, Maestri e OpenCode;
+- nomes de arquivo inválidos no Windows, como `a:b`;
+- nomes que só diferem por maiúsculas, ao restaurar em macOS ou Windows;
+- a retomada real de uma sessão com `claude --resume` depois do restore.
 
 ---
 
@@ -278,16 +438,8 @@ O projeto se chamava `claude-migrate`. Na v3:
 
 ## Mapeamento de paths
 
-O formato é `origem:destino`, aplicado pelo prefixo mais longo que casa em uma
-fronteira de diretório. Entre Windows e POSIX, os separadores do restante do
-path são convertidos.
-
-```bash
--m "/home/user:/Users/user"
--m "/mnt/e/workspace:/Users/user/workspace"
--m "C:\Users\user:/home/user"
--m "/home/u/work:/Users/u/work,/home/u/pessoal:/Users/u/pessoal"
-```
+O formato é `origem:destino`. Os exemplos por sistema e as regras estão em
+[Migrando entre Linux, macOS e Windows](#migrando-entre-linux-macos-e-windows).
 
 O Claude Code localiza sessões pelo diretório atual. Depois de migrar, rode
 `claude --resume` de dentro do novo diretório.
