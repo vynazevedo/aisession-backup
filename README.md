@@ -5,7 +5,7 @@ terminal entre máquinas, com plano prévio, rollback e remapeamento preciso de
 paths.
 
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![version](https://img.shields.io/badge/version-2.0.0-success?style=flat-square)](Cargo.toml)
+[![version](https://img.shields.io/badge/version-3.0.0-success?style=flat-square)](Cargo.toml)
 [![CI](https://img.shields.io/github/actions/workflow/status/vynazevedo/claude-migrate/ci.yml?style=flat-square&label=CI&branch=main)](https://github.com/vynazevedo/claude-migrate/actions/workflows/ci.yml)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square)](https://www.rust-lang.org)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square)](#instalação)
