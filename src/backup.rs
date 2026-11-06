@@ -3,20 +3,19 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use sha2::{Digest, Sha256};
 
 use crate::discover::DiscoveredSession;
 use crate::model::{Artifact, ArtifactKind, Manifest, SCHEMA_VERSION};
 
 /// Computes the SHA-256 of a file by streaming it, returning (hex, size).
-fn hash_file(path: &Path) -> Result<(String, u64)> {
+pub(crate) fn hash_file(path: &Path) -> Result<(String, u64)> {
+    crate::archive::ensure_regular(path)?;
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
@@ -36,7 +35,7 @@ fn hash_file(path: &Path) -> Result<(String, u64)> {
 /// Deterministic global checksum: SHA-256 over every artifact's
 /// `kind:logical_name:sha256` line, sorted, so it is independent of session
 /// ordering and covers all session content.
-fn global_checksum(sessions: &[crate::model::Session]) -> String {
+pub(crate) fn global_checksum(sessions: &[crate::model::Session]) -> String {
     let mut lines: Vec<String> = Vec::new();
     for s in sessions {
         for a in &s.artifacts {
@@ -55,27 +54,47 @@ fn global_checksum(sessions: &[crate::model::Session]) -> String {
 /// Archive path for an artifact. Kinds are namespaced into subdirectories so
 /// an env file and a todos file that happen to share a name
 /// (`<id>-agent-<id>.json`) never collide inside the archive.
-fn archive_path(kind: ArtifactKind, session_id: &str, name: &str) -> String {
+pub(crate) fn archive_path(kind: ArtifactKind, session_id: &str, name: &str) -> String {
     match kind {
         ArtifactKind::Session => format!("sessions/{session_id}/{name}"),
         ArtifactKind::Env => format!("sessions/{session_id}/env/{name}"),
         ArtifactKind::Todos => format!("sessions/{session_id}/todos/{name}"),
+        ArtifactKind::Project => format!("sessions/{session_id}/project/{name}"),
+        ArtifactKind::Memory => format!("sessions/{session_id}/memory/{name}"),
     }
 }
 
 fn logical_name(kind: ArtifactKind, path: &Path, session_id: &str) -> String {
-    match kind {
-        ArtifactKind::Session => format!("{session_id}.jsonl"),
-        ArtifactKind::Env | ArtifactKind::Todos => path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+    let marker = match kind {
+        ArtifactKind::Session => return format!("{session_id}.jsonl"),
+        ArtifactKind::Env => "session-env",
+        ArtifactKind::Todos => "todos",
+        ArtifactKind::Project => session_id,
+        ArtifactKind::Memory => "memory",
+    };
+    for parent in path.ancestors().skip(1) {
+        if parent.file_name().and_then(|s| s.to_str()) == Some(marker) {
+            return path
+                .strip_prefix(parent)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+        }
     }
+    String::new()
 }
 
 /// Builds the manifest (with artifact checksums) and the flat list of files to
 /// archive, without yet writing anything.
-fn plan(selected: &[DiscoveredSession]) -> Result<(Manifest, Vec<(String, PathBuf)>)> {
+#[cfg(test)]
+pub(crate) fn plan(selected: &[DiscoveredSession]) -> Result<(Manifest, Vec<(String, PathBuf)>)> {
+    plan_with_hashes(selected, true)
+}
+
+pub(crate) fn plan_with_hashes(
+    selected: &[DiscoveredSession],
+    hashes: bool,
+) -> Result<(Manifest, Vec<(String, PathBuf)>)> {
     let mut sessions = Vec::with_capacity(selected.len());
     // (archive path, on-disk path)
     let mut files: Vec<(String, PathBuf)> = Vec::new();
@@ -94,10 +113,7 @@ fn plan(selected: &[DiscoveredSession]) -> Result<(Manifest, Vec<(String, PathBu
         all.extend(ds.companions.iter().cloned());
 
         for (kind, path) in all {
-            if !path.is_file() {
-                continue;
-            }
-            let (sha, size) = hash_file(&path)?;
+            let (sha, size) = inventory_digest(&path, hashes)?;
             let name = logical_name(kind, &path, &session.id);
             total_size += size;
             session.artifacts.push(Artifact {
@@ -121,6 +137,9 @@ fn plan(selected: &[DiscoveredSession]) -> Result<(Manifest, Vec<(String, PathBu
         source_os: std::env::consts::OS.to_string(),
         claude_version,
         sessions,
+        providers: Vec::new(),
+        extras: Vec::new(),
+        config: Vec::new(),
         checksum,
         total_size,
     };
@@ -128,20 +147,22 @@ fn plan(selected: &[DiscoveredSession]) -> Result<(Manifest, Vec<(String, PathBu
     Ok((manifest, files))
 }
 
+pub(crate) fn inventory_digest(path: &Path, hashes: bool) -> Result<(String, u64)> {
+    if hashes {
+        return hash_file(path);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok((String::new(), metadata.len())),
+        Ok(_) => anyhow::bail!("source is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((String::new(), 0)),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_default()
-}
-
-fn write_entry<W: Write>(builder: &mut tar::Builder<W>, name: &str, data: &[u8]) -> Result<()> {
-    let mut header = tar::Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(0o644);
-    header.set_mtime(Utc::now().timestamp() as u64);
-    header.set_cksum();
-    builder.append_data(&mut header, name, data)?;
-    Ok(())
 }
 
 /// Global auxiliary directories archived under `extras/` when `--full` is set.
@@ -161,50 +182,58 @@ pub struct BackupOptions {
     pub include_credentials: bool,
 }
 
-/// Creates the archive at `output` for the selected sessions, plus whatever
-/// `opts` requests. Returns the manifest and whether secret-bearing config was
-/// included (so the caller can warn).
-pub fn create(
-    selected: &[DiscoveredSession],
-    output: &Path,
+pub(crate) fn collect_additional_with_hashes(
     claude_dir: &Path,
     opts: BackupOptions,
-) -> Result<Manifest> {
-    let (manifest, files) = plan(selected)?;
-
-    let out_file =
-        File::create(output).with_context(|| format!("creating {}", output.display()))?;
-    let encoder = GzEncoder::new(out_file, Compression::default());
-    let mut builder = tar::Builder::new(encoder);
-
-    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
-    write_entry(&mut builder, "manifest.json", &manifest_json)?;
-
-    for (archive_name, disk_path) in &files {
-        let mut header = tar::Header::new_gnu();
-        let meta = std::fs::metadata(disk_path)?;
-        header.set_size(meta.len());
-        header.set_mode(0o644);
-        header.set_mtime(Utc::now().timestamp() as u64);
-        header.set_cksum();
-        let file = File::open(disk_path)?;
-        builder.append_data(&mut header, archive_name, file)?;
-    }
-
+    manifest: &mut Manifest,
+    files: &mut Vec<(String, PathBuf)>,
+    staging: &Path,
+    hashes: bool,
+) -> Result<()> {
     if opts.include_extras {
-        archive_extras(&mut builder, claude_dir)?;
-    }
-
-    if opts.include_config {
-        let bundle = crate::config::collect(claude_dir, opts.include_credentials);
-        for (name, bytes) in &bundle.files {
-            write_entry(&mut builder, &format!("config/{name}"), bytes)?;
+        for dir in EXTRA_DIRS {
+            let root = claude_dir.join(dir);
+            if !root.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(root).follow_root_links(false) {
+                let entry = entry?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let rel = entry
+                    .path()
+                    .strip_prefix(claude_dir)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let (sha256, size) = inventory_digest(entry.path(), hashes)?;
+                manifest.extras.push(crate::model::FileDigest {
+                    rel: rel.clone(),
+                    sha256,
+                    size,
+                });
+                files.push((format!("extras/{rel}"), entry.into_path()));
+            }
         }
     }
-
-    let encoder = builder.into_inner()?;
-    encoder.finish()?;
-    Ok(manifest)
+    if opts.include_config {
+        for (rel, bytes) in crate::config::collect(claude_dir, opts.include_credentials).files {
+            let name = format!("config/{rel}");
+            crate::safety::atomic_write(
+                staging,
+                &name,
+                &bytes,
+                crate::safety::WriteMode::CreateNew,
+            )?;
+            manifest.config.push(crate::model::FileDigest {
+                rel,
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                size: bytes.len() as u64,
+            });
+            files.push((name.clone(), staging.join(name)));
+        }
+    }
+    Ok(())
 }
 
 /// Reports whether a config backup of `claude_dir` would contain secrets, so
@@ -213,42 +242,6 @@ pub fn config_has_secrets(claude_dir: &Path, include_credentials: bool) -> bool 
     crate::config::collect(claude_dir, include_credentials).has_secrets
 }
 
-/// Walks each `EXTRA_DIRS` entry and appends its files under `extras/<dir>/...`.
-fn archive_extras<W: Write>(builder: &mut tar::Builder<W>, claude_dir: &Path) -> Result<()> {
-    for dir in EXTRA_DIRS {
-        let base = claude_dir.join(dir);
-        if !base.is_dir() {
-            continue;
-        }
-        for entry in walkdir::WalkDir::new(&base)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let rel = match path.strip_prefix(claude_dir) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let archive_name = format!("extras/{}", rel.to_string_lossy().replace('\\', "/"));
-            let mut header = tar::Header::new_gnu();
-            let meta = std::fs::metadata(path)?;
-            header.set_size(meta.len());
-            header.set_mode(0o644);
-            header.set_mtime(Utc::now().timestamp() as u64);
-            header.set_cksum();
-            let file = File::open(path)?;
-            builder.append_data(&mut header, &archive_name, file)?;
-        }
-    }
-    Ok(())
-}
-
-/// Verifies that a manifest's recorded global checksum matches its artifacts.
-/// (The artifact list is part of the manifest, so this guards against a
-/// tampered or truncated manifest, while restore re-hashes the actual bytes.)
 pub fn manifest_self_consistent(manifest: &Manifest) -> bool {
     if manifest.checksum.is_empty() {
         return false;
@@ -266,15 +259,16 @@ pub fn summarize(manifest: &Manifest) -> String {
     ));
     out.push_str(&format!(
         "Source:   {} ({})\n",
-        manifest.source_host, manifest.source_os
+        crate::archive::report_text(&manifest.source_host),
+        crate::archive::report_text(&manifest.source_os)
     ));
     if let Some(v) = &manifest.claude_version {
-        out.push_str(&format!("Claude:   {v}\n"));
+        out.push_str(&format!("Claude:   {}\n", crate::archive::report_text(v)));
     }
     if !manifest.checksum.is_empty() {
         out.push_str(&format!(
             "Checksum: {}...\n",
-            &manifest.checksum[..16.min(manifest.checksum.len())]
+            &crate::archive::report_text(&manifest.checksum.chars().take(16).collect::<String>())
         ));
     }
     out.push_str(&format!("Sessions: {}\n", manifest.sessions.len()));
@@ -285,4 +279,19 @@ pub fn summarize(manifest: &Manifest) -> String {
 /// callers that build mappings.
 pub fn session_dirs(sessions: &[crate::model::Session]) -> BTreeMap<String, ()> {
     sessions.iter().map(|s| (s.cwd.clone(), ())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn summary_escapes_manifest_controls_and_accepts_unicode_checksum() {
+        let mut manifest = super::plan(&[]).unwrap().0;
+        manifest.source_host = "host\u{1b}[31m".into();
+        manifest.source_os = "os\rspoof".into();
+        manifest.claude_version = Some("version\u{7}".into());
+        manifest.checksum = "漢".repeat(6);
+        let summary = super::summarize(&manifest);
+        assert!(!summary.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(summary.contains("\\u{1b}"));
+    }
 }

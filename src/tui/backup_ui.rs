@@ -1,5 +1,3 @@
-//! Interactive session selection for `backup`.
-
 use std::path::Path;
 
 use anyhow::Result;
@@ -8,28 +6,40 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::backup;
-use crate::cli::human_size;
 use crate::discover::{self, DiscoveredSession};
+use crate::engine::{self, BackupRequest, ClaudeSelection, Passphrase};
+use crate::plan::Plan;
+use crate::ui::{human_size, sanitize};
 
-use super::{with_terminal, Tui};
+use super::{render_plan_lines, with_terminal, Tui};
 
-#[derive(PartialEq)]
-enum Action {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupStep {
+    Select,
+    Confirm,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupAction {
     Confirm,
     Cancel,
 }
 
-struct BackupApp {
-    sessions: Vec<DiscoveredSession>,
-    selected: Vec<bool>,
-    visible: Vec<usize>,
-    state: ListState,
-    filter: String,
-    filtering: bool,
+pub struct BackupApp {
+    pub sessions: Vec<DiscoveredSession>,
+    pub selected: Vec<bool>,
+    pub visible: Vec<usize>,
+    pub state: ListState,
+    pub filter: String,
+    pub filtering: bool,
+    pub step: BackupStep,
+    pub plan: Option<Plan>,
+    pub action: Option<BackupAction>,
 }
 
 impl BackupApp {
-    fn new(sessions: Vec<DiscoveredSession>) -> Self {
+    pub fn new(sessions: Vec<DiscoveredSession>) -> Self {
         let selected = vec![false; sessions.len()];
         let visible = (0..sessions.len()).collect();
         let mut state = ListState::default();
@@ -43,16 +53,23 @@ impl BackupApp {
             state,
             filter: String::new(),
             filtering: false,
+            step: BackupStep::Select,
+            plan: None,
+            action: None,
         }
     }
 
-    fn recompute_visible(&mut self) {
+    pub fn recompute_visible(&mut self) {
         let needle = self.filter.to_lowercase();
         self.visible = self
             .sessions
             .iter()
             .enumerate()
-            .filter(|(_, s)| needle.is_empty() || s.session.cwd.to_lowercase().contains(&needle))
+            .filter(|(_, s)| {
+                needle.is_empty()
+                    || s.session.cwd.to_lowercase().contains(&needle)
+                    || s.session.preview.to_lowercase().contains(&needle)
+            })
             .map(|(i, _)| i)
             .collect();
         if self.visible.is_empty() {
@@ -62,18 +79,18 @@ impl BackupApp {
         }
     }
 
-    fn selected_count(&self) -> usize {
+    pub fn selected_count(&self) -> usize {
         self.selected.iter().filter(|&&b| b).count()
     }
 
-    fn cursor_session(&self) -> Option<usize> {
+    pub fn cursor_session(&self) -> Option<usize> {
         self.state
             .selected()
             .and_then(|v| self.visible.get(v))
             .copied()
     }
 
-    fn move_cursor(&mut self, delta: isize) {
+    pub fn move_cursor(&mut self, delta: isize) {
         if self.visible.is_empty() {
             return;
         }
@@ -83,7 +100,7 @@ impl BackupApp {
         self.state.select(Some(next as usize));
     }
 
-    fn selected_sessions(&self) -> Vec<DiscoveredSession> {
+    pub fn selected_sessions(&self) -> Vec<DiscoveredSession> {
         self.sessions
             .iter()
             .enumerate()
@@ -92,15 +109,24 @@ impl BackupApp {
             .collect()
     }
 
-    fn run(&mut self, terminal: &mut Tui) -> Result<Action> {
-        loop {
-            terminal.draw(|f| self.draw(f))?;
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+    pub fn selected_session_ids(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.selected[*i])
+            .map(|(_, s)| s.session.id.clone())
+            .collect()
+    }
+
+    pub fn set_plan(&mut self, plan: Plan) {
+        self.plan = Some(plan);
+    }
+
+    pub fn handle_key(&mut self, code: KeyCode) {
+        match self.step {
+            BackupStep::Select => {
                 if self.filtering {
-                    match key.code {
+                    match code {
                         KeyCode::Esc | KeyCode::Enter => self.filtering = false,
                         KeyCode::Backspace => {
                             self.filter.pop();
@@ -112,10 +138,13 @@ impl BackupApp {
                         }
                         _ => {}
                     }
-                    continue;
+                    return;
                 }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Cancel),
+                match code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        self.action = Some(BackupAction::Cancel);
+                        self.step = BackupStep::Done;
+                    }
                     KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
                     KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
                     KeyCode::Char(' ') => {
@@ -127,15 +156,75 @@ impl BackupApp {
                     KeyCode::Char('n') => self.selected.iter_mut().for_each(|b| *b = false),
                     KeyCode::Char('/') => self.filtering = true,
                     KeyCode::Char('b') | KeyCode::Enter if self.selected_count() > 0 => {
-                        return Ok(Action::Confirm);
+                        self.step = BackupStep::Confirm;
                     }
                     _ => {}
+                }
+            }
+            BackupStep::Confirm => match code {
+                KeyCode::Esc => {
+                    self.step = BackupStep::Select;
+                }
+                KeyCode::Char('q') => {
+                    self.action = Some(BackupAction::Cancel);
+                    self.step = BackupStep::Done;
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let has_refusals = self.plan.as_ref().map(Plan::has_refusals).unwrap_or(false);
+                    if !has_refusals {
+                        self.action = Some(BackupAction::Confirm);
+                        self.step = BackupStep::Done;
+                    }
+                }
+                _ => {}
+            },
+            BackupStep::Done => {}
+        }
+    }
+
+    fn run(
+        &mut self,
+        terminal: &mut Tui,
+        claude_dir: &Path,
+        output: &Path,
+        opts: backup::BackupOptions,
+    ) -> Result<BackupAction> {
+        loop {
+            if self.step == BackupStep::Confirm && self.plan.is_none() {
+                let req = BackupRequest {
+                    output: output.to_path_buf(),
+                    overwrite: false,
+                    claude: Some(ClaudeSelection {
+                        claude_dir: claude_dir.to_path_buf(),
+                        session_ids: Some(self.selected_session_ids()),
+                        match_path: None,
+                        include_extras: opts.include_extras,
+                        include_config: opts.include_config,
+                        include_credentials: opts.include_credentials,
+                    }),
+                    providers: Vec::new(),
+                    passphrase: Passphrase::None,
+                };
+                self.plan = Some(match engine::plan_backup(&req) {
+                    Ok(plan) => plan,
+                    Err(err) => Plan::failed(format!("{err:#}")),
+                });
+            } else if self.step != BackupStep::Confirm {
+                self.plan = None;
+            }
+            terminal.draw(|f| self.draw(f))?;
+            if let Some(act) = self.action {
+                return Ok(act);
+            }
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    self.handle_key(key.code);
                 }
             }
         }
     }
 
-    fn draw(&mut self, f: &mut Frame) {
+    pub fn draw(&mut self, f: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -145,14 +234,31 @@ impl BackupApp {
             ])
             .split(f.area());
 
+        if self.step == BackupStep::Confirm {
+            let header = Paragraph::new("Confirm Backup Plan")
+                .style(Style::default().add_modifier(Modifier::BOLD));
+            f.render_widget(header, chunks[0]);
+
+            let body = Paragraph::new(render_plan_lines(self.plan.as_ref()))
+                .block(Block::default().borders(Borders::ALL).title("Plan"))
+                .wrap(Wrap { trim: false });
+            f.render_widget(body, chunks[1]);
+
+            let help = Paragraph::new("enter/y confirm | esc back | q quit")
+                .style(Style::default().fg(Color::DarkGray))
+                .wrap(Wrap { trim: true });
+            f.render_widget(help, chunks[2]);
+            return;
+        }
+
         let header = Paragraph::new(format!(
             "Backup - {}/{} selected{}",
             self.selected_count(),
             self.sessions.len(),
             if self.filtering {
-                format!("   filter: {}_", self.filter)
+                format!("   filter: {}_", sanitize(&self.filter))
             } else if !self.filter.is_empty() {
-                format!("   filter: {}", self.filter)
+                format!("   filter: {}", sanitize(&self.filter))
             } else {
                 String::new()
             }
@@ -167,9 +273,9 @@ impl BackupApp {
                 let s = &self.sessions[i].session;
                 let check = if self.selected[i] { "[x]" } else { "[ ]" };
                 let cwd = if s.cwd.is_empty() {
-                    "<unknown cwd>"
+                    "<unknown cwd>".to_string()
                 } else {
-                    &s.cwd
+                    sanitize(&s.cwd)
                 };
                 let line = format!(
                     "{check} {cwd}  ({} msgs, {})",
@@ -201,44 +307,45 @@ impl BackupApp {
 pub fn run_backup(claude_dir: &Path, output: &Path, opts: backup::BackupOptions) -> Result<()> {
     let sessions = discover::load_sessions(claude_dir)?;
     if sessions.is_empty() {
-        println!("No sessions found in {}", claude_dir.display());
+        println!(
+            "No sessions found in {}",
+            sanitize(&claude_dir.display().to_string())
+        );
         return Ok(());
     }
 
     let mut app = BackupApp::new(sessions);
-    let action = with_terminal(|t| app.run(t))?;
+    let action = with_terminal(|t| app.run(t, claude_dir, output, opts))?;
 
-    if action == Action::Cancel {
+    if action == BackupAction::Cancel {
         println!("Cancelled.");
         return Ok(());
     }
 
-    let selected = app.selected_sessions();
-    if selected.is_empty() {
+    let ids = app.selected_session_ids();
+    if ids.is_empty() {
         println!("Nothing selected.");
         return Ok(());
     }
 
-    println!("Creating backup of {} sessions...", selected.len());
-    let manifest = backup::create(&selected, output, claude_dir, opts)?;
-    let mut tags = Vec::new();
-    if opts.include_extras {
-        tags.push("extras");
-    }
-    if opts.include_config {
-        tags.push("config");
-    }
-    let suffix = if tags.is_empty() {
-        String::new()
-    } else {
-        format!(", with {}", tags.join(" + "))
+    let req = BackupRequest {
+        output: output.to_path_buf(),
+        overwrite: false,
+        claude: Some(ClaudeSelection {
+            claude_dir: claude_dir.to_path_buf(),
+            session_ids: Some(ids),
+            match_path: None,
+            include_extras: opts.include_extras,
+            include_config: opts.include_config,
+            include_credentials: opts.include_credentials,
+        }),
+        providers: Vec::new(),
+        passphrase: Passphrase::None,
     };
-    println!(
-        "Backup written to {} ({} sessions, {}{}).",
-        output.display(),
-        manifest.sessions.len(),
-        human_size(manifest.total_size),
-        suffix
+    let report = engine::run_backup(&req)?;
+    print!(
+        "{}",
+        crate::ui::format_backup_report(&report, crate::ui::color_stdout())
     );
     Ok(())
 }

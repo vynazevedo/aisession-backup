@@ -1,139 +1,411 @@
-//! Command-line interface: argument parsing and command dispatch.
-
 use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::File;
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::backup;
 use crate::discover;
+use crate::engine::{
+    self, BackupRequest, ClaudeSelection, Passphrase, ProviderSelection, RestoreRequest,
+};
 use crate::model::Manifest;
-use crate::restore::{self, RestoreOptions, Status};
+use crate::plan::Action;
+use crate::provider::{self, LocateEnv, ProviderId, ScanOptions};
+use crate::ui::{self, sanitize, DoctorEntry};
+
+pub const EXIT_OK: u8 = 0;
+pub const EXIT_ERROR: u8 = 1;
+pub const EXIT_USAGE: u8 = 2;
+pub const EXIT_CONFIRM_REQUIRED: u8 = 3;
+pub const EXIT_VERIFY_FAILED: u8 = 4;
+pub const EXIT_PLAN_REFUSED: u8 = 5;
+
+#[derive(Debug)]
+pub struct CliExit {
+    pub code: u8,
+    pub message: String,
+}
+
+impl CliExit {
+    pub fn new(code: u8, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for CliExit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CliExit {}
+
+pub fn exit_code(err: &anyhow::Error) -> u8 {
+    if let Some(exit) = err.downcast_ref::<CliExit>() {
+        return exit.code;
+    }
+    if let Some(clap_err) = err.downcast_ref::<clap::Error>() {
+        use clap::error::ErrorKind::*;
+        return match clap_err.kind() {
+            DisplayHelp | DisplayVersion => EXIT_OK,
+            _ => EXIT_USAGE,
+        };
+    }
+    EXIT_ERROR
+}
 
 #[derive(Parser)]
 #[command(
     name = "claude-migrate",
     version,
-    about = "Backup, restore and migrate Claude Code sessions across machines"
+    about = "Backup, restore and migrate AI coding sessions across machines"
 )]
 pub struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    pub command: Option<Commands>,
 
-    /// Enable verbose output.
-    #[arg(short, long, global = true)]
-    verbose: bool,
+    #[arg(short, long, global = true, help = "Enable verbose output")]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Interactively select and back up sessions into a .tar.gz.
-    Backup {
-        /// Output file path (default: claude-backup-<timestamp>.tar.gz).
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Also archive global state: shell-snapshots, file-history, plans.
-        #[arg(long)]
-        full: bool,
-        /// Also archive global config: settings, CLAUDE.md, plugins, MCP servers.
-        #[arg(long)]
-        config: bool,
-        /// With config, also include login credentials (sensitive).
-        #[arg(long)]
+pub enum Commands {
+    #[command(about = "Inspect detected providers, paths, sizes and running hints")]
+    Doctor {
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(about = "Scan providers for sessions, configs and workspaces")]
+    Scan {
+        #[arg(
+            short,
+            long,
+            help = "Comma-separated providers (claude,codex,grok,gemini,agy,opencode,maestri|all)"
+        )]
+        provider: Option<String>,
+        #[arg(long, help = "Include opaque state databases and history")]
+        include_state: bool,
+        #[arg(long, help = "Include login credentials")]
         include_credentials: bool,
-        /// Non-interactive: back up all sessions whose cwd contains this text.
-        #[arg(long = "match", value_name = "SUBSTR")]
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(about = "Back up sessions and provider items into an archive")]
+    Backup {
+        #[arg(
+            short,
+            long,
+            help = "Comma-separated providers (claude,codex,grok,gemini,agy,opencode,maestri|all)"
+        )]
+        provider: Option<String>,
+        #[arg(
+            long = "match",
+            value_name = "SUBSTR",
+            help = "Filter items whose cwd contains SUBSTR"
+        )]
         match_path: Option<String>,
-        /// Shorthand for --full --config.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Restore sessions from a backup, remapping paths as needed.
-    Restore {
-        /// Path to the .tar.gz backup file.
-        backup_file: String,
-        /// Destination Claude directory.
-        #[arg(short, long, default_value = "~/.claude")]
-        dest: String,
-        /// Path mappings, comma separated: old1:new1,old2:new2.
-        #[arg(short, long)]
-        mappings: Option<String>,
-        /// Show what would happen without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Skip the interactive UI (non-interactive restore).
-        #[arg(short, long)]
-        force: bool,
-        /// Also rewrite absolute paths embedded in tool calls (heuristic).
-        #[arg(long)]
-        rewrite_tool_paths: bool,
-        /// Append entries to history.jsonl so projects show in the prompt.
-        #[arg(long)]
-        restore_history: bool,
-        /// Do not verify archive checksums before restoring.
-        #[arg(long)]
-        no_verify_checksum: bool,
-        /// Apply the archived global config bundle, if present.
-        #[arg(long)]
+        #[arg(long, help = "Include Claude auxiliary state directories")]
+        full: bool,
+        #[arg(long, help = "Include global configuration files")]
         config: bool,
-        /// With --config, overwrite existing config files and MCP servers.
-        #[arg(long)]
-        overwrite_config: bool,
+        #[arg(long, help = "Include provider state databases and history")]
+        include_state: bool,
+        #[arg(long, help = "Include login credentials (requires --encrypt)")]
+        include_credentials: bool,
+        #[arg(long, help = "Shorthand for --full --config")]
+        all: bool,
+        #[arg(long, help = "Encrypt archive with age passphrase")]
+        encrypt: bool,
+        #[arg(short, long, help = "Output archive file path")]
+        output: Option<String>,
+        #[arg(long, help = "Overwrite output archive if it already exists")]
+        overwrite: bool,
+        #[arg(long, help = "Print the backup plan and exit without writing")]
+        dry_run: bool,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+        #[arg(short, long, help = "Skip confirmation prompt")]
+        yes: bool,
     },
-    /// List sessions on disk, or inside a backup file.
+    #[command(about = "Restore sessions and provider items from an archive")]
+    Restore {
+        #[arg(value_name = "FILE", help = "Path to the backup archive")]
+        backup_file: String,
+        #[arg(short, long, help = "Destination Claude directory")]
+        dest: Option<String>,
+        #[arg(
+            long = "provider-home",
+            value_name = "ID=PATH",
+            help = "Destination for one provider, repeatable; with --dest, providers without it are refused"
+        )]
+        provider_home: Vec<String>,
+        #[arg(
+            short,
+            long,
+            help = "Comma-separated path mappings (old1:new1,old2:new2)"
+        )]
+        mappings: Option<String>,
+        #[arg(
+            short,
+            long,
+            help = "Only restore the specified comma-separated providers"
+        )]
+        provider: Option<String>,
+        #[arg(long, help = "Print the restore plan and exit without writing")]
+        dry_run: bool,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+        #[arg(
+            short,
+            long,
+            alias = "force",
+            short_alias = 'f',
+            help = "Skip confirmation prompt"
+        )]
+        yes: bool,
+        #[arg(long, help = "Apply archived global configuration")]
+        config: bool,
+        #[arg(
+            long,
+            alias = "overwrite-config",
+            help = "Overwrite existing files and configuration entries"
+        )]
+        overwrite: bool,
+        #[arg(long, help = "Allow restoring config that can execute code")]
+        allow_exec_config: bool,
+        #[arg(long, help = "Allow restoring login credentials")]
+        allow_credentials: bool,
+        #[arg(long, help = "Allow restoring even if a provider process is running")]
+        allow_running: bool,
+        #[arg(long, help = "Rewrite embedded absolute paths inside tool calls")]
+        rewrite_tool_paths: bool,
+        #[arg(long, help = "Append restored sessions to history.jsonl")]
+        restore_history: bool,
+        #[arg(long, help = "Skip checksum and entry verification before restoring")]
+        no_verify_checksum: bool,
+    },
+    #[command(about = "Verify archive integrity, checksums and entry safety")]
+    Verify {
+        #[arg(value_name = "FILE", help = "Path to the backup archive")]
+        file: String,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(about = "Scan selected files for secret tokens before backup")]
+    Audit {
+        #[arg(
+            short,
+            long,
+            help = "Comma-separated providers (claude,codex,grok,gemini,agy,opencode,maestri|all)"
+        )]
+        provider: Option<String>,
+        #[arg(
+            long = "match",
+            value_name = "SUBSTR",
+            help = "Filter items whose cwd contains SUBSTR"
+        )]
+        match_path: Option<String>,
+        #[arg(long, help = "Include Claude auxiliary state directories")]
+        full: bool,
+        #[arg(long, help = "Include global configuration files")]
+        config: bool,
+        #[arg(long, help = "Include provider state databases and history")]
+        include_state: bool,
+        #[arg(long, help = "Include login credentials")]
+        include_credentials: bool,
+        #[arg(long, help = "Shorthand for --full --config")]
+        all: bool,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(about = "List restore journal entries")]
+    History {
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(about = "Roll back a previous restore using its journal ID")]
+    Rollback {
+        #[arg(value_name = "ID", help = "Journal entry identifier")]
+        id: String,
+        #[arg(long, help = "Print the rollback plan and exit without writing")]
+        dry_run: bool,
+        #[arg(short, long, help = "Skip confirmation prompt")]
+        yes: bool,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(about = "List sessions on disk or inside an archive")]
     List {
-        /// Optional backup file; omit to list local sessions.
+        #[arg(value_name = "FILE", help = "Optional archive file to inspect")]
         backup_file: Option<String>,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
     },
-    /// Print version information.
+    #[command(about = "Generate shell completion scripts")]
+    Completions {
+        #[arg(
+            value_name = "SHELL",
+            help = "Target shell (bash, zsh, fish, elvish, powershell)"
+        )]
+        shell: clap_complete::Shell,
+    },
+    #[command(about = "Print version information")]
     Version,
 }
 
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            use clap::error::ErrorKind::*;
+            match err.kind() {
+                DisplayHelp | DisplayVersion => {
+                    let _ = err.print();
+                    return Ok(());
+                }
+                _ => {
+                    let _ = err.print();
+                    return Err(CliExit::new(EXIT_USAGE, "").into());
+                }
+            }
+        }
+    };
+    dispatch(cli)
+}
+
+pub fn dispatch(cli: Cli) -> Result<()> {
     crate::tui::set_verbose(cli.verbose);
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            let claude_dir = resolve_claude_dir(None);
+            return crate::tui::run_home(&claude_dir);
+        }
+        let mut cmd = Cli::command();
+        cmd.print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    match command {
+        Commands::Doctor { json } => cmd_doctor(json),
+        Commands::Scan {
+            provider,
+            include_state,
+            include_credentials,
+            json,
+        } => cmd_scan(
+            provider.as_deref(),
+            ScanOptions {
+                include_state,
+                include_credentials,
+            },
+            json,
+        ),
         Commands::Backup {
-            output,
+            provider,
+            match_path,
             full,
             config,
+            include_state,
             include_credentials,
-            match_path,
             all,
-        } => {
-            let opts = backup::BackupOptions {
-                include_extras: full || all,
-                include_config: config || all || include_credentials,
-                include_credentials,
-            };
-            cmd_backup(output, opts, match_path.as_deref())
-        }
+            encrypt,
+            output,
+            overwrite,
+            dry_run,
+            json,
+            yes,
+        } => cmd_backup(BackupArgs {
+            provider,
+            match_path,
+            full: full || all,
+            config: config || all || include_credentials,
+            include_state,
+            include_credentials,
+            encrypt,
+            output,
+            overwrite,
+            dry_run,
+            json,
+            yes,
+        }),
         Commands::Restore {
             backup_file,
             dest,
+            provider_home,
             mappings,
+            provider,
             dry_run,
-            force,
+            json,
+            yes,
+            config,
+            overwrite,
+            allow_exec_config,
+            allow_credentials,
+            allow_running,
             rewrite_tool_paths,
             restore_history,
             no_verify_checksum,
-            config,
-            overwrite_config,
         } => cmd_restore(RestoreArgs {
             backup_file,
             dest,
+            provider_home,
             mappings,
+            provider,
             dry_run,
-            force,
+            json,
+            yes,
+            apply_config: config,
+            overwrite,
+            allow_exec_config,
+            allow_credentials,
+            allow_running,
             rewrite_tool_paths,
             restore_history,
             no_verify_checksum,
-            apply_config: config,
-            overwrite_config,
         }),
-        Commands::List { backup_file } => cmd_list(backup_file.as_deref()),
+        Commands::Verify { file, json } => cmd_verify(Path::new(&file), json),
+        Commands::Audit {
+            provider,
+            match_path,
+            full,
+            config,
+            include_state,
+            include_credentials,
+            all,
+            json,
+        } => cmd_audit(
+            SelectionSpec {
+                provider,
+                match_path,
+                full: full || all,
+                config: config || all || include_credentials,
+                include_state,
+                include_credentials,
+            },
+            json,
+        ),
+        Commands::History { json } => cmd_history(json),
+        Commands::Rollback {
+            id,
+            dry_run,
+            yes,
+            json,
+        } => cmd_rollback(&id, dry_run, yes, json),
+        Commands::List { backup_file, json } => cmd_list(backup_file.as_deref(), json),
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "claude-migrate", &mut io::stdout());
+            Ok(())
+        }
         Commands::Version => {
             println!("claude-migrate {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -141,257 +413,717 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// Parsed arguments for the restore command, to avoid a long parameter list.
+struct BackupArgs {
+    provider: Option<String>,
+    match_path: Option<String>,
+    full: bool,
+    config: bool,
+    include_state: bool,
+    include_credentials: bool,
+    encrypt: bool,
+    output: Option<String>,
+    overwrite: bool,
+    dry_run: bool,
+    json: bool,
+    yes: bool,
+}
+
 struct RestoreArgs {
     backup_file: String,
-    dest: String,
+    dest: Option<String>,
+    provider_home: Vec<String>,
     mappings: Option<String>,
+    provider: Option<String>,
     dry_run: bool,
-    force: bool,
+    json: bool,
+    yes: bool,
+    apply_config: bool,
+    overwrite: bool,
+    allow_exec_config: bool,
+    allow_credentials: bool,
+    allow_running: bool,
     rewrite_tool_paths: bool,
     restore_history: bool,
     no_verify_checksum: bool,
-    apply_config: bool,
-    overwrite_config: bool,
 }
 
-/// Expands a leading `~/` to the user's home directory.
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+}
+
 pub fn expand_path(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = user_home_dir() {
             return home.join(rest);
         }
     }
     PathBuf::from(path)
 }
 
-fn cmd_backup(
-    output: Option<String>,
-    opts: backup::BackupOptions,
-    match_path: Option<&str>,
-) -> Result<()> {
-    let claude_dir = expand_path("~/.claude");
-    let output = output.unwrap_or_else(|| {
-        format!(
-            "claude-backup-{}.tar.gz",
-            chrono::Local::now().format("%Y%m%d-%H%M%S")
-        )
-    });
-    if opts.include_config && backup::config_has_secrets(&claude_dir, opts.include_credentials) {
-        eprintln!(
-            "Warning: this backup includes config with secrets (MCP keys{}). Store and transfer it securely.",
-            if opts.include_credentials { " and login credentials" } else { "" }
-        );
+pub fn resolve_claude_dir(explicit: Option<&str>) -> PathBuf {
+    if let Some(dest) = explicit {
+        return expand_path(dest);
     }
+    if let Ok(env_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let trimmed = env_dir.trim();
+        if !trimmed.is_empty() {
+            return expand_path(trimmed);
+        }
+    }
+    expand_path("~/.claude")
+}
 
-    match match_path {
-        Some(substr) => backup_non_interactive(&claude_dir, Path::new(&output), opts, substr),
-        None => crate::tui::run_backup(&claude_dir, Path::new(&output), opts),
+fn locate_env_with_claude(claude_dir: &Path) -> LocateEnv {
+    let mut env = LocateEnv {
+        user_home: user_home_dir(),
+        overrides: BTreeMap::new(),
+    };
+    if claude_dir.exists() {
+        env.overrides
+            .insert(ProviderId::Claude, claude_dir.to_path_buf());
+    }
+    env
+}
+
+fn fallback_provider_home(id: ProviderId, claude_dir: &Path) -> PathBuf {
+    let home = user_home_dir().unwrap_or_else(|| PathBuf::from("."));
+    match id {
+        ProviderId::Claude => claude_dir.to_path_buf(),
+        ProviderId::Codex => std::env::var_os("CODEX_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex")),
+        ProviderId::Grok => home.join(".grok"),
+        ProviderId::Gemini | ProviderId::Antigravity => home.join(".gemini"),
+        ProviderId::Opencode => home.join(".local/share/opencode"),
+        ProviderId::Maestri => std::env::var_os("MAESTRI_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".maestri")),
     }
 }
 
-/// Non-interactive backup of every session whose cwd contains `substr`.
-fn backup_non_interactive(
-    claude_dir: &Path,
-    output: &Path,
-    opts: backup::BackupOptions,
-    substr: &str,
-) -> Result<()> {
-    let sessions = discover::load_sessions(claude_dir).context("scanning sessions")?;
-    let selected: Vec<_> = sessions
-        .into_iter()
-        .filter(|d| d.session.cwd.contains(substr))
-        .collect();
+pub(crate) fn default_provider_homes(claude_dir: &Path) -> BTreeMap<ProviderId, PathBuf> {
+    let env = locate_env_with_claude(claude_dir);
+    let mut homes = BTreeMap::new();
+    for prov in provider::registry() {
+        let id = prov.id();
+        if id == ProviderId::Claude {
+            homes.insert(id, claude_dir.to_path_buf());
+        } else {
+            let path = prov
+                .locate(&env)
+                .unwrap_or_else(|| fallback_provider_home(id, claude_dir));
+            homes.insert(id, path);
+        }
+    }
+    homes
+}
 
-    if selected.is_empty() {
-        println!("No sessions match '{substr}'.");
+pub fn parse_provider_homes(raw: &[String]) -> Result<BTreeMap<ProviderId, PathBuf>> {
+    let mut homes = BTreeMap::new();
+    for entry in raw {
+        let safe = sanitize(entry);
+        let (id, path) = entry
+            .split_once('=')
+            .with_context(|| format!("invalid provider home '{safe}' (expected id=path)"))?;
+        let Some(id) = ProviderId::parse(id.trim()) else {
+            bail!("unknown provider in '{safe}'");
+        };
+        if id == ProviderId::Claude {
+            bail!("use --dest to choose the Claude directory");
+        }
+        let path = path.trim();
+        if path.chars().any(char::is_control) || has_parent_component(path) {
+            bail!(
+                "provider home for {} has control characters or '..'",
+                id.as_str()
+            );
+        }
+        let path = expand_path(path);
+        if !path.is_absolute() {
+            bail!("provider home for {} must be absolute", id.as_str());
+        }
+        if homes.insert(id, path).is_some() {
+            bail!("provider home for {} given more than once", id.as_str());
+        }
+    }
+    Ok(homes)
+}
+
+fn restore_provider_homes(
+    dest_given: bool,
+    claude_dir: &Path,
+    explicit: BTreeMap<ProviderId, PathBuf>,
+) -> BTreeMap<ProviderId, PathBuf> {
+    let mut homes = if dest_given {
+        BTreeMap::new()
+    } else {
+        default_provider_homes(claude_dir)
+    };
+    homes.extend(explicit);
+    homes
+}
+
+pub fn parse_providers(raw: Option<&str>, default_claude: bool) -> Result<(bool, Vec<ProviderId>)> {
+    let Some(raw) = raw else {
+        if default_claude {
+            return Ok((false, vec![ProviderId::Claude]));
+        }
+        return Ok((true, ProviderId::ALL.to_vec()));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("provider list cannot be empty");
+    }
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok((true, ProviderId::ALL.to_vec()));
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(id) = ProviderId::parse(token) else {
+            bail!("unknown provider '{token}'");
+        };
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    if out.is_empty() {
+        bail!("no valid providers specified");
+    }
+    Ok((false, out))
+}
+
+fn resolve_encrypt_passphrase(encrypt: bool) -> Result<Passphrase> {
+    if !encrypt {
+        return Ok(Passphrase::None);
+    }
+    if let Ok(val) = std::env::var("CLAUDE_MIGRATE_PASSPHRASE") {
+        if !val.is_empty() {
+            return Ok(Passphrase::Value(val));
+        }
+    }
+    if !io::stdin().is_terminal() {
+        bail!(
+            "encryption passphrase required: set CLAUDE_MIGRATE_PASSPHRASE in non-interactive mode"
+        );
+    }
+    let first = rpassword::prompt_password("Enter passphrase: ")
+        .context("reading encryption passphrase")?;
+    if first.is_empty() {
+        bail!("passphrase cannot be empty");
+    }
+    let second =
+        rpassword::prompt_password("Confirm passphrase: ").context("confirming passphrase")?;
+    if first != second {
+        bail!("passphrases do not match");
+    }
+    Ok(Passphrase::Value(first))
+}
+
+fn is_archive_encrypted(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 32];
+    let Ok(n) = file.read(&mut magic) else {
+        return false;
+    };
+    magic[..n].starts_with(crate::crypto::MAGIC)
+}
+
+pub(crate) fn resolve_decrypt_passphrase(path: &Path) -> Result<Passphrase> {
+    if let Ok(val) = std::env::var("CLAUDE_MIGRATE_PASSPHRASE") {
+        if !val.is_empty() {
+            return Ok(Passphrase::Value(val));
+        }
+    }
+    if is_archive_encrypted(path) && io::stdin().is_terminal() {
+        let pass =
+            rpassword::prompt_password("Enter passphrase: ").context("reading passphrase")?;
+        return Ok(Passphrase::Value(pass));
+    }
+    Ok(Passphrase::None)
+}
+
+fn confirm_or_abort(plan: &crate::plan::Plan, yes: bool, json_mode: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    ui::print_plan(plan, json_mode);
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(CliExit::new(
+            EXIT_CONFIRM_REQUIRED,
+            "confirmation required: pass --yes to proceed without a TTY",
+        )
+        .into());
+    }
+    eprint!("Proceed with these changes? [y/N]: ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    let answer = line.trim().to_ascii_lowercase();
+    if answer != "y" && answer != "yes" {
+        return Err(CliExit::new(EXIT_CONFIRM_REQUIRED, "confirmation declined").into());
+    }
+    Ok(())
+}
+
+struct SelectionSpec {
+    provider: Option<String>,
+    match_path: Option<String>,
+    full: bool,
+    config: bool,
+    include_state: bool,
+    include_credentials: bool,
+}
+
+fn build_selection_request(
+    spec: SelectionSpec,
+    output: PathBuf,
+    overwrite: bool,
+    passphrase: Passphrase,
+) -> Result<BackupRequest> {
+    let claude_dir = resolve_claude_dir(None);
+    let env = locate_env_with_claude(&claude_dir);
+    let (is_all, ids) = parse_providers(spec.provider.as_deref(), true)?;
+
+    let mut claude = None;
+    let mut providers = Vec::new();
+
+    for id in ids {
+        if id == ProviderId::Claude {
+            if !is_all || claude_dir.exists() {
+                claude = Some(ClaudeSelection {
+                    claude_dir: claude_dir.clone(),
+                    session_ids: None,
+                    match_path: spec.match_path.clone(),
+                    include_extras: spec.full || spec.include_state,
+                    include_config: spec.config,
+                    include_credentials: spec.include_credentials,
+                });
+            }
+        } else {
+            let Some(prov) = provider::find(id) else {
+                continue;
+            };
+            let located = prov.locate(&env);
+            let home = match located {
+                Some(h) => h,
+                None if is_all => continue,
+                None => fallback_provider_home(id, &claude_dir),
+            };
+            let item_ids = if let Some(substr) = &spec.match_path {
+                let inv = prov.scan(
+                    &home,
+                    &ScanOptions {
+                        include_state: spec.include_state,
+                        include_credentials: spec.include_credentials,
+                    },
+                )?;
+                let matched: Vec<String> = inv
+                    .items
+                    .into_iter()
+                    .filter(|item| {
+                        item.cwd
+                            .as_ref()
+                            .map(|c| c.contains(substr))
+                            .unwrap_or(false)
+                            || item.label.contains(substr)
+                    })
+                    .map(|item| item.id)
+                    .collect();
+                Some(matched)
+            } else {
+                None
+            };
+            providers.push(ProviderSelection {
+                provider: id,
+                home,
+                item_ids,
+                include_state: spec.include_state,
+                include_credentials: spec.include_credentials,
+            });
+        }
+    }
+
+    if claude.is_none() && providers.is_empty() {
+        claude = Some(ClaudeSelection {
+            claude_dir,
+            session_ids: None,
+            match_path: spec.match_path,
+            include_extras: spec.full || spec.include_state,
+            include_config: spec.config,
+            include_credentials: spec.include_credentials,
+        });
+    }
+
+    Ok(BackupRequest {
+        output,
+        overwrite,
+        claude,
+        providers,
+        passphrase,
+    })
+}
+
+fn cmd_doctor(json: bool) -> Result<()> {
+    let claude_dir = resolve_claude_dir(None);
+    let env = locate_env_with_claude(&claude_dir);
+    let mut entries = Vec::new();
+
+    for prov in provider::registry() {
+        let home = prov.locate(&env);
+        let detected = home.as_ref().map(|h| h.exists()).unwrap_or(false);
+        let mut items = 0usize;
+        let mut bytes = 0u64;
+        let mut running_hint = None;
+        if let Some(h) = &home {
+            if h.exists() {
+                if let Ok(inv) = prov.scan(h, &ScanOptions::default()) {
+                    items = inv.items.len();
+                    bytes = inv.items.iter().map(provider::Item::total_size).sum();
+                }
+                running_hint = prov.running_hint(h).map(|s| sanitize(&s));
+            }
+        }
+        entries.push(DoctorEntry {
+            provider: prov.id().as_str().to_string(),
+            display_name: prov.display_name().to_string(),
+            detected,
+            path: home,
+            items,
+            bytes,
+            running_hint,
+        });
+    }
+
+    if json {
+        ui::print_json(&entries)?;
+    } else {
+        print!("{}", ui::format_doctor(&entries, ui::color_stdout()));
+    }
+    Ok(())
+}
+
+fn cmd_scan(provider_arg: Option<&str>, opts: ScanOptions, json: bool) -> Result<()> {
+    let claude_dir = resolve_claude_dir(None);
+    let env = locate_env_with_claude(&claude_dir);
+    let (is_all, ids) = parse_providers(provider_arg, false)?;
+    let mut inventories = Vec::new();
+
+    for id in ids {
+        let Some(prov) = provider::find(id) else {
+            continue;
+        };
+        let home = match prov.locate(&env) {
+            Some(h) => h,
+            None if is_all => continue,
+            None => fallback_provider_home(id, &claude_dir),
+        };
+        if !home.exists() && is_all {
+            continue;
+        }
+        let inv = prov.scan(&home, &opts)?;
+        inventories.push(inv);
+    }
+
+    if json {
+        ui::print_json(&inventories)?;
+    } else {
+        print!(
+            "{}",
+            ui::format_inventories(&inventories, ui::color_stdout())
+        );
+    }
+    Ok(())
+}
+
+fn cmd_backup(args: BackupArgs) -> Result<()> {
+    let ext = if args.encrypt { "tar.gz.age" } else { "tar.gz" };
+    let output_str = args.output.unwrap_or_else(|| {
+        format!(
+            "claude-backup-{}.{ext}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        )
+    });
+    let output = expand_path(&output_str);
+    let passphrase = resolve_encrypt_passphrase(args.encrypt)?;
+
+    let request = build_selection_request(
+        SelectionSpec {
+            provider: args.provider,
+            match_path: args.match_path,
+            full: args.full,
+            config: args.config,
+            include_state: args.include_state,
+            include_credentials: args.include_credentials,
+        },
+        output,
+        args.overwrite,
+        passphrase,
+    )?;
+
+    let plan = engine::plan_backup(&request)?;
+    if args.dry_run {
+        if args.json {
+            ui::print_json(&plan)?;
+        } else {
+            ui::print_plan(&plan, false);
+        }
         return Ok(());
     }
 
-    println!(
-        "Backing up {} session(s) matching '{}'...",
-        selected.len(),
-        substr
-    );
-    let manifest = backup::create(&selected, output, claude_dir, opts)?;
-    let mut tags = Vec::new();
-    if opts.include_extras {
-        tags.push("extras");
+    if plan.has_refusals() {
+        if args.json {
+            ui::print_json(&plan)?;
+        } else {
+            ui::print_plan(&plan, false);
+        }
+        return Err(
+            CliExit::new(EXIT_PLAN_REFUSED, "backup plan contains refused operations").into(),
+        );
     }
-    if opts.include_config {
-        tags.push("config");
-    }
-    let suffix = if tags.is_empty() {
-        String::new()
+
+    confirm_or_abort(&plan, args.yes, args.json)?;
+
+    let report = engine::run_backup(&request)?;
+    if args.json {
+        ui::print_json(&report)?;
     } else {
-        format!(", with {}", tags.join(" + "))
-    };
-    println!(
-        "Backup written to {} ({} sessions, {}{}).",
-        output.display(),
-        manifest.sessions.len(),
-        human_size(manifest.total_size),
-        suffix
-    );
+        print!("{}", ui::format_backup_report(&report, ui::color_stdout()));
+    }
     Ok(())
 }
 
 fn cmd_restore(args: RestoreArgs) -> Result<()> {
-    let claude_dir = expand_path(&args.dest);
-    let backup_path = PathBuf::from(&args.backup_file);
+    let claude_dir = resolve_claude_dir(args.dest.as_deref());
+    let archive = expand_path(&args.backup_file);
+    let mappings = parse_mappings(args.mappings.as_deref().unwrap_or(""))?;
+    let only_providers = match args.provider.as_deref() {
+        Some(raw) => {
+            let (is_all, ids) = parse_providers(Some(raw), false)?;
+            if is_all {
+                None
+            } else {
+                Some(ids)
+            }
+        }
+        None => None,
+    };
+    let passphrase = resolve_decrypt_passphrase(&archive)?;
+    let provider_homes = restore_provider_homes(
+        args.dest.is_some(),
+        &claude_dir,
+        parse_provider_homes(&args.provider_home)?,
+    );
 
-    // Interactive path unless the user passed mappings or --force.
-    if args.mappings.is_none() && !args.force {
-        return crate::tui::run_restore(
-            &backup_path,
-            &claude_dir,
-            crate::tui::RestoreFlags {
-                dry_run: args.dry_run,
-                rewrite_tool_paths: args.rewrite_tool_paths,
-                restore_history: args.restore_history,
-                no_verify_checksum: args.no_verify_checksum,
-                apply_config: args.apply_config,
-                overwrite_config: args.overwrite_config,
-            },
-        );
-    }
-
-    let parsed = parse_mappings(args.mappings.as_deref().unwrap_or(""))?;
-
-    let loaded = restore::load_backup(&backup_path)?;
-    verify_or_bail(&loaded, args.no_verify_checksum)?;
-
-    let opts = RestoreOptions {
+    let request = RestoreRequest {
+        archive,
+        passphrase,
         claude_dir,
-        mappings: parsed,
-        dry_run: args.dry_run,
+        provider_homes,
+        only_providers,
+        only_sessions: None,
+        mappings,
         rewrite_tool_paths: args.rewrite_tool_paths,
         restore_history: args.restore_history,
         apply_config: args.apply_config,
-        overwrite_config: args.overwrite_config,
+        overwrite: args.overwrite,
+        allow_exec_config: args.allow_exec_config,
+        allow_credentials: args.allow_credentials,
+        allow_running: args.allow_running,
+        skip_verify: args.no_verify_checksum,
     };
 
+    let prepared = engine::prepare_restore(request)?;
     if args.dry_run {
-        println!("=== DRY RUN ===");
-    }
-    println!("Restoring {} sessions...\n", loaded.manifest.sessions.len());
-
-    let results = restore::restore_sessions(
-        &loaded.manifest.sessions,
-        &loaded.data,
-        &opts,
-        |_, _, cwd| {
-            println!("  {cwd}");
-        },
-    )?;
-
-    print_results(&results, args.dry_run);
-
-    if !loaded.extras.is_empty() {
-        let n = restore::restore_extras(&opts.claude_dir, &loaded, args.dry_run);
-        println!("  Extras restored: {n} files (shell-snapshots, file-history, plans)");
-    }
-
-    if opts.apply_config && !loaded.config.is_empty() {
-        let report = crate::config::restore_config(
-            &opts.claude_dir,
-            &loaded.config,
-            opts.overwrite_config,
-            args.dry_run,
-        );
-        println!(
-            "  Config: {} files written, {} kept, {} MCP servers merged",
-            report.written, report.skipped, report.mcp_merged
-        );
-    } else if !loaded.config.is_empty() {
-        println!("  Config bundle present in archive; pass --config to apply it.");
-    }
-    Ok(())
-}
-
-fn verify_or_bail(loaded: &restore::LoadedBackup, skip: bool) -> Result<()> {
-    if skip {
-        return Ok(());
-    }
-    let report = restore::verify_checksums(loaded);
-    if report.skipped {
-        eprintln!("Note: v1 backup has no per-artifact checksums; skipping verification.");
-        return Ok(());
-    }
-    if !report.ok() {
-        for m in &report.mismatches {
-            eprintln!("  checksum error: {m}");
+        if args.json {
+            ui::print_json(&prepared.plan)?;
+        } else {
+            ui::print_plan(&prepared.plan, false);
         }
+        return Ok(());
+    }
+
+    let verify_failed = !args.no_verify_checksum
+        && prepared.plan.ops.iter().any(|op| {
+            op.provider == "archive"
+                && matches!(&op.action, Action::Refuse(reason) if reason.contains("verification failed"))
+        });
+    if verify_failed {
+        if args.json {
+            ui::print_json(&prepared.plan)?;
+        } else {
+            ui::print_plan(&prepared.plan, true);
+        }
+        return Err(CliExit::new(EXIT_VERIFY_FAILED, "archive verification failed").into());
+    }
+
+    if prepared.plan.has_refusals() {
+        if args.json {
+            ui::print_json(&prepared.plan)?;
+        } else {
+            ui::print_plan(&prepared.plan, false);
+        }
+        return Err(CliExit::new(
+            EXIT_PLAN_REFUSED,
+            "restore plan contains refused operations",
+        )
+        .into());
+    }
+
+    confirm_or_abort(&prepared.plan, args.yes, args.json)?;
+
+    let report = engine::apply_restore(prepared)?;
+    if args.json {
+        ui::print_json(&report)?;
+    } else {
+        print!("{}", ui::format_restore_report(&report, ui::color_stdout()));
+    }
+    if !report.failed.is_empty() {
         bail!(
-            "checksum verification failed ({} of {} artifacts); use --no-verify-checksum to override",
-            report.mismatches.len(),
-            report.checked
+            "restore finished with {} failed operation(s)",
+            report.failed.len()
         );
     }
-    println!("Checksum OK ({} artifacts).", report.checked);
     Ok(())
 }
 
-fn print_results(results: &restore::Results, dry_run: bool) {
-    println!();
-    let mut total_rewritten = 0usize;
-    for d in &results.details {
-        if let Some(collision) = &d.case_collision {
-            eprintln!(
-                "  WARNING case collision: {} vs existing {} (case-insensitive target)",
-                d.encoded, collision
+fn cmd_verify(path: &Path, json: bool) -> Result<()> {
+    if !path.is_file() {
+        bail!(
+            "archive not found: {}",
+            sanitize(&path.display().to_string())
+        );
+    }
+    let passphrase = resolve_decrypt_passphrase(path)?;
+    let report = match engine::verify_archive(path, &passphrase) {
+        Ok(r) => r,
+        Err(err) => {
+            return Err(
+                CliExit::new(EXIT_VERIFY_FAILED, format!("verification failed: {err:#}")).into(),
             );
         }
-        total_rewritten += d.lines_rewritten;
-        if d.status == Status::Failed {
-            eprintln!("  FAILED {}: {}", d.old_cwd, d.note);
-        }
-    }
-    if dry_run {
-        println!("=== DRY RUN SUMMARY ===");
-        println!("Would restore: {} sessions", results.restored);
+    };
+    if json {
+        ui::print_json(&report)?;
     } else {
-        println!("Restore complete.");
-        println!(
-            "  Restored: {} | Skipped: {} | Failed: {}",
-            results.restored, results.skipped, results.failed
+        print!("{}", ui::format_verify_report(&report, ui::color_stdout()));
+    }
+    if !report.ok() {
+        return Err(CliExit::new(EXIT_VERIFY_FAILED, "archive verification failed").into());
+    }
+    Ok(())
+}
+
+fn cmd_audit(spec: SelectionSpec, json: bool) -> Result<()> {
+    let request = build_selection_request(
+        spec,
+        PathBuf::from("audit.tar.gz"),
+        false,
+        Passphrase::Value("audit-placeholder".to_string()),
+    )?;
+    let findings = engine::audit_selection(&request)?;
+    if json {
+        ui::print_json(&findings)?;
+    } else {
+        print!("{}", ui::format_audit(&findings, ui::color_stdout()));
+    }
+    Ok(())
+}
+
+fn cmd_history(json: bool) -> Result<()> {
+    let entries = engine::list_journal()?;
+    if json {
+        ui::print_json(&entries)?;
+    } else {
+        print!("{}", ui::format_journal(&entries, ui::color_stdout()));
+    }
+    Ok(())
+}
+
+fn cmd_rollback(id: &str, dry_run: bool, yes: bool, json: bool) -> Result<()> {
+    let plan = engine::plan_rollback(id)?;
+    if dry_run {
+        if json {
+            ui::print_json(&plan)?;
+        } else {
+            ui::print_plan(&plan, false);
+        }
+        return Ok(());
+    }
+    if plan.has_refusals() {
+        if json {
+            ui::print_json(&plan)?;
+        } else {
+            ui::print_plan(&plan, false);
+        }
+        return Err(CliExit::new(
+            EXIT_PLAN_REFUSED,
+            "rollback plan contains refused operations",
+        )
+        .into());
+    }
+
+    confirm_or_abort(&plan, yes, json)?;
+
+    let report = engine::rollback(id)?;
+    if json {
+        ui::print_json(&report)?;
+    } else {
+        print!("{}", ui::format_restore_report(&report, ui::color_stdout()));
+    }
+    if !report.failed.is_empty() {
+        bail!(
+            "rollback finished with {} failed operation(s)",
+            report.failed.len()
         );
-        println!("  JSONL lines with rewritten cwd: {total_rewritten}");
     }
+    Ok(())
 }
 
-fn cmd_list(backup_file: Option<&str>) -> Result<()> {
+fn cmd_list(backup_file: Option<&str>, json: bool) -> Result<()> {
     match backup_file {
-        Some(file) => list_backup(Path::new(file)),
-        None => list_local(),
+        Some(file) => list_backup(Path::new(file), json),
+        None => list_local(json),
     }
 }
 
-fn list_backup(path: &Path) -> Result<()> {
-    let loaded = restore::load_backup(path)?;
-    print_manifest(&loaded.manifest, path);
+fn list_backup(path: &Path, json: bool) -> Result<()> {
+    let passphrase = resolve_decrypt_passphrase(path)?;
+    let manifest = crate::engine::read_manifest(path, &passphrase)?;
+    if json {
+        ui::print_json(&manifest)?;
+    } else {
+        print_manifest(&manifest, path);
+    }
     Ok(())
 }
 
 fn print_manifest(manifest: &Manifest, path: &Path) {
-    println!(
-        "Backup: {}",
-        path.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default()
-    );
-    print!("{}", backup::summarize(manifest));
+    let fname = path
+        .file_name()
+        .map(|n| sanitize(&n.to_string_lossy()))
+        .unwrap_or_default();
+    println!("Backup: {fname}");
+    print!("{}", sanitize_multiline(&backup::summarize(manifest)));
     println!();
     for s in &manifest.sessions {
-        println!(
-            "  {}",
-            if s.cwd.is_empty() {
-                "<unknown cwd>"
-            } else {
-                &s.cwd
-            }
-        );
-        println!("     id: {}", s.id);
+        let cwd = if s.cwd.is_empty() {
+            "<unknown cwd>".to_string()
+        } else {
+            sanitize(&s.cwd)
+        };
+        println!("  {cwd}");
+        println!("     id: {}", sanitize(&s.id));
         println!(
             "     messages: {} | size: {} | {}",
             s.message_count,
@@ -399,28 +1131,57 @@ fn print_manifest(manifest: &Manifest, path: &Path) {
             s.timestamp.format("%Y-%m-%d %H:%M")
         );
         if !s.preview.is_empty() {
-            println!("     first: {}", s.preview);
+            println!("     first: {}", sanitize(&s.preview));
+        }
+    }
+    for p in &manifest.providers {
+        println!(
+            "  Provider: {} ({} items, source: {})",
+            p.id.as_str(),
+            p.items.len(),
+            sanitize(&p.source_home)
+        );
+        for item in &p.items {
+            println!(
+                "     - {} ({}): {}",
+                sanitize(&item.id),
+                human_size(item.total_size()),
+                sanitize(&item.label)
+            );
         }
     }
 }
 
-fn list_local() -> Result<()> {
-    let claude_dir = expand_path("~/.claude");
+fn sanitize_multiline(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        out.push_str(&sanitize(line));
+        out.push('\n');
+    }
+    out
+}
+
+fn list_local(json: bool) -> Result<()> {
+    let claude_dir = resolve_claude_dir(None);
     let sessions = discover::load_sessions(&claude_dir).context("scanning sessions")?;
+    if json {
+        let only_sessions: Vec<_> = sessions.into_iter().map(|d| d.session).collect();
+        return ui::print_json(&only_sessions);
+    }
     println!(
         "Found {} sessions in {}\n",
         sessions.len(),
-        claude_dir.display()
+        sanitize(&claude_dir.display().to_string())
     );
     for ds in &sessions {
         let s = &ds.session;
         let cwd = if s.cwd.is_empty() {
-            "<unknown cwd>"
+            "<unknown cwd>".to_string()
         } else {
-            &s.cwd
+            sanitize(&s.cwd)
         };
         println!("  {cwd}");
-        println!("     id: {}", s.id);
+        println!("     id: {}", sanitize(&s.id));
         println!(
             "     messages: {} | size: {} | {} | artifacts: {}",
             s.message_count,
@@ -429,13 +1190,28 @@ fn list_local() -> Result<()> {
             ds.companions.len() + 1
         );
         if !s.preview.is_empty() {
-            println!("     first: {}", s.preview);
+            println!("     first: {}", sanitize(&s.preview));
         }
     }
     Ok(())
 }
 
-/// Parses `old1:new1,old2:new2`, validating that both sides are absolute.
+fn split_mapping(piece: &str) -> Option<(&str, &str)> {
+    let bytes = piece.as_bytes();
+    let start = if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        3
+    } else {
+        0
+    };
+    let rel_colon = piece.get(start..)?.find(':')?;
+    let colon = start + rel_colon;
+    Some((&piece[..colon], &piece[colon + 1..]))
+}
+
 pub fn parse_mappings(raw: &str) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     if raw.trim().is_empty() {
@@ -446,39 +1222,47 @@ pub fn parse_mappings(raw: &str) -> Result<BTreeMap<String, String>> {
         if piece.is_empty() {
             continue;
         }
-        let (old, new) = piece
-            .split_once(':')
+        if piece.chars().any(char::is_control) {
+            bail!("mapping contains control characters");
+        }
+        let (old, new) = split_mapping(piece)
             .with_context(|| format!("invalid mapping '{piece}' (expected old:new)"))?;
-        if !is_absolute_like(old) || !is_absolute_like(new) {
+        if !is_absolute_like(old) {
             bail!("mapping paths must be absolute: '{piece}'");
         }
+        validate_mapping_target(new).map_err(|reason| anyhow::anyhow!("{reason}: '{piece}'"))?;
         out.insert(old.to_string(), new.to_string());
     }
     Ok(out)
 }
 
-/// Absolute on unix (`/...`) or windows (`C:\...`).
+fn has_parent_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|part| part == "..")
+}
+
+pub(crate) fn validate_mapping_target(target: &str) -> std::result::Result<(), &'static str> {
+    if target.chars().any(char::is_control) {
+        return Err("mapping destination contains control characters");
+    }
+    if !is_absolute_like(target) {
+        return Err("mapping paths must be absolute");
+    }
+    if has_parent_component(target) {
+        return Err("mapping destination cannot contain '..'");
+    }
+    Ok(())
+}
+
 fn is_absolute_like(p: &str) -> bool {
     p.starts_with('/')
         || (p.len() >= 3
+            && p.as_bytes()[0].is_ascii_alphabetic()
             && p.as_bytes()[1] == b':'
             && (p.as_bytes()[2] == b'\\' || p.as_bytes()[2] == b'/'))
 }
 
 pub fn human_size(bytes: u64) -> String {
-    const UNIT: f64 = 1024.0;
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut size = bytes as f64;
-    let units = ["KB", "MB", "GB", "TB", "PB"];
-    let mut idx = 0;
-    size /= UNIT;
-    while size >= UNIT && idx < units.len() - 1 {
-        size /= UNIT;
-        idx += 1;
-    }
-    format!("{size:.1} {}", units[idx])
+    ui::human_size(bytes)
 }
 
 #[cfg(test)]
@@ -499,9 +1283,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_mappings_accepts_windows() {
-        let m = parse_mappings("/home/u:C:\\Users\\u");
-        assert!(m.is_ok());
+    fn parse_mappings_accepts_windows_source_and_target() {
+        let m = parse_mappings("/home/u:C:\\Users\\u").unwrap();
+        assert_eq!(m.get("/home/u"), Some(&"C:\\Users\\u".to_string()));
+
+        let m2 = parse_mappings("C:\\a:/b,D:/work:E:\\work").unwrap();
+        assert_eq!(m2.get("C:\\a"), Some(&"/b".to_string()));
+        assert_eq!(m2.get("D:/work"), Some(&"E:\\work".to_string()));
     }
 
     #[test]

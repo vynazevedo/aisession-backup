@@ -1,81 +1,97 @@
-//! Interactive restore: select sessions, edit path mappings, preview, execute.
-
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::claudepath;
-use crate::model::Session;
+use crate::engine::{self, Passphrase, PreparedRestore, RestoreReport, RestoreRequest};
+use crate::model::{Manifest, Session};
+use crate::plan::Plan;
+use crate::provider::ProviderId;
 use crate::remap;
-use crate::restore::{self, LoadedBackup, RestoreOptions, Results, Status};
+use crate::ui::sanitize;
 
-use super::{current_user, with_terminal, Tui};
+use super::{current_user, render_plan_lines, with_terminal, Tui};
 
-#[derive(PartialEq, Clone, Copy)]
-enum Step {
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum RestoreStep {
     Select,
     Mapping,
     Preview,
     Done,
 }
 
-struct MapRow {
-    root: String,
-    count: usize,
-    value: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapRow {
+    pub root: String,
+    pub count: usize,
+    pub value: String,
 }
 
-struct RestoreApp {
-    loaded: LoadedBackup,
-    claude_dir: std::path::PathBuf,
-    flags: super::RestoreFlags,
-    selected: Vec<bool>,
-    state: ListState,
-    step: Step,
-    rows: Vec<MapRow>,
-    focus: usize,
-    results: Option<Results>,
-    extras_restored: Option<usize>,
-    config_restored: Option<(usize, usize, usize)>,
-    cancelled: bool,
+pub struct RestoreApp {
+    pub manifest: Manifest,
+    pub archive_path: PathBuf,
+    pub claude_dir: PathBuf,
+    pub flags: super::RestoreFlags,
+    pub selected: Vec<bool>,
+    pub state: ListState,
+    pub step: RestoreStep,
+    pub rows: Vec<MapRow>,
+    pub focus: usize,
+    pub plan: Option<Plan>,
+    pub report: Option<RestoreReport>,
+    pub confirmed: bool,
+    pub cancelled: bool,
+    pub passphrase: Passphrase,
+    pub provider_homes: BTreeMap<ProviderId, PathBuf>,
+    pub mapping_error: Option<String>,
+    prepared: Option<PreparedRestore>,
 }
 
 impl RestoreApp {
-    fn new(loaded: LoadedBackup, claude_dir: &Path, flags: super::RestoreFlags) -> Self {
-        let n = loaded.manifest.sessions.len();
+    pub fn new(
+        manifest: Manifest,
+        archive_path: &Path,
+        claude_dir: &Path,
+        flags: super::RestoreFlags,
+    ) -> Self {
+        let n = manifest.sessions.len();
         let mut state = ListState::default();
         if n > 0 {
             state.select(Some(0));
         }
         Self {
-            loaded,
+            manifest,
+            archive_path: archive_path.to_path_buf(),
             claude_dir: claude_dir.to_path_buf(),
             flags,
             selected: vec![false; n],
             state,
-            step: Step::Select,
+            step: RestoreStep::Select,
             rows: Vec::new(),
             focus: 0,
-            results: None,
-            extras_restored: None,
-            config_restored: None,
+            plan: None,
+            report: None,
+            confirmed: false,
             cancelled: false,
+            passphrase: Passphrase::None,
+            provider_homes: BTreeMap::new(),
+            mapping_error: None,
+            prepared: None,
         }
     }
 
-    fn sessions(&self) -> &[Session] {
-        &self.loaded.manifest.sessions
+    pub fn sessions(&self) -> &[Session] {
+        &self.manifest.sessions
     }
 
-    fn selected_count(&self) -> usize {
+    pub fn selected_count(&self) -> usize {
         self.selected.iter().filter(|&&b| b).count()
     }
 
-    fn selected_sessions(&self) -> Vec<Session> {
+    pub fn selected_sessions(&self) -> Vec<Session> {
         self.sessions()
             .iter()
             .enumerate()
@@ -84,7 +100,7 @@ impl RestoreApp {
             .collect()
     }
 
-    fn move_cursor(&mut self, delta: isize) {
+    pub fn move_cursor(&mut self, delta: isize) {
         let len = self.sessions().len() as isize;
         if len == 0 {
             return;
@@ -94,15 +110,24 @@ impl RestoreApp {
             .select(Some((cur + delta).rem_euclid(len) as usize));
     }
 
-    fn build_rows(&mut self) {
-        let dirs: Vec<String> = self
+    pub fn build_rows(&mut self) {
+        let mut dirs: Vec<String> = self
             .selected_sessions()
             .iter()
             .map(|s| s.cwd.clone())
             .filter(|c| !c.is_empty())
             .collect();
+        for p in &self.manifest.providers {
+            for item in &p.items {
+                if let Some(cwd) = &item.cwd {
+                    if !cwd.is_empty() {
+                        dirs.push(cwd.clone());
+                    }
+                }
+            }
+        }
         let roots = remap::detect_project_roots(&dirs);
-        let source_os = self.loaded.manifest.source_os.clone();
+        let source_os = self.manifest.source_os.clone();
         let target_os = std::env::consts::OS;
         let user = current_user();
         self.rows = roots
@@ -119,7 +144,7 @@ impl RestoreApp {
         self.focus = 0;
     }
 
-    fn mappings(&self) -> BTreeMap<String, String> {
+    pub fn mappings(&self) -> BTreeMap<String, String> {
         let mut m = BTreeMap::new();
         for row in &self.rows {
             let v = row.value.trim();
@@ -130,129 +155,204 @@ impl RestoreApp {
         m
     }
 
-    fn execute(&mut self) -> Result<()> {
-        let opts = RestoreOptions {
+    pub fn set_plan(&mut self, plan: Plan) {
+        self.plan = Some(plan);
+    }
+
+    pub fn build_restore_request(&self) -> RestoreRequest {
+        RestoreRequest {
+            archive: self.archive_path.clone(),
+            passphrase: self.passphrase.clone(),
             claude_dir: self.claude_dir.clone(),
+            provider_homes: self.provider_homes.clone(),
+            only_providers: None,
+            only_sessions: Some(
+                self.selected_sessions()
+                    .into_iter()
+                    .map(|session| session.id)
+                    .collect(),
+            ),
             mappings: self.mappings(),
-            dry_run: self.flags.dry_run,
             rewrite_tool_paths: self.flags.rewrite_tool_paths,
             restore_history: self.flags.restore_history,
             apply_config: self.flags.apply_config,
-            overwrite_config: self.flags.overwrite_config,
+            overwrite: self.flags.overwrite_config,
+            allow_exec_config: self.flags.allow_exec_config,
+            allow_credentials: self.flags.allow_credentials,
+            allow_running: self.flags.allow_running,
+            skip_verify: self.flags.no_verify_checksum,
+        }
+    }
+
+    pub fn handle_key(&mut self, code: KeyCode) {
+        match self.step {
+            RestoreStep::Select => match code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.cancelled = true;
+                    self.step = RestoreStep::Done;
+                }
+                KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
+                KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
+                KeyCode::Char(' ') => {
+                    if let Some(i) = self.state.selected() {
+                        if let Some(flag) = self.selected.get_mut(i) {
+                            *flag = !*flag;
+                        }
+                    }
+                }
+                KeyCode::Char('a') => self.selected.iter_mut().for_each(|b| *b = true),
+                KeyCode::Char('n') => self.selected.iter_mut().for_each(|b| *b = false),
+                KeyCode::Char('p') | KeyCode::Enter
+                    if self.selected_count() > 0 || !self.manifest.providers.is_empty() =>
+                {
+                    self.build_rows();
+                    self.step = RestoreStep::Mapping;
+                }
+                _ => {}
+            },
+            RestoreStep::Mapping => match code {
+                KeyCode::Esc => self.step = RestoreStep::Select,
+                KeyCode::Tab | KeyCode::Down => {
+                    if !self.rows.is_empty() {
+                        self.focus = (self.focus + 1) % self.rows.len();
+                    }
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    if !self.rows.is_empty() {
+                        self.focus = (self.focus + self.rows.len() - 1) % self.rows.len();
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(row) = self.rows.get_mut(self.focus) {
+                        row.value.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(row) = self.rows.get_mut(self.focus) {
+                        row.value.push(c);
+                    }
+                }
+                KeyCode::Enter => {
+                    let invalid = self.rows.iter().find_map(|row| {
+                        let value = row.value.trim();
+                        if value.is_empty() {
+                            return None;
+                        }
+                        crate::cli::validate_mapping_target(value)
+                            .err()
+                            .map(|reason| format!("{reason}: {value}"))
+                    });
+                    if let Some(reason) = invalid {
+                        self.mapping_error = Some(reason);
+                    } else {
+                        self.mapping_error = None;
+                        self.plan = None;
+                        self.prepared = None;
+                        self.step = RestoreStep::Preview;
+                    }
+                }
+                _ => {}
+            },
+            RestoreStep::Preview => match code {
+                KeyCode::Esc => self.step = RestoreStep::Mapping,
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let has_refusals = self.plan.as_ref().map(Plan::has_refusals).unwrap_or(false);
+                    if !has_refusals {
+                        self.confirmed = true;
+                        self.step = RestoreStep::Done;
+                    }
+                }
+                KeyCode::Char('q') => {
+                    self.cancelled = true;
+                    self.step = RestoreStep::Done;
+                }
+                KeyCode::Char('r') => {
+                    self.flags.allow_running = !self.flags.allow_running;
+                    self.invalidate_plan();
+                }
+                KeyCode::Char('x') => {
+                    self.flags.allow_exec_config = !self.flags.allow_exec_config;
+                    self.invalidate_plan();
+                }
+                KeyCode::Char('c') => {
+                    self.flags.allow_credentials = !self.flags.allow_credentials;
+                    self.invalidate_plan();
+                }
+                KeyCode::Char('o') => {
+                    self.flags.overwrite_config = !self.flags.overwrite_config;
+                    self.invalidate_plan();
+                }
+                _ => {}
+            },
+            RestoreStep::Done => {}
+        }
+    }
+
+    fn invalidate_plan(&mut self) {
+        self.plan = None;
+        self.prepared = None;
+    }
+
+    pub fn preview_help(&self) -> String {
+        let state = |on: bool| if on { "on" } else { "off" };
+        let blocked = if self.plan.as_ref().is_some_and(Plan::has_refusals) {
+            "Blocked by REFUSE entries, enter is disabled | "
+        } else {
+            "enter/y execute | "
         };
-        let sessions = self.selected_sessions();
-        let results = restore::restore_sessions(&sessions, &self.loaded.data, &opts, |_, _, _| {})?;
-        self.results = Some(results);
-        if !self.loaded.extras.is_empty() {
-            self.extras_restored = Some(restore::restore_extras(
-                &self.claude_dir,
-                &self.loaded,
-                self.flags.dry_run,
-            ));
-        }
-        if self.flags.apply_config && !self.loaded.config.is_empty() {
-            let r = crate::config::restore_config(
-                &self.claude_dir,
-                &self.loaded.config,
-                self.flags.overwrite_config,
-                self.flags.dry_run,
-            );
-            self.config_restored = Some((r.written, r.skipped, r.mcp_merged));
-        }
-        self.step = Step::Done;
-        Ok(())
+        format!(
+            "{blocked}r allow-running:{} | x exec-config:{} | c credentials:{} | o overwrite:{} | esc back | q quit",
+            state(self.flags.allow_running),
+            state(self.flags.allow_exec_config),
+            state(self.flags.allow_credentials),
+            state(self.flags.overwrite_config),
+        )
     }
 
     fn run(&mut self, terminal: &mut Tui) -> Result<()> {
         loop {
+            if self.step == RestoreStep::Preview && self.plan.is_none() {
+                let req = self.build_restore_request();
+                match engine::prepare_restore(req) {
+                    Ok(prepared) => {
+                        self.plan = Some(prepared.plan.clone());
+                        self.prepared = Some(prepared);
+                    }
+                    Err(err) => self.plan = Some(Plan::failed(format!("{err:#}"))),
+                }
+            }
             terminal.draw(|f| self.draw(f))?;
+            if self.step == RestoreStep::Done {
+                return Ok(());
+            }
             let Event::Key(key) = event::read()? else {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            match self.step {
-                Step::Select => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        self.cancelled = true;
-                        return Ok(());
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
-                    KeyCode::Char(' ') => {
-                        if let Some(i) = self.state.selected() {
-                            self.selected[i] = !self.selected[i];
-                        }
-                    }
-                    KeyCode::Char('a') => self.selected.iter_mut().for_each(|b| *b = true),
-                    KeyCode::Char('n') => self.selected.iter_mut().for_each(|b| *b = false),
-                    KeyCode::Char('p') | KeyCode::Enter if self.selected_count() > 0 => {
-                        self.build_rows();
-                        self.step = Step::Mapping;
-                    }
-                    _ => {}
-                },
-                Step::Mapping => match key.code {
-                    KeyCode::Esc => self.step = Step::Select,
-                    KeyCode::Tab | KeyCode::Down => {
-                        if !self.rows.is_empty() {
-                            self.focus = (self.focus + 1) % self.rows.len();
-                        }
-                    }
-                    KeyCode::BackTab | KeyCode::Up => {
-                        if !self.rows.is_empty() {
-                            self.focus = (self.focus + self.rows.len() - 1) % self.rows.len();
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(row) = self.rows.get_mut(self.focus) {
-                            row.value.pop();
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        if let Some(row) = self.rows.get_mut(self.focus) {
-                            row.value.push(c);
-                        }
-                    }
-                    KeyCode::Enter => self.step = Step::Preview,
-                    _ => {}
-                },
-                Step::Preview => match key.code {
-                    KeyCode::Esc => self.step = Step::Mapping,
-                    KeyCode::Enter => self.execute()?,
-                    KeyCode::Char('q') => {
-                        self.cancelled = true;
-                        return Ok(());
-                    }
-                    _ => {}
-                },
-                Step::Done => match key.code {
-                    KeyCode::Char('q') | KeyCode::Enter | KeyCode::Esc => return Ok(()),
-                    _ => {}
-                },
-            }
+            self.handle_key(key.code);
         }
     }
 
-    fn draw(&mut self, f: &mut Frame) {
+    pub fn draw(&mut self, f: &mut Frame) {
         match self.step {
-            Step::Select => self.draw_select(f),
-            Step::Mapping => self.draw_mapping(f),
-            Step::Preview => self.draw_preview(f),
-            Step::Done => self.draw_done(f),
+            RestoreStep::Select => self.draw_select(f),
+            RestoreStep::Mapping => self.draw_mapping(f),
+            RestoreStep::Preview => self.draw_preview(f),
+            RestoreStep::Done => self.draw_done(f),
         }
     }
 
     fn draw_select(&mut self, f: &mut Frame) {
         let chunks = vchunks(f.area(), &[2, 0, 2]);
-        let m = &self.loaded.manifest;
+        let m = &self.manifest;
         let header = Paragraph::new(format!(
             "Restore - {}/{} selected | source: {} ({})",
             self.selected_count(),
             self.sessions().len(),
-            m.source_host,
-            m.source_os
+            sanitize(&m.source_host),
+            sanitize(&m.source_os)
         ))
         .style(bold());
         f.render_widget(header, chunks[0]);
@@ -264,9 +364,9 @@ impl RestoreApp {
             .map(|(i, s)| {
                 let check = if self.selected[i] { "[x]" } else { "[ ]" };
                 let cwd = if s.cwd.is_empty() {
-                    "<unknown cwd>"
+                    "<unknown cwd>".to_string()
                 } else {
-                    &s.cwd
+                    sanitize(&s.cwd)
                 };
                 ListItem::new(format!("{check} {cwd}  ({} msgs)", s.message_count))
             })
@@ -287,7 +387,7 @@ impl RestoreApp {
         let chunks = vchunks(f.area(), &[3, 0, 2]);
         let info = Paragraph::new(format!(
             "Path Mapping  (source {} -> target {})\nEdit destination for each project root:",
-            self.loaded.manifest.source_os,
+            sanitize(&self.manifest.source_os),
             std::env::consts::OS
         ))
         .style(bold());
@@ -297,13 +397,22 @@ impl RestoreApp {
         for (i, row) in self.rows.iter().enumerate() {
             let marker = if i == self.focus { "> " } else { "  " };
             lines.push(Line::from(vec![Span::styled(
-                format!("{}{}  ({} sessions)", marker, row.root, row.count),
+                format!(
+                    "{}{}  ({} sessions)",
+                    marker,
+                    sanitize(&row.root),
+                    row.count
+                ),
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             )]));
             let cursor = if i == self.focus { "_" } else { "" };
-            lines.push(Line::from(format!("    -> {}{}", row.value, cursor)));
+            lines.push(Line::from(format!(
+                "    -> {}{}",
+                sanitize(&row.value),
+                cursor
+            )));
             lines.push(Line::from(""));
         }
         let body = Paragraph::new(lines)
@@ -311,59 +420,32 @@ impl RestoreApp {
             .wrap(Wrap { trim: false });
         f.render_widget(body, chunks[1]);
 
-        f.render_widget(
-            help("tab/down next | shift-tab/up prev | type to edit | enter confirm | esc back"),
-            chunks[2],
-        );
+        let hint = match &self.mapping_error {
+            Some(err) => sanitize(err),
+            None => "tab/down next | shift-tab/up prev | type to edit | enter confirm | esc back"
+                .to_string(),
+        };
+        f.render_widget(help(&hint), chunks[2]);
     }
 
     fn draw_preview(&mut self, f: &mut Frame) {
         let chunks = vchunks(f.area(), &[2, 0, 2]);
         let title = Paragraph::new(if self.flags.dry_run {
-            "Preview (DRY RUN)"
+            "Confirm Restore Plan (DRY RUN)"
         } else {
-            "Preview"
+            "Confirm Restore Plan"
         })
         .style(bold());
         f.render_widget(title, chunks[0]);
 
-        let mappings = self.mappings();
-        let mut lines: Vec<Line> = Vec::new();
-        for s in self.selected_sessions() {
-            let new_cwd = remap::apply_longest_mapping(&s.cwd, &mappings);
-            let encoded = claudepath::encode(&new_cwd);
-            lines.push(Line::from(s.cwd.clone()));
-            if new_cwd != s.cwd {
-                lines.push(Line::from(Span::styled(
-                    format!("  -> {new_cwd}"),
-                    Style::default().fg(Color::Green),
-                )));
-            }
-            let dest = self
-                .claude_dir
-                .join("projects")
-                .join(&encoded)
-                .join(format!("{}.jsonl", s.id));
-            let status = if dest.exists() {
-                Span::styled("  [SKIP exists]", Style::default().fg(Color::Yellow))
-            } else {
-                Span::styled("  [OK]", Style::default().fg(Color::Green))
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  encoded: {encoded}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                status,
-            ]));
-            lines.push(Line::from(""));
-        }
+        let lines = render_plan_lines(self.plan.as_ref());
         let body = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL))
+            .block(Block::default().borders(Borders::ALL).title("Plan"))
             .wrap(Wrap { trim: false });
         f.render_widget(body, chunks[1]);
 
-        f.render_widget(help("enter execute | esc back | q quit"), chunks[2]);
+        let hint = self.preview_help();
+        f.render_widget(help(&hint), chunks[2]);
     }
 
     fn draw_done(&mut self, f: &mut Frame) {
@@ -371,42 +453,16 @@ impl RestoreApp {
         f.render_widget(Paragraph::new("Restore Complete").style(bold()), chunks[0]);
 
         let mut lines: Vec<Line> = Vec::new();
-        if let Some(r) = &self.results {
-            if self.flags.dry_run {
+        if let Some(r) = &self.report {
+            lines.push(Line::from(format!("Written: {}", r.written)));
+            lines.push(Line::from(format!("Merged:  {}", r.merged)));
+            lines.push(Line::from(format!("Skipped: {}", r.skipped)));
+            lines.push(Line::from(format!("Failed:  {}", r.failed.len())));
+            for err in &r.failed {
                 lines.push(Line::from(Span::styled(
-                    "DRY RUN - no changes written",
-                    Style::default().fg(Color::Yellow),
+                    format!("x {}", sanitize(err)),
+                    Style::default().fg(Color::Red),
                 )));
-                lines.push(Line::from(""));
-            }
-            lines.push(Line::from(format!("Restored: {}", r.restored)));
-            lines.push(Line::from(format!("Skipped:  {}", r.skipped)));
-            lines.push(Line::from(format!("Failed:   {}", r.failed)));
-            let rewritten: usize = r.details.iter().map(|d| d.lines_rewritten).sum();
-            lines.push(Line::from(format!(
-                "JSONL lines with rewritten cwd: {rewritten}"
-            )));
-            if let Some(n) = self.extras_restored {
-                lines.push(Line::from(format!("Extras restored: {n} files")));
-            }
-            if let Some((w, s, m)) = self.config_restored {
-                lines.push(Line::from(format!(
-                    "Config: {w} files written, {s} kept, {m} MCP servers merged"
-                )));
-            }
-            for d in &r.details {
-                if let Some(c) = &d.case_collision {
-                    lines.push(Line::from(Span::styled(
-                        format!("! case collision: {} vs {}", d.encoded, c),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                }
-                if d.status == Status::Failed {
-                    lines.push(Line::from(Span::styled(
-                        format!("x {}: {}", d.old_cwd, d.note),
-                        Style::default().fg(Color::Red),
-                    )));
-                }
             }
         }
         let body = Paragraph::new(lines)
@@ -455,38 +511,38 @@ pub fn run_restore(
     claude_dir: &Path,
     flags: super::RestoreFlags,
 ) -> Result<()> {
-    let loaded = restore::load_backup(backup_path)?;
-
-    if !flags.no_verify_checksum {
-        let report = restore::verify_checksums(&loaded);
-        if report.skipped {
-            eprintln!("Note: v1 backup has no per-artifact checksums; skipping verification.");
-        } else if !report.ok() {
-            for m in &report.mismatches {
-                eprintln!("  checksum error: {m}");
-            }
-            bail!(
-                "checksum verification failed ({} of {} artifacts); pass --no-verify-checksum to override",
-                report.mismatches.len(),
-                report.checked
-            );
-        } else {
-            println!("Checksum OK ({} artifacts).", report.checked);
-        }
+    let passphrase = crate::cli::resolve_decrypt_passphrase(backup_path)?;
+    let staged = crate::archive::stage(backup_path, &passphrase)?;
+    if !flags.no_verify_checksum && !staged.report.ok() {
+        bail!("archive verification failed; pass --no-verify-checksum to override");
     }
 
-    let mut app = RestoreApp::new(loaded, claude_dir, flags);
+    let mut app = RestoreApp::new(staged.manifest, backup_path, claude_dir, flags);
+    app.passphrase = passphrase;
+    app.provider_homes = crate::cli::default_provider_homes(claude_dir);
     with_terminal(|t| app.run(t))?;
 
-    if app.cancelled {
+    if app.cancelled || !app.confirmed {
         println!("Cancelled.");
         return Ok(());
     }
 
-    if let Some(r) = &app.results {
-        println!(
-            "Done. Restored: {} | Skipped: {} | Failed: {}",
-            r.restored, r.skipped, r.failed
+    let Some(prepared) = app.prepared.take() else {
+        bail!("restore plan was not prepared");
+    };
+    if flags.dry_run {
+        crate::ui::print_plan(&prepared.plan, false);
+        return Ok(());
+    }
+    let report = engine::apply_restore(prepared)?;
+    print!(
+        "{}",
+        crate::ui::format_restore_report(&report, crate::ui::color_stdout())
+    );
+    if !report.failed.is_empty() {
+        bail!(
+            "restore finished with {} failed operation(s)",
+            report.failed.len()
         );
     }
     Ok(())
