@@ -384,6 +384,39 @@ pub fn format_inventories(inventories: &[Inventory], color: bool) -> String {
         }
     }
     out.push_str(&render_table(&headers, &rows, color));
+    out.push_str(&format_inventory_warnings(inventories, color));
+    out
+}
+
+pub fn format_inventories_grouped(inventories: &[Inventory], color: bool) -> String {
+    if inventories.is_empty() {
+        return "No providers found.\n".to_string();
+    }
+    let mut entries = Vec::new();
+    for inv in inventories {
+        for item in &inv.items {
+            let kind = serde_json::to_value(item.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "item".to_string());
+            entries.push(crate::grouping::Entry {
+                id: item.id.clone(),
+                label: item.label.clone(),
+                cwd: item.cwd.clone(),
+                provider: inv.provider.as_str().to_string(),
+                detail: format!("{kind}, {} file(s)", item.files.len()),
+                size: item.total_size(),
+                updated_at: item.updated_at,
+            });
+        }
+    }
+    let mut out = crate::grouping::format_groups(&entries, color);
+    out.push_str(&format_inventory_warnings(inventories, color));
+    out
+}
+
+fn format_inventory_warnings(inventories: &[Inventory], color: bool) -> String {
+    let mut out = String::new();
     for inv in inventories {
         for warn in &inv.warnings {
             let clean = sanitize(warn);

@@ -132,6 +132,7 @@ fn restore_request(_root: &Path, archive: &Path, claude_dir: &Path) -> RestoreRe
         provider_homes: BTreeMap::new(),
         only_providers: None,
         only_sessions: None,
+        only_items: None,
         mappings: BTreeMap::new(),
         rewrite_tool_paths: false,
         restore_history: false,
@@ -1742,18 +1743,38 @@ fn running_provider_is_refused_without_allow_running() {
     let mut child = spawn_named_sleeper(tmp.path(), "claude");
     let mut restore = restore_request(tmp.path(), &request.output, &dest);
     restore.allow_running = false;
+    restore.apply_config = false;
+    let mut no_sessions = restore.clone();
+    no_sessions.only_sessions = Some(BTreeSet::new());
+    let mut config_only = no_sessions.clone();
+    config_only.apply_config = true;
     let prepared = prepare_restore(restore);
+    let no_sessions = prepare_restore(no_sessions);
+    let config_only = prepare_restore(config_only);
     let _ = child.kill();
     let _ = child.wait();
+    let claude_refused = |plan: &Plan| {
+        plan.ops
+            .iter()
+            .any(|op| refused(&op.action) && op.provider == "claude")
+    };
     let prepared = prepared.unwrap();
     assert!(
-        prepared
-            .plan
-            .ops
-            .iter()
-            .any(|op| { refused(&op.action) && op.provider == "claude" }),
+        claude_refused(&prepared.plan),
         "running claude was not refused: {:?}",
         prepared.plan
+    );
+    let no_sessions = no_sessions.unwrap();
+    assert!(
+        !claude_refused(&no_sessions.plan),
+        "nothing goes to claude, so it should not block: {:?}",
+        no_sessions.plan
+    );
+    let config_only = config_only.unwrap();
+    assert!(
+        claude_refused(&config_only.plan),
+        "config still writes to the claude directory: {:?}",
+        config_only.plan
     );
 }
 
@@ -2439,7 +2460,7 @@ fn restore_ui_preview_keys_rebuild_before_confirm() {
             ..RestoreFlags::default()
         },
     );
-    app.selected.fill(true);
+    app.picker.selected.fill(true);
     app.step = RestoreStep::Preview;
     app.set_plan(Plan::failed("provider may be running"));
     app.handle_key(KeyCode::Char('y'));

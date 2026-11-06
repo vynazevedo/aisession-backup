@@ -6,6 +6,7 @@ pub mod config;
 pub mod crypto;
 pub mod discover;
 pub mod engine;
+pub mod grouping;
 pub mod journal;
 pub mod model;
 pub mod plan;

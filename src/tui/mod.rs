@@ -1,4 +1,5 @@
 pub mod backup_ui;
+pub mod groups;
 pub mod restore_ui;
 
 use std::io::{self, IsTerminal, Stdout};
@@ -22,6 +23,7 @@ use crate::provider::{self, Item, LocateEnv, ProviderId, ScanOptions};
 use crate::ui::{human_size, sanitize};
 
 pub use backup_ui::{run_backup, BackupApp, BackupStep};
+pub use groups::{GroupPicker, Mark, PickRow};
 pub use restore_ui::{run_restore, MapRow, RestoreApp, RestoreStep};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -155,11 +157,9 @@ pub struct HomeState {
     pub screen: HomeScreen,
     pub provider_cursor: usize,
     pub provider_list_state: ListState,
-    pub item_cursor: usize,
-    pub item_list_state: ListState,
-    pub visible_items: Vec<usize>,
-    pub filter: String,
-    pub filtering: bool,
+    pub picker: Option<GroupPicker>,
+    picker_refs: Vec<(usize, usize)>,
+    picker_all_providers: bool,
     pub restore_input: String,
     pub plan: Option<Plan>,
     pub outcome: Option<HomeOutcome>,
@@ -176,11 +176,9 @@ impl HomeState {
             screen: HomeScreen::Providers,
             provider_cursor: 0,
             provider_list_state,
-            item_cursor: 0,
-            item_list_state: ListState::default(),
-            visible_items: Vec::new(),
-            filter: String::new(),
-            filtering: false,
+            picker: None,
+            picker_refs: Vec::new(),
+            picker_all_providers: false,
             restore_input: String::new(),
             plan: None,
             outcome: None,
@@ -216,40 +214,47 @@ impl HomeState {
             .sum()
     }
 
-    pub fn recompute_visible_items(&mut self) {
-        let Some(entry) = self.providers.get(self.provider_cursor) else {
-            self.visible_items.clear();
-            self.item_list_state.select(None);
+    pub fn open_picker(&mut self, only_provider: Option<usize>) {
+        let mut entries = Vec::new();
+        let mut selected = Vec::new();
+        let mut refs = Vec::new();
+        for (provider_index, provider) in self.providers.iter().enumerate() {
+            if only_provider.is_some_and(|wanted| wanted != provider_index) {
+                continue;
+            }
+            for (item_index, item) in provider.items.iter().enumerate() {
+                entries.push(crate::grouping::Entry {
+                    id: item.id.clone(),
+                    label: item.label.clone(),
+                    cwd: item.cwd.clone(),
+                    provider: provider.id.as_str().to_string(),
+                    detail: String::new(),
+                    size: item.total_size(),
+                    updated_at: item.updated_at,
+                });
+                selected.push(provider.selected.get(item_index).copied().unwrap_or(false));
+                refs.push((provider_index, item_index));
+            }
+        }
+        self.picker = Some(GroupPicker::new(entries, selected));
+        self.picker_refs = refs;
+        self.picker_all_providers = only_provider.is_none();
+        self.screen = HomeScreen::ItemPicker;
+    }
+
+    fn sync_picker_selection(&mut self) {
+        let Some(picker) = &self.picker else {
             return;
         };
-        let needle = self.filter.to_lowercase();
-        self.visible_items = entry
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                if needle.is_empty() {
-                    return true;
-                }
-                let label_match = item.label.to_lowercase().contains(&needle);
-                let cwd_match = item
-                    .cwd
-                    .as_ref()
-                    .map(|c| c.to_lowercase().contains(&needle))
-                    .unwrap_or(false);
-                let id_match = item.id.to_lowercase().contains(&needle);
-                label_match || cwd_match || id_match
-            })
-            .map(|(i, _)| i)
-            .collect();
-        if self.visible_items.is_empty() {
-            self.item_cursor = 0;
-            self.item_list_state.select(None);
-        } else {
-            if self.item_cursor >= self.visible_items.len() {
-                self.item_cursor = 0;
+        for (position, &(provider, item)) in self.picker_refs.iter().enumerate() {
+            let value = picker.selected.get(position).copied().unwrap_or(false);
+            if let Some(flag) = self
+                .providers
+                .get_mut(provider)
+                .and_then(|entry| entry.selected.get_mut(item))
+            {
+                *flag = value;
             }
-            self.item_list_state.select(Some(self.item_cursor));
         }
     }
 
@@ -337,13 +342,10 @@ impl HomeState {
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if self.provider_cursor < len {
-                    self.filter.clear();
-                    self.filtering = false;
-                    self.item_cursor = 0;
-                    self.recompute_visible_items();
-                    self.screen = HomeScreen::ItemPicker;
+                    self.open_picker(Some(self.provider_cursor));
                 }
             }
+            KeyCode::Char('d') => self.open_picker(None),
             KeyCode::Char(' ') => {
                 if let Some(entry) = self.providers.get_mut(self.provider_cursor) {
                     let all_selected =
@@ -372,76 +374,35 @@ impl HomeState {
     }
 
     fn handle_item_picker_key(&mut self, code: KeyCode) {
-        if self.filtering {
-            match code {
-                KeyCode::Esc | KeyCode::Enter => self.filtering = false,
-                KeyCode::Backspace => {
-                    self.filter.pop();
-                    self.recompute_visible_items();
-                }
-                KeyCode::Char(c) => {
-                    self.filter.push(c);
-                    self.recompute_visible_items();
-                }
-                _ => {}
-            }
+        let Some(picker) = self.picker.as_mut() else {
+            self.screen = HomeScreen::Providers;
+            return;
+        };
+        if picker.filtering {
+            picker.handle_key(code);
+            self.sync_picker_selection();
             return;
         }
         match code {
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                self.screen = HomeScreen::Providers;
-            }
+            KeyCode::Esc => self.screen = HomeScreen::Providers,
             KeyCode::Char('q') => {
                 self.outcome = Some(HomeOutcome::Cancelled);
                 self.screen = HomeScreen::Done;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.visible_items.is_empty() {
-                    self.item_cursor = (self.item_cursor + 1) % self.visible_items.len();
-                    self.item_list_state.select(Some(self.item_cursor));
+            KeyCode::Char('b') => {
+                if self.total_selected_items() > 0 {
+                    self.screen = HomeScreen::ConfirmBackup;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if !self.visible_items.is_empty() {
-                    let n = self.visible_items.len();
-                    self.item_cursor = (self.item_cursor + n - 1) % n;
-                    self.item_list_state.select(Some(self.item_cursor));
+            KeyCode::Left | KeyCode::Char('h') => {
+                if !picker.handle_key(code) {
+                    self.screen = HomeScreen::Providers;
                 }
             }
-            KeyCode::Char(' ') => {
-                if let Some(&real_idx) = self.visible_items.get(self.item_cursor) {
-                    if let Some(entry) = self.providers.get_mut(self.provider_cursor) {
-                        if let Some(flag) = entry.selected.get_mut(real_idx) {
-                            *flag = !*flag;
-                        }
-                    }
-                }
+            _ => {
+                picker.handle_key(code);
+                self.sync_picker_selection();
             }
-            KeyCode::Char('a') => {
-                if let Some(entry) = self.providers.get_mut(self.provider_cursor) {
-                    for &real_idx in &self.visible_items {
-                        if let Some(flag) = entry.selected.get_mut(real_idx) {
-                            *flag = true;
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('n') => {
-                if let Some(entry) = self.providers.get_mut(self.provider_cursor) {
-                    for &real_idx in &self.visible_items {
-                        if let Some(flag) = entry.selected.get_mut(real_idx) {
-                            *flag = false;
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('/') => {
-                self.filtering = true;
-            }
-            KeyCode::Char('b') | KeyCode::Enter if self.total_selected_items() > 0 => {
-                self.screen = HomeScreen::ConfirmBackup;
-            }
-            _ => {}
         }
     }
 
@@ -536,60 +497,33 @@ impl HomeState {
                 f.render_stateful_widget(list, chunks[1], &mut self.provider_list_state);
 
                 let help = Paragraph::new(
-                    "enter/l items | space toggle provider | a all | n none | b backup | r restore | q quit",
+                    "enter/l items | d all providers by directory | space toggle provider | a all | n none | b backup | r restore | q quit",
                 )
                 .style(Style::default().fg(Color::DarkGray))
                 .wrap(Wrap { trim: true });
                 f.render_widget(help, chunks[2]);
             }
             HomeScreen::ItemPicker => {
-                let prov_name = self
-                    .providers
-                    .get(self.provider_cursor)
-                    .map(|p| sanitize(&p.display_name))
-                    .unwrap_or_default();
-                let filter_str = if self.filtering {
-                    format!(" | filter: {}_", sanitize(&self.filter))
-                } else if !self.filter.is_empty() {
-                    format!(" | filter: {}", sanitize(&self.filter))
+                let scope = if self.picker_all_providers {
+                    "all providers".to_string()
                 } else {
-                    String::new()
+                    self.providers
+                        .get(self.provider_cursor)
+                        .map(|p| sanitize(&p.display_name))
+                        .unwrap_or_default()
+                };
+                let selected_total = self.total_selected_items();
+                let Some(picker) = self.picker.as_mut() else {
+                    return;
                 };
                 let header = Paragraph::new(format!(
-                    "Items - {prov_name} ({} total selected){filter_str}",
-                    self.total_selected_items()
+                    "Directories - {scope} ({selected_total} total selected){}",
+                    picker.filter_suffix()
                 ))
                 .style(Style::default().add_modifier(Modifier::BOLD));
                 f.render_widget(header, chunks[0]);
 
-                let items: Vec<ListItem> =
-                    if let Some(entry) = self.providers.get(self.provider_cursor) {
-                        self.visible_items
-                            .iter()
-                            .filter_map(|&idx| {
-                                let item = entry.items.get(idx)?;
-                                let check = if entry.selected.get(idx).copied().unwrap_or(false) {
-                                    "[x]"
-                                } else {
-                                    "[ ]"
-                                };
-                                let cwd = item
-                                    .cwd
-                                    .as_deref()
-                                    .map(sanitize)
-                                    .unwrap_or_else(|| "-".to_string());
-                                let label = sanitize(&item.label);
-                                Some(ListItem::new(format!(
-                                    "{check} {label} ({cwd}, {})",
-                                    human_size(item.total_size())
-                                )))
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-
-                let list = List::new(items)
+                let list = List::new(picker.list_items())
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
@@ -601,11 +535,12 @@ impl HomeState {
                             .add_modifier(Modifier::BOLD),
                     )
                     .highlight_symbol("> ");
-                f.render_stateful_widget(list, chunks[1], &mut self.item_list_state);
+                f.render_stateful_widget(list, chunks[1], &mut picker.state);
 
-                let help = Paragraph::new(
-                    "space toggle | a all | n none | / filter | b/enter backup | esc/h back | q quit",
-                )
+                let help = Paragraph::new(format!(
+                    "{} | b backup | esc back | q quit",
+                    groups::PICKER_HELP
+                ))
                 .style(Style::default().fg(Color::DarkGray))
                 .wrap(Wrap { trim: true });
                 f.render_widget(help, chunks[2]);

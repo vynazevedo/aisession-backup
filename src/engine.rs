@@ -61,6 +61,7 @@ pub struct RestoreRequest {
     pub provider_homes: BTreeMap<ProviderId, PathBuf>,
     pub only_providers: Option<Vec<ProviderId>>,
     pub only_sessions: Option<std::collections::BTreeSet<String>>,
+    pub only_items: Option<std::collections::BTreeSet<(ProviderId, String)>>,
     pub mappings: BTreeMap<String, String>,
     pub rewrite_tool_paths: bool,
     pub restore_history: bool,
@@ -77,6 +78,12 @@ impl RestoreRequest {
         self.only_sessions
             .as_ref()
             .is_none_or(|ids| ids.contains(id))
+    }
+
+    fn wants_item(&self, provider: ProviderId, id: &str) -> bool {
+        self.only_items
+            .as_ref()
+            .is_none_or(|items| items.contains(&(provider, id.to_string())))
     }
 }
 
@@ -938,7 +945,13 @@ pub fn prepare_restore(request: RestoreRequest) -> Result<PreparedRestore> {
             .only_providers
             .as_ref()
             .is_none_or(|ids| ids.contains(&ProviderId::Claude));
+        let writes_to_claude = request.apply_config
+            || request
+                .only_sessions
+                .as_ref()
+                .is_none_or(|ids| !ids.is_empty());
         if claude_enabled
+            && writes_to_claude
             && !request.allow_running
             && crate::provider::find(ProviderId::Claude)
                 .is_some_and(|p| p.running_hint(&request.claude_dir).is_some())
@@ -1117,6 +1130,14 @@ pub fn prepare_restore(request: RestoreRequest) -> Result<PreparedRestore> {
             {
                 continue;
             }
+            let wanted: Vec<_> = record
+                .items
+                .iter()
+                .filter(|item| request.wants_item(record.id, &item.id))
+                .collect();
+            if request.only_items.is_some() && wanted.is_empty() {
+                continue;
+            }
             let Some(home) = request.provider_homes.get(&record.id) else {
                 planner.refuse(
                     record.id.as_str(),
@@ -1130,7 +1151,7 @@ pub fn prepare_restore(request: RestoreRequest) -> Result<PreparedRestore> {
                 planner.refuse(record.id.as_str(), "provider may be running");
                 continue;
             }
-            for item in &record.items {
+            for item in wanted {
                 for file in &item.files {
                     let name = format!("providers/{}/{}", record.id.as_str(), file.rel);
                     if crate::safety::validate_rel(&name).is_err() {
@@ -1387,6 +1408,7 @@ mod tests {
             provider_homes: BTreeMap::new(),
             only_providers: None,
             only_sessions: None,
+            only_items: None,
             mappings: BTreeMap::from([("/old/project".into(), "/new/project".into())]),
             rewrite_tool_paths: false,
             restore_history: false,

@@ -268,11 +268,11 @@ Ainda não foram cobertos entre sistemas diferentes:
 | Comando | Descrição |
 |---------|-----------|
 | `doctor` | Provedores detectados, paths, tamanhos e processos em execução |
-| `scan` | Inventário de sessões, configs e workspaces |
+| `scan` | Inventário de sessões, configs e workspaces, agrupado por diretório |
 | `audit` | Procura tokens nos arquivos selecionados, sem exibir os valores |
 | `backup` | Gera o arquivo de backup |
 | `verify <arquivo>` | Confere integridade, checksums e segurança das entradas |
-| `list [arquivo]` | Lista sessões locais ou de um arquivo |
+| `list [arquivo]` | Lista sessões locais ou de um arquivo, agrupadas por diretório |
 | `restore <arquivo>` | Restaura sessões e itens de provedores |
 | `history` | Lista os restores registrados no journal |
 | `rollback <id>` | Desfaz um restore |
@@ -280,7 +280,8 @@ Ainda não foram cobertos entre sistemas diferentes:
 | `version` | Mostra a versão |
 
 `doctor`, `scan`, `audit`, `backup`, `verify`, `list`, `restore`, `history` e
-`rollback` aceitam `--json`.
+`rollback` aceitam `--json`, cuja saída não é agrupada. `list` e `scan` aceitam
+`--flat` para listar item por item, sem agrupar.
 
 ### backup
 
@@ -338,8 +339,37 @@ aisession-backup restore tudo.tar.gz.age --dest /tmp/teste/.claude --provider cl
 
 ### Interface interativa
 
-Na tela inicial, escolha provedores e itens e tecle `b` para o backup ou `r`
-para o restore. Toda escrita passa por uma tela com o plano real.
+Na tela inicial, `enter` abre os itens de um provedor e `d` abre os de todos os
+provedores juntos. Tecle `b` para o backup ou `r` para o restore. Toda escrita passa
+por uma tela com o plano real.
+
+As telas de seleção mostram uma linha por diretório, com itens selecionados, tamanho,
+última atividade e quantidade por provedor. A ordem é da atividade mais recente para
+a mais antiga, e os itens sem diretório, como configurações, ficam no fim.
+
+```text
+[x] > /work/app      4/4 | 310 MB | 2026-11-06 | claude 3, codex 1
+[-] v /work/api      1/2 |  95 MB | 2026-11-05 | claude 2
+    [x] corrigir autenticação  (claude | 60 MB | 2026-11-05)
+    [ ] revisar migrations     (claude | 35 MB | 2026-10-30)
+[ ] > (no directory) 0/1 |   2 MB | 2026-10-12 | codex 1
+```
+
+| Tecla | Ação na tela de seleção |
+|-------|-------------------------|
+| `espaço` | Marca ou desmarca o diretório inteiro ou o item |
+| `enter` | Abre ou fecha o diretório |
+| `l` ou `→` | Abre o diretório |
+| `h` ou `←` | Fecha o diretório |
+| `a` e `n` | Marca ou desmarca tudo o que está visível |
+| `/` | Filtra por diretório, nome ou id |
+| `b` ou `p` | Segue para o backup ou para o restore |
+| `esc` | Volta |
+| `q` | Sai sem escrever |
+
+Com filtro ativo, marcar um diretório afeta só os itens visíveis dele. Um `[-]` indica
+seleção parcial. Diretórios são agrupados pelo `cwd` exato: `/work/app` e
+`/work/app/sub` ficam separados.
 
 No restore, o plano é recalculado a cada mudança, e o plano confirmado é o que
 será executado:
@@ -355,9 +385,9 @@ será executado:
 | `q` | Sai sem escrever |
 
 O backup criptografado e a seleção de credenciais estão disponíveis apenas na
-linha de comando. Na interface, o restore seleciona sessões do Claude
-individualmente, e os itens dos outros provedores aparecem no plano como um
-conjunto.
+linha de comando. Na interface, o restore aplica só o que estiver marcado, e isso
+inclui os itens dos outros provedores. Na linha de comando, use `--provider` para
+restaurar por provedor.
 
 ---
 

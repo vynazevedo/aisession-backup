@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, Paragraph, Wrap};
 
 use crate::engine::{self, Passphrase, PreparedRestore, RestoreReport, RestoreRequest};
 use crate::model::{Manifest, Session};
@@ -13,6 +13,7 @@ use crate::provider::ProviderId;
 use crate::remap;
 use crate::ui::sanitize;
 
+use super::groups::{GroupPicker, PICKER_HELP};
 use super::{current_user, render_plan_lines, with_terminal, Tui};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -35,8 +36,8 @@ pub struct RestoreApp {
     pub archive_path: PathBuf,
     pub claude_dir: PathBuf,
     pub flags: super::RestoreFlags,
-    pub selected: Vec<bool>,
-    pub state: ListState,
+    pub picker: GroupPicker,
+    item_refs: Vec<(ProviderId, String, Option<String>)>,
     pub step: RestoreStep,
     pub rows: Vec<MapRow>,
     pub focus: usize,
@@ -57,18 +58,24 @@ impl RestoreApp {
         claude_dir: &Path,
         flags: super::RestoreFlags,
     ) -> Self {
-        let n = manifest.sessions.len();
-        let mut state = ListState::default();
-        if n > 0 {
-            state.select(Some(0));
-        }
+        let picker = GroupPicker::new(crate::cli::manifest_entries(&manifest), Vec::new());
+        let item_refs = manifest
+            .providers
+            .iter()
+            .flat_map(|provider| {
+                provider
+                    .items
+                    .iter()
+                    .map(|item| (provider.id, item.id.clone(), item.cwd.clone()))
+            })
+            .collect();
         Self {
             manifest,
             archive_path: archive_path.to_path_buf(),
             claude_dir: claude_dir.to_path_buf(),
             flags,
-            selected: vec![false; n],
-            state,
+            picker,
+            item_refs,
             step: RestoreStep::Select,
             rows: Vec::new(),
             focus: 0,
@@ -88,26 +95,25 @@ impl RestoreApp {
     }
 
     pub fn selected_count(&self) -> usize {
-        self.selected.iter().filter(|&&b| b).count()
+        self.picker.selected_count()
     }
 
     pub fn selected_sessions(&self) -> Vec<Session> {
         self.sessions()
             .iter()
             .enumerate()
-            .filter(|(i, _)| self.selected[*i])
+            .filter(|(i, _)| self.picker.selected[*i])
             .map(|(_, s)| s.clone())
             .collect()
     }
 
-    pub fn move_cursor(&mut self, delta: isize) {
-        let len = self.sessions().len() as isize;
-        if len == 0 {
-            return;
-        }
-        let cur = self.state.selected().unwrap_or(0) as isize;
-        self.state
-            .select(Some((cur + delta).rem_euclid(len) as usize));
+    fn selected_item_refs(&self) -> impl Iterator<Item = &(ProviderId, String, Option<String>)> {
+        let offset = self.manifest.sessions.len();
+        self.item_refs
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| self.picker.selected[offset + i])
+            .map(|(_, item)| item)
     }
 
     pub fn build_rows(&mut self) {
@@ -117,15 +123,11 @@ impl RestoreApp {
             .map(|s| s.cwd.clone())
             .filter(|c| !c.is_empty())
             .collect();
-        for p in &self.manifest.providers {
-            for item in &p.items {
-                if let Some(cwd) = &item.cwd {
-                    if !cwd.is_empty() {
-                        dirs.push(cwd.clone());
-                    }
-                }
-            }
-        }
+        dirs.extend(
+            self.selected_item_refs()
+                .filter_map(|(_, _, cwd)| cwd.clone())
+                .filter(|cwd| !cwd.is_empty()),
+        );
         let roots = remap::detect_project_roots(&dirs);
         let source_os = self.manifest.source_os.clone();
         let target_os = std::env::consts::OS;
@@ -172,6 +174,11 @@ impl RestoreApp {
                     .map(|session| session.id)
                     .collect(),
             ),
+            only_items: Some(
+                self.selected_item_refs()
+                    .map(|(provider, id, _)| (*provider, id.clone()))
+                    .collect(),
+            ),
             mappings: self.mappings(),
             rewrite_tool_paths: self.flags.rewrite_tool_paths,
             restore_history: self.flags.restore_history,
@@ -186,30 +193,27 @@ impl RestoreApp {
 
     pub fn handle_key(&mut self, code: KeyCode) {
         match self.step {
-            RestoreStep::Select => match code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    self.cancelled = true;
-                    self.step = RestoreStep::Done;
+            RestoreStep::Select => {
+                if self.picker.filtering {
+                    self.picker.handle_key(code);
+                    return;
                 }
-                KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
-                KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
-                KeyCode::Char(' ') => {
-                    if let Some(i) = self.state.selected() {
-                        if let Some(flag) = self.selected.get_mut(i) {
-                            *flag = !*flag;
+                match code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        self.cancelled = true;
+                        self.step = RestoreStep::Done;
+                    }
+                    KeyCode::Char('p') => {
+                        if self.selected_count() > 0 {
+                            self.build_rows();
+                            self.step = RestoreStep::Mapping;
                         }
                     }
+                    _ => {
+                        self.picker.handle_key(code);
+                    }
                 }
-                KeyCode::Char('a') => self.selected.iter_mut().for_each(|b| *b = true),
-                KeyCode::Char('n') => self.selected.iter_mut().for_each(|b| *b = false),
-                KeyCode::Char('p') | KeyCode::Enter
-                    if self.selected_count() > 0 || !self.manifest.providers.is_empty() =>
-                {
-                    self.build_rows();
-                    self.step = RestoreStep::Mapping;
-                }
-                _ => {}
-            },
+            }
             RestoreStep::Mapping => match code {
                 KeyCode::Esc => self.step = RestoreStep::Select,
                 KeyCode::Tab | KeyCode::Down => {
@@ -348,39 +352,24 @@ impl RestoreApp {
         let chunks = vchunks(f.area(), &[2, 0, 2]);
         let m = &self.manifest;
         let header = Paragraph::new(format!(
-            "Restore - {}/{} selected | source: {} ({})",
-            self.selected_count(),
-            self.sessions().len(),
+            "Restore - {}/{} selected | source: {} ({}){}",
+            self.picker.selected_count(),
+            self.picker.entries.len(),
             sanitize(&m.source_host),
-            sanitize(&m.source_os)
+            sanitize(&m.source_os),
+            self.picker.filter_suffix()
         ))
         .style(bold());
         f.render_widget(header, chunks[0]);
 
-        let items: Vec<ListItem> = self
-            .sessions()
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let check = if self.selected[i] { "[x]" } else { "[ ]" };
-                let cwd = if s.cwd.is_empty() {
-                    "<unknown cwd>".to_string()
-                } else {
-                    sanitize(&s.cwd)
-                };
-                ListItem::new(format!("{check} {cwd}  ({} msgs)", s.message_count))
-            })
-            .collect();
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Sessions"))
+        let list = List::new(self.picker.list_items())
+            .block(Block::default().borders(Borders::ALL).title("Directories"))
             .highlight_style(highlight())
             .highlight_symbol("> ");
-        f.render_stateful_widget(list, chunks[1], &mut self.state);
+        f.render_stateful_widget(list, chunks[1], &mut self.picker.state);
 
-        f.render_widget(
-            help("space toggle | a all | n none | p/enter proceed | q quit"),
-            chunks[2],
-        );
+        let hint = format!("{PICKER_HELP} | p proceed | q quit");
+        f.render_widget(help(&hint), chunks[2]);
     }
 
     fn draw_mapping(&mut self, f: &mut Frame) {

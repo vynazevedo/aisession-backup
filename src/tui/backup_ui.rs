@@ -3,14 +3,15 @@ use std::path::Path;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, Paragraph, Wrap};
 
 use crate::backup;
 use crate::discover::{self, DiscoveredSession};
 use crate::engine::{self, BackupRequest, ClaudeSelection, Passphrase};
 use crate::plan::Plan;
-use crate::ui::{human_size, sanitize};
+use crate::ui::sanitize;
 
+use super::groups::{GroupPicker, PICKER_HELP};
 use super::{render_plan_lines, with_terminal, Tui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,11 +29,7 @@ pub enum BackupAction {
 
 pub struct BackupApp {
     pub sessions: Vec<DiscoveredSession>,
-    pub selected: Vec<bool>,
-    pub visible: Vec<usize>,
-    pub state: ListState,
-    pub filter: String,
-    pub filtering: bool,
+    pub picker: GroupPicker,
     pub step: BackupStep,
     pub plan: Option<Plan>,
     pub action: Option<BackupAction>,
@@ -40,80 +37,36 @@ pub struct BackupApp {
 
 impl BackupApp {
     pub fn new(sessions: Vec<DiscoveredSession>) -> Self {
-        let selected = vec![false; sessions.len()];
-        let visible = (0..sessions.len()).collect();
-        let mut state = ListState::default();
-        if !sessions.is_empty() {
-            state.select(Some(0));
-        }
+        let entries = sessions
+            .iter()
+            .map(|found| crate::grouping::Entry {
+                id: found.session.id.clone(),
+                label: found.session.preview.clone(),
+                cwd: Some(found.session.cwd.clone()),
+                provider: crate::provider::ProviderId::Claude.as_str().to_string(),
+                detail: format!("{} msgs", found.session.message_count),
+                size: found.session.size_bytes,
+                updated_at: Some(found.session.timestamp),
+            })
+            .collect();
         Self {
             sessions,
-            selected,
-            visible,
-            state,
-            filter: String::new(),
-            filtering: false,
+            picker: GroupPicker::new(entries, Vec::new()),
             step: BackupStep::Select,
             plan: None,
             action: None,
         }
     }
 
-    pub fn recompute_visible(&mut self) {
-        let needle = self.filter.to_lowercase();
-        self.visible = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                needle.is_empty()
-                    || s.session.cwd.to_lowercase().contains(&needle)
-                    || s.session.preview.to_lowercase().contains(&needle)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        if self.visible.is_empty() {
-            self.state.select(None);
-        } else {
-            self.state.select(Some(0));
-        }
-    }
-
     pub fn selected_count(&self) -> usize {
-        self.selected.iter().filter(|&&b| b).count()
-    }
-
-    pub fn cursor_session(&self) -> Option<usize> {
-        self.state
-            .selected()
-            .and_then(|v| self.visible.get(v))
-            .copied()
-    }
-
-    pub fn move_cursor(&mut self, delta: isize) {
-        if self.visible.is_empty() {
-            return;
-        }
-        let len = self.visible.len() as isize;
-        let cur = self.state.selected().unwrap_or(0) as isize;
-        let next = (cur + delta).rem_euclid(len);
-        self.state.select(Some(next as usize));
-    }
-
-    pub fn selected_sessions(&self) -> Vec<DiscoveredSession> {
-        self.sessions
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.selected[*i])
-            .map(|(_, s)| s.clone())
-            .collect()
+        self.picker.selected_count()
     }
 
     pub fn selected_session_ids(&self) -> Vec<String> {
         self.sessions
             .iter()
             .enumerate()
-            .filter(|(i, _)| self.selected[*i])
+            .filter(|(i, _)| self.picker.selected[*i])
             .map(|(_, s)| s.session.id.clone())
             .collect()
     }
@@ -125,19 +78,8 @@ impl BackupApp {
     pub fn handle_key(&mut self, code: KeyCode) {
         match self.step {
             BackupStep::Select => {
-                if self.filtering {
-                    match code {
-                        KeyCode::Esc | KeyCode::Enter => self.filtering = false,
-                        KeyCode::Backspace => {
-                            self.filter.pop();
-                            self.recompute_visible();
-                        }
-                        KeyCode::Char(c) => {
-                            self.filter.push(c);
-                            self.recompute_visible();
-                        }
-                        _ => {}
-                    }
+                if self.picker.filtering {
+                    self.picker.handle_key(code);
                     return;
                 }
                 match code {
@@ -145,20 +87,14 @@ impl BackupApp {
                         self.action = Some(BackupAction::Cancel);
                         self.step = BackupStep::Done;
                     }
-                    KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
-                    KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
-                    KeyCode::Char(' ') => {
-                        if let Some(idx) = self.cursor_session() {
-                            self.selected[idx] = !self.selected[idx];
+                    KeyCode::Char('b') => {
+                        if self.selected_count() > 0 {
+                            self.step = BackupStep::Confirm;
                         }
                     }
-                    KeyCode::Char('a') => self.selected.iter_mut().for_each(|b| *b = true),
-                    KeyCode::Char('n') => self.selected.iter_mut().for_each(|b| *b = false),
-                    KeyCode::Char('/') => self.filtering = true,
-                    KeyCode::Char('b') | KeyCode::Enter if self.selected_count() > 0 => {
-                        self.step = BackupStep::Confirm;
+                    _ => {
+                        self.picker.handle_key(code);
                     }
-                    _ => {}
                 }
             }
             BackupStep::Confirm => match code {
@@ -255,51 +191,24 @@ impl BackupApp {
             "Backup - {}/{} selected{}",
             self.selected_count(),
             self.sessions.len(),
-            if self.filtering {
-                format!("   filter: {}_", sanitize(&self.filter))
-            } else if !self.filter.is_empty() {
-                format!("   filter: {}", sanitize(&self.filter))
-            } else {
-                String::new()
-            }
+            self.picker.filter_suffix()
         ))
         .style(Style::default().add_modifier(Modifier::BOLD));
         f.render_widget(header, chunks[0]);
 
-        let items: Vec<ListItem> = self
-            .visible
-            .iter()
-            .map(|&i| {
-                let s = &self.sessions[i].session;
-                let check = if self.selected[i] { "[x]" } else { "[ ]" };
-                let cwd = if s.cwd.is_empty() {
-                    "<unknown cwd>".to_string()
-                } else {
-                    sanitize(&s.cwd)
-                };
-                let line = format!(
-                    "{check} {cwd}  ({} msgs, {})",
-                    s.message_count,
-                    human_size(s.size_bytes)
-                );
-                ListItem::new(line)
-            })
-            .collect();
-
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Sessions"))
+        let list = List::new(self.picker.list_items())
+            .block(Block::default().borders(Borders::ALL).title("Directories"))
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("> ");
-        f.render_stateful_widget(list, chunks[1], &mut self.state);
+        f.render_stateful_widget(list, chunks[1], &mut self.picker.state);
 
-        let help =
-            Paragraph::new("space toggle | a all | n none | / filter | b/enter backup | q quit")
-                .style(Style::default().fg(Color::DarkGray))
-                .wrap(Wrap { trim: true });
+        let help = Paragraph::new(format!("{PICKER_HELP} | b backup | q quit"))
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(Wrap { trim: true });
         f.render_widget(help, chunks[2]);
     }
 }
