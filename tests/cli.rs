@@ -436,7 +436,7 @@ fn tui_state_machines_and_tty_guard_work_without_terminal() {
     home.handle_key(KeyCode::Char('/'));
     home.handle_key(KeyCode::Char('f'));
     home.handle_key(KeyCode::Enter);
-    assert_eq!(home.visible_items, vec![0]);
+    assert_eq!(home.picker.as_ref().unwrap().rows.len(), 1);
     home.handle_key(KeyCode::Char('a'));
     assert_eq!(home.total_selected_items(), 1);
     home.handle_key(KeyCode::Char('b'));
@@ -465,7 +465,7 @@ fn tui_state_machines_and_tty_guard_work_without_terminal() {
     }]);
     backup_app.handle_key(KeyCode::Char(' '));
     assert_eq!(backup_app.selected_count(), 1);
-    backup_app.handle_key(KeyCode::Enter);
+    backup_app.handle_key(KeyCode::Char('b'));
     assert_eq!(backup_app.step, BackupStep::Confirm);
     backup_app.set_plan(Plan::default());
     backup_app.handle_key(KeyCode::Char('y'));
@@ -491,7 +491,7 @@ fn tui_state_machines_and_tty_guard_work_without_terminal() {
         RestoreFlags::default(),
     );
     restore_app.handle_key(KeyCode::Char('a'));
-    restore_app.handle_key(KeyCode::Enter);
+    restore_app.handle_key(KeyCode::Char('p'));
     assert_eq!(restore_app.step, RestoreStep::Mapping);
     assert_eq!(restore_app.rows.len(), 1);
     restore_app.rows[0].value = "/Users/bob/app".into();
@@ -636,7 +636,7 @@ fn tui_restore_request_applies_only_the_selected_sessions() {
         .insert(ProviderId::Codex, env.root.join("tui/.codex"));
     let wanted = app.sessions()[0].id.clone();
     let other = app.sessions()[1].id.clone();
-    app.selected[0] = true;
+    app.picker.selected[0] = true;
     let prepared = aisession_backup::engine::prepare_restore(app.build_restore_request()).unwrap();
     assert!(!prepared.plan.has_refusals(), "{:?}", prepared.plan);
     aisession_backup::engine::apply_restore(prepared).unwrap();
@@ -646,7 +646,113 @@ fn tui_restore_request_applies_only_the_selected_sessions() {
         .collect();
     assert!(names.iter().any(|name| name.contains(&wanted)));
     assert!(!names.iter().any(|name| name.contains(&other)));
-    assert!(!tree_snapshot(&env.root.join("tui/.codex")).is_empty());
+    assert!(!env.root.join("tui/.codex").exists());
+}
+
+#[test]
+fn tui_restore_selects_a_whole_directory_across_providers() {
+    let env = TestEnv::new();
+    let archive = multi_provider_archive(&env);
+    let staged =
+        aisession_backup::archive::stage(&archive, &aisession_backup::engine::Passphrase::None)
+            .unwrap();
+    let dest = env.root.join("tui/.claude");
+    let mut app = RestoreApp::new(
+        staged.manifest,
+        &archive,
+        &dest,
+        RestoreFlags {
+            allow_running: true,
+            ..RestoreFlags::default()
+        },
+    );
+    let group = app
+        .picker
+        .groups
+        .iter()
+        .position(|group| group.cwd.as_deref() == Some("/work/one"))
+        .unwrap();
+    assert_eq!(
+        app.picker.groups[group].provider_summary(),
+        "claude 1, codex 1"
+    );
+    let row = app
+        .picker
+        .rows
+        .iter()
+        .position(|row| *row == aisession_backup::tui::PickRow::Group(group))
+        .unwrap();
+    app.picker.state.select(Some(row));
+    app.handle_key(KeyCode::Char(' '));
+    assert_eq!(app.selected_count(), 2);
+    app.handle_key(KeyCode::Char('p'));
+    assert_eq!(app.step, RestoreStep::Mapping);
+    assert_eq!(app.rows.len(), 1);
+    assert_eq!(app.rows[0].root, "/work/one");
+
+    let request = app.build_restore_request();
+    assert_eq!(request.only_sessions.as_ref().unwrap().len(), 1);
+    assert_eq!(request.only_items.as_ref().unwrap().len(), 1);
+    assert!(request
+        .only_items
+        .as_ref()
+        .unwrap()
+        .iter()
+        .all(|(id, _)| *id == ProviderId::Codex));
+
+    let mut without_destination = request.clone();
+    without_destination.provider_homes.clear();
+    let refused = aisession_backup::engine::prepare_restore(without_destination).unwrap();
+    assert!(refused.plan.has_refusals());
+
+    let mut homes = request.clone();
+    homes
+        .provider_homes
+        .insert(ProviderId::Codex, env.root.join("tui/.codex"));
+    let prepared = aisession_backup::engine::prepare_restore(homes).unwrap();
+    assert!(!prepared.plan.has_refusals(), "{:?}", prepared.plan);
+    aisession_backup::engine::apply_restore(prepared).unwrap();
+    let codex: Vec<String> = tree_snapshot(&env.root.join("tui/.codex"))
+        .into_iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+    assert_eq!(codex.len(), 1, "{codex:?}");
+    let claude = tree_snapshot(&dest);
+    assert_eq!(claude.len(), 1);
+}
+
+#[test]
+fn list_and_scan_group_by_directory_and_flat_keeps_the_old_output() {
+    let env = TestEnv::new();
+    env.write_claude_session("11111111-1111-4111-8111-111111111111", "/work/one", "first");
+    env.write_claude_session(
+        "22222222-2222-4222-8222-222222222222",
+        "/work/one",
+        "second",
+    );
+    env.write_claude_session("33333333-3333-4333-8333-333333333333", "/work/two", "third");
+
+    let grouped = env.run(&["list"]);
+    assert_eq!(code_of(&grouped), EXIT_OK);
+    let text = String::from_utf8_lossy(&grouped.stdout);
+    assert_eq!(text.matches("/work/one | 2 item(s)").count(), 1);
+    assert_eq!(text.matches("/work/two | 1 item(s)").count(), 1);
+
+    let flat = env.run(&["list", "--flat"]);
+    assert_eq!(code_of(&flat), EXIT_OK);
+    let text = String::from_utf8_lossy(&flat.stdout);
+    assert_eq!(text.matches("  /work/one\n").count(), 2);
+
+    let scan = env.run(&["scan", "--provider", "claude"]);
+    assert_eq!(code_of(&scan), EXIT_OK);
+    assert!(String::from_utf8_lossy(&scan.stdout).contains("/work/one | 2 item(s)"));
+    let scan_flat = env.run(&["scan", "--provider", "claude", "--flat"]);
+    assert_eq!(code_of(&scan_flat), EXIT_OK);
+    assert!(String::from_utf8_lossy(&scan_flat.stdout).contains("PROVIDER"));
+
+    let json = env.run(&["list", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 3);
 }
 
 #[test]

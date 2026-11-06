@@ -94,6 +94,8 @@ pub enum Commands {
         include_state: bool,
         #[arg(long, help = "Include login credentials")]
         include_credentials: bool,
+        #[arg(long, help = "Show a flat table instead of grouping by directory")]
+        flat: bool,
         #[arg(long, help = "Output JSON to stdout")]
         json: bool,
     },
@@ -245,6 +247,8 @@ pub enum Commands {
     List {
         #[arg(value_name = "FILE", help = "Optional archive file to inspect")]
         backup_file: Option<String>,
+        #[arg(long, help = "List items one by one instead of grouping by directory")]
+        flat: bool,
         #[arg(long, help = "Output JSON to stdout")]
         json: bool,
     },
@@ -300,6 +304,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             provider,
             include_state,
             include_credentials,
+            flat,
             json,
         } => cmd_scan(
             provider.as_deref(),
@@ -307,6 +312,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 include_state,
                 include_credentials,
             },
+            flat,
             json,
         ),
         Commands::Backup {
@@ -400,7 +406,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             yes,
             json,
         } => cmd_rollback(&id, dry_run, yes, json),
-        Commands::List { backup_file, json } => cmd_list(backup_file.as_deref(), json),
+        Commands::List {
+            backup_file,
+            flat,
+            json,
+        } => cmd_list(backup_file.as_deref(), flat, json),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "aisession-backup", &mut io::stdout());
@@ -815,7 +825,7 @@ fn cmd_doctor(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_scan(provider_arg: Option<&str>, opts: ScanOptions, json: bool) -> Result<()> {
+fn cmd_scan(provider_arg: Option<&str>, opts: ScanOptions, flat: bool, json: bool) -> Result<()> {
     let claude_dir = resolve_claude_dir(None);
     let env = locate_env_with_claude(&claude_dir);
     let (is_all, ids) = parse_providers(provider_arg, false)?;
@@ -839,10 +849,15 @@ fn cmd_scan(provider_arg: Option<&str>, opts: ScanOptions, json: bool) -> Result
 
     if json {
         ui::print_json(&inventories)?;
-    } else {
+    } else if flat {
         print!(
             "{}",
             ui::format_inventories(&inventories, ui::color_stdout())
+        );
+    } else {
+        print!(
+            "{}",
+            ui::format_inventories_grouped(&inventories, ui::color_stdout())
         );
     }
     Ok(())
@@ -934,6 +949,7 @@ fn cmd_restore(args: RestoreArgs) -> Result<()> {
         provider_homes,
         only_providers,
         only_sessions: None,
+        only_items: None,
         mappings,
         rewrite_tool_paths: args.rewrite_tool_paths,
         restore_history: args.restore_history,
@@ -1092,25 +1108,55 @@ fn cmd_rollback(id: &str, dry_run: bool, yes: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(backup_file: Option<&str>, json: bool) -> Result<()> {
+fn cmd_list(backup_file: Option<&str>, flat: bool, json: bool) -> Result<()> {
     match backup_file {
-        Some(file) => list_backup(Path::new(file), json),
-        None => list_local(json),
+        Some(file) => list_backup(Path::new(file), flat, json),
+        None => list_local(flat, json),
     }
 }
 
-fn list_backup(path: &Path, json: bool) -> Result<()> {
+fn session_entry(session: &crate::model::Session) -> crate::grouping::Entry {
+    crate::grouping::Entry {
+        id: session.id.clone(),
+        label: session.preview.clone(),
+        cwd: Some(session.cwd.clone()),
+        provider: ProviderId::Claude.as_str().to_string(),
+        detail: format!("{} msgs", session.message_count),
+        size: session.size_bytes,
+        updated_at: Some(session.timestamp),
+    }
+}
+
+pub(crate) fn manifest_entries(manifest: &Manifest) -> Vec<crate::grouping::Entry> {
+    let mut entries: Vec<_> = manifest.sessions.iter().map(session_entry).collect();
+    for provider in &manifest.providers {
+        for item in &provider.items {
+            entries.push(crate::grouping::Entry {
+                id: item.id.clone(),
+                label: item.label.clone(),
+                cwd: item.cwd.clone(),
+                provider: provider.id.as_str().to_string(),
+                detail: format!("{} file(s)", item.files.len()),
+                size: item.total_size(),
+                updated_at: item.updated_at,
+            });
+        }
+    }
+    entries
+}
+
+fn list_backup(path: &Path, flat: bool, json: bool) -> Result<()> {
     let passphrase = resolve_decrypt_passphrase(path)?;
     let manifest = crate::engine::read_manifest(path, &passphrase)?;
     if json {
         ui::print_json(&manifest)?;
     } else {
-        print_manifest(&manifest, path);
+        print_manifest(&manifest, path, flat);
     }
     Ok(())
 }
 
-fn print_manifest(manifest: &Manifest, path: &Path) {
+fn print_manifest(manifest: &Manifest, path: &Path, flat: bool) {
     let fname = path
         .file_name()
         .map(|n| sanitize(&n.to_string_lossy()))
@@ -1118,6 +1164,13 @@ fn print_manifest(manifest: &Manifest, path: &Path) {
     println!("Backup: {fname}");
     print!("{}", sanitize_multiline(&backup::summarize(manifest)));
     println!();
+    if !flat {
+        print!(
+            "{}",
+            crate::grouping::format_groups(&manifest_entries(manifest), ui::color_stdout())
+        );
+        return;
+    }
     for s in &manifest.sessions {
         let cwd = if s.cwd.is_empty() {
             "<unknown cwd>".to_string()
@@ -1163,7 +1216,7 @@ fn sanitize_multiline(text: &str) -> String {
     out
 }
 
-fn list_local(json: bool) -> Result<()> {
+fn list_local(flat: bool, json: bool) -> Result<()> {
     let claude_dir = resolve_claude_dir(None);
     let sessions = discover::load_sessions(&claude_dir).context("scanning sessions")?;
     if json {
@@ -1175,6 +1228,17 @@ fn list_local(json: bool) -> Result<()> {
         sessions.len(),
         sanitize(&claude_dir.display().to_string())
     );
+    if !flat {
+        let entries: Vec<_> = sessions
+            .iter()
+            .map(|found| session_entry(&found.session))
+            .collect();
+        print!(
+            "{}",
+            crate::grouping::format_groups(&entries, ui::color_stdout())
+        );
+        return Ok(());
+    }
     for ds in &sessions {
         let s = &ds.session;
         let cwd = if s.cwd.is_empty() {

@@ -88,6 +88,7 @@ fn restore_request(root: &Path) -> engine::RestoreRequest {
         provider_homes: BTreeMap::new(),
         only_providers: None,
         only_sessions: None,
+        only_items: None,
         mappings: BTreeMap::new(),
         rewrite_tool_paths: true,
         restore_history: false,
