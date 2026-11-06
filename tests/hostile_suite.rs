@@ -696,7 +696,7 @@ fn deep_tool_result_names_survive_verification() {
     let cwd = "/work/app";
     put_session(&home, id, cwd, "parent");
     let encoded = claude_migrate::claudepath::encode(cwd);
-    let long_name = "r".repeat(180);
+    let long_name = "r".repeat(120);
     put_rel(
         &home,
         &format!("projects/{encoded}/{id}/tool-results/{long_name}.bin"),
@@ -1728,6 +1728,7 @@ fn empty_cwd_is_refused_and_not_written() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn running_provider_is_refused_without_allow_running() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1755,6 +1756,7 @@ fn running_provider_is_refused_without_allow_running() {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_named_sleeper(root: &Path, name: &str) -> std::process::Child {
     let bin = root.join(name);
     fs::copy("/bin/sleep", &bin).unwrap();

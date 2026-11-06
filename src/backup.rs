@@ -268,7 +268,7 @@ pub fn summarize(manifest: &Manifest) -> String {
     if !manifest.checksum.is_empty() {
         out.push_str(&format!(
             "Checksum: {}...\n",
-            &crate::archive::report_text(&manifest.checksum.chars().take(16).collect::<String>())
+            crate::archive::report_text(&manifest.checksum.chars().take(16).collect::<String>())
         ));
     }
     out.push_str(&format!("Sessions: {}\n", manifest.sessions.len()));
