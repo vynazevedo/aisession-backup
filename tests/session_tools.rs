@@ -240,9 +240,15 @@ fn relocate_moves_sessions_to_the_new_folder_and_rolls_back() {
         .join("projects")
         .join(claudepath::encode(&format!("{new_root}/app")))
         .join(format!("{CLAUDE_ID}.jsonl"));
-    assert_eq!(cwd_of(&copy), format!("{new_root}/app"));
+    let joined = |leaf: &str| {
+        Path::new(&new_root)
+            .join(leaf)
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(cwd_of(&copy), joined("app"));
     assert_eq!(cwd_of(&original), format!("{old_root}/app"));
-    assert_eq!(cwd_of(&rollout), format!("{new_root}/api"));
+    assert_eq!(cwd_of(&rollout), joined("api"));
 
     let resume = env.ok(&["resume", CLAUDE_ID]);
     assert!(resume.contains("claude --resume"));
