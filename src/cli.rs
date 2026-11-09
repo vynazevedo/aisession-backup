@@ -171,6 +171,13 @@ pub enum Commands {
             help = "Snapshot to restore from the repository"
         )]
         snapshot: String,
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "repo",
+            help = "With --snapshot latest, use the newest snapshot taken on this host"
+        )]
+        host: Option<String>,
         #[arg(short, long, help = "Destination Claude directory")]
         dest: Option<String>,
         #[arg(
@@ -440,6 +447,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             backup_file,
             repo,
             snapshot,
+            host,
             dest,
             provider_home,
             mappings,
@@ -459,6 +467,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             backup_file,
             repo,
             snapshot,
+            host,
             dest,
             provider_home,
             mappings,
@@ -569,6 +578,7 @@ struct RestoreArgs {
     backup_file: Option<String>,
     repo: Option<String>,
     snapshot: String,
+    host: Option<String>,
     dest: Option<String>,
     provider_home: Vec<String>,
     mappings: Option<String>,
@@ -820,6 +830,8 @@ pub enum RepoAction {
     Snapshots {
         #[arg(value_name = "LOCATION")]
         location: String,
+        #[arg(long, value_name = "NAME", help = "Only snapshots taken on this host")]
+        host: Option<String>,
         #[arg(long, help = "Output JSON to stdout")]
         json: bool,
     },
@@ -863,8 +875,15 @@ fn cmd_repo(action: RepoAction) -> Result<()> {
             );
             Ok(())
         }
-        RepoAction::Snapshots { location, json } => {
-            let snapshots = open_repository(&location)?.list_snapshots()?;
+        RepoAction::Snapshots {
+            location,
+            host,
+            json,
+        } => {
+            let mut snapshots = open_repository(&location)?.list_snapshots()?;
+            if let Some(host) = &host {
+                snapshots.retain(|info| &info.host == host);
+            }
             if json {
                 return ui::print_json(&snapshots);
             }
@@ -1496,13 +1515,34 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolve_snapshot(
+    repository: &crate::repo::Repository,
+    snapshot: &str,
+    host: Option<&str>,
+) -> Result<String> {
+    let Some(host) = host else {
+        return Ok(snapshot.to_string());
+    };
+    if snapshot != "latest" {
+        return Err(CliExit::new(EXIT_USAGE, "--host only applies to --snapshot latest").into());
+    }
+    repository
+        .list_snapshots()?
+        .into_iter()
+        .find(|info| info.host == host)
+        .map(|info| info.id)
+        .with_context(|| format!("no snapshot from host {}", sanitize(host)))
+}
+
 fn stage_repository_snapshot(
     location: &str,
     snapshot: &str,
+    host: Option<&str>,
 ) -> Result<crate::archive::StagedArchive> {
     let repository = open_repository(location)?;
+    let id = resolve_snapshot(&repository, snapshot, host)?;
     let staging = crate::archive::staging_dir()?;
-    let (manifest, files) = repository.stage_snapshot(snapshot, staging.path())?;
+    let (manifest, files) = repository.stage_snapshot(&id, staging.path())?;
     let report = engine::VerifyReport {
         encrypted: false,
         schema_version: manifest.schema_version,
@@ -1529,7 +1569,11 @@ fn cmd_restore(args: RestoreArgs) -> Result<()> {
                 sanitize(location),
                 sanitize(&args.snapshot)
             )),
-            Some(stage_repository_snapshot(location, &args.snapshot)?),
+            Some(stage_repository_snapshot(
+                location,
+                &args.snapshot,
+                args.host.as_deref(),
+            )?),
         ),
         _ => {
             return Err(CliExit::new(

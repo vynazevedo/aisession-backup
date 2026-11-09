@@ -1241,6 +1241,39 @@ fn incremental_repository_backup_restore_and_prune() {
     let snapshots: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(snapshots.as_array().unwrap().len(), 2);
     let check = with_pass(&["repo", "check", repo_arg, "--read-data"], "correct horse");
+    let host = snapshots[0]["host"].as_str().unwrap().to_string();
+    let by_host = with_pass(
+        &["repo", "snapshots", repo_arg, "--host", &host, "--json"],
+        "correct horse",
+    );
+    let by_host: serde_json::Value = serde_json::from_slice(&by_host.stdout).unwrap();
+    assert_eq!(by_host.as_array().unwrap().len(), 2);
+    let none = with_pass(
+        &[
+            "repo",
+            "snapshots",
+            repo_arg,
+            "--host",
+            "no-such-host",
+            "--json",
+        ],
+        "correct horse",
+    );
+    let none: serde_json::Value = serde_json::from_slice(&none.stdout).unwrap();
+    assert!(none.as_array().unwrap().is_empty());
+    let missing_host = with_pass(
+        &[
+            "restore",
+            "--repo",
+            repo_arg,
+            "--host",
+            "no-such-host",
+            "--dry-run",
+        ],
+        "correct horse",
+    );
+    assert_ne!(code_of(&missing_host), EXIT_OK);
+    assert!(String::from_utf8_lossy(&missing_host.stderr).contains("no snapshot from host"));
     assert_eq!(
         code_of(&check),
         EXIT_OK,
