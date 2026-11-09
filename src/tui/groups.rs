@@ -1,6 +1,8 @@
 use ratatui::crossterm::event::KeyCode;
 use ratatui::prelude::*;
-use ratatui::widgets::{ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+
+use super::theme::{split_with_details, Icon, Theme};
 
 use crate::grouping::{format_date, group_entries, DirGroup, Entry};
 use crate::ui::{human_size, sanitize};
@@ -292,21 +294,228 @@ impl GroupPicker {
         }
     }
 
-    pub fn list_items(&self) -> Vec<ListItem<'static>> {
+    fn mark_span(&self, mark: Mark, theme: &Theme) -> Span<'static> {
+        let (icon, style) = match mark {
+            Mark::Full => (Icon::Check, theme.success()),
+            Mark::Partial => (Icon::Partial, theme.warning()),
+            Mark::Empty => (Icon::Empty, theme.muted()),
+        };
+        Span::styled(theme.icon(icon).to_string(), style)
+    }
+
+    fn provider_spans(&self, group: &DirGroup, theme: &Theme) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        for (name, count) in &group.providers {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("{} {count}", sanitize(name)),
+                theme.provider(name),
+            ));
+        }
+        spans
+    }
+
+    pub fn row_line(&self, row: PickRow, theme: &Theme) -> Line<'static> {
+        match row {
+            PickRow::Group(index) => {
+                let group = &self.groups[index];
+                let chosen = group
+                    .members
+                    .iter()
+                    .filter(|&&member| self.selected[member])
+                    .count();
+                let folder = if self.is_open(index) {
+                    Icon::FolderOpen
+                } else {
+                    Icon::Folder
+                };
+                let mut spans = vec![
+                    self.mark_span(self.mark(index), theme),
+                    Span::raw(" "),
+                    Span::styled(theme.icon(folder).to_string(), theme.accent()),
+                    Span::raw(" "),
+                    Span::styled(group.title(), theme.strong()),
+                    Span::styled(
+                        format!(
+                            "  {chosen}/{}  {}  {}",
+                            group.members.len(),
+                            human_size(group.size),
+                            format_date(group.latest)
+                        ),
+                        theme.muted(),
+                    ),
+                ];
+                spans.extend(self.provider_spans(group, theme));
+                Line::from(spans)
+            }
+            PickRow::Entry { entry, .. } => {
+                let item = &self.entries[entry];
+                let mark = if self.selected[entry] {
+                    Mark::Full
+                } else {
+                    Mark::Empty
+                };
+                let label = if item.label.is_empty() {
+                    sanitize(&item.id)
+                } else {
+                    sanitize(&item.label)
+                };
+                Line::from(vec![
+                    Span::raw("    "),
+                    self.mark_span(mark, theme),
+                    Span::raw(" "),
+                    Span::raw(label),
+                    Span::raw("  "),
+                    Span::styled(sanitize(&item.provider), theme.provider(&item.provider)),
+                    Span::styled(
+                        format!(
+                            "  {}  {}",
+                            human_size(item.size),
+                            format_date(item.updated_at)
+                        ),
+                        theme.muted(),
+                    ),
+                ])
+            }
+        }
+    }
+
+    pub fn list_items(&self, theme: &Theme) -> Vec<ListItem<'static>> {
         self.rows
             .iter()
-            .map(|&row| {
-                let style = match row {
-                    PickRow::Group(_) => Style::default().add_modifier(Modifier::BOLD),
-                    PickRow::Entry { .. } => Style::default(),
-                };
-                ListItem::new(self.row_text(row)).style(style)
-            })
+            .map(|&row| ListItem::new(self.row_line(row, theme)))
             .collect()
+    }
+
+    fn field(theme: &Theme, name: &str, value: String) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("{name:<10}"), theme.muted()),
+            Span::raw(value),
+        ])
+    }
+
+    pub fn detail_lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+        match self.current() {
+            Some(PickRow::Group(index)) => {
+                let group = &self.groups[index];
+                let chosen = group
+                    .members
+                    .iter()
+                    .filter(|&&member| self.selected[member])
+                    .count();
+                let mut providers =
+                    vec![Span::styled(format!("{:<10}", "providers"), theme.muted())];
+                providers.extend(self.provider_spans(group, theme));
+                vec![
+                    Line::from(Span::styled(group.title(), theme.accent())),
+                    Line::from(""),
+                    Self::field(theme, "items", group.members.len().to_string()),
+                    Self::field(theme, "selected", chosen.to_string()),
+                    Self::field(theme, "size", human_size(group.size)),
+                    Self::field(theme, "last", format_date(group.latest)),
+                    Line::from(providers),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "space selects the whole directory, enter opens it",
+                        theme.muted(),
+                    )),
+                ]
+            }
+            Some(PickRow::Entry { entry, .. }) => {
+                let item = &self.entries[entry];
+                let title = if item.label.is_empty() {
+                    sanitize(&item.id)
+                } else {
+                    sanitize(&item.label)
+                };
+                let mut lines = vec![
+                    Line::from(Span::styled(title, theme.accent())),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(format!("{:<10}", "provider"), theme.muted()),
+                        Span::styled(sanitize(&item.provider), theme.provider(&item.provider)),
+                    ]),
+                    Self::field(theme, "id", sanitize(&item.id)),
+                    Self::field(theme, "size", human_size(item.size)),
+                    Self::field(theme, "updated", format_date(item.updated_at)),
+                    Self::field(
+                        theme,
+                        "directory",
+                        item.cwd
+                            .as_deref()
+                            .map(sanitize)
+                            .unwrap_or_else(|| crate::grouping::NO_DIRECTORY.to_string()),
+                    ),
+                ];
+                if !item.detail.is_empty() {
+                    lines.push(Self::field(theme, "detail", sanitize(&item.detail)));
+                }
+                lines.push(Self::field(
+                    theme,
+                    "selected",
+                    if self.selected[entry] { "yes" } else { "no" }.to_string(),
+                ));
+                lines
+            }
+            None => vec![Line::from(Span::styled(
+                if self.filter.is_empty() {
+                    "Nothing to show."
+                } else {
+                    "No item matches the filter."
+                },
+                theme.muted(),
+            ))],
+        }
+    }
+
+    pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme, title: &str) {
+        let (list_area, detail_area) = split_with_details(area);
+        let title = if self.filter.is_empty() && !self.filtering {
+            title.to_string()
+        } else {
+            format!(
+                "{title}  {} {}{}",
+                theme.icon(Icon::Search),
+                sanitize(&self.filter),
+                if self.filtering { "_" } else { "" }
+            )
+        };
+        let list = List::new(self.list_items(theme))
+            .block(theme.panel(&title))
+            .highlight_style(theme.selected_row())
+            .highlight_symbol("> ");
+        f.render_stateful_widget(list, list_area, &mut self.state);
+        if let Some(detail_area) = detail_area {
+            f.render_widget(
+                Paragraph::new(self.detail_lines(theme))
+                    .block(theme.panel("Details"))
+                    .wrap(Wrap { trim: false }),
+                detail_area,
+            );
+        }
     }
 }
 
-pub const PICKER_HELP: &str = "space toggle | enter/l open | h close | a all | n none | / filter";
+pub const PICKER_KEYS: [(&str, &str); 6] = [
+    ("space", "select"),
+    ("enter", "open"),
+    ("h", "close"),
+    ("a/n", "all/none"),
+    ("/", "filter"),
+    ("?", "help"),
+];
+
+pub const PICKER_HELP_KEYS: [(&str, &str); 9] = [
+    ("space", "select or clear the directory or item"),
+    ("enter", "open or close the directory"),
+    ("l / right", "open the directory"),
+    ("h / left", "close the directory"),
+    ("j/k", "move"),
+    ("a / n", "select or clear everything visible"),
+    ("/", "filter by directory, name or id"),
+    ("esc", "leave the filter or go back"),
+    ("q", "quit without writing"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -447,6 +656,33 @@ mod tests {
         picker.handle_key(KeyCode::Char(' '));
         picker.handle_key(KeyCode::Char('a'));
         assert_eq!(picker.selected_count(), 0);
+    }
+
+    #[test]
+    fn picker_renders_with_details_and_on_tiny_terminals() {
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true, crate::tui::theme::IconSet::Nerd);
+        let mut picker = picker();
+        picker.handle_key(KeyCode::Enter);
+        for (width, height) in [(1, 1), (30, 6), (140, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| picker.render(f, f.area(), &theme, "Directories"))
+                .unwrap();
+        }
+        let detail: String = picker
+            .detail_lines(&theme)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(detail.contains("/app"));
+        let row: String = picker
+            .row_line(PickRow::Group(0), &theme)
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(row.contains("claude 2"));
     }
 
     #[test]

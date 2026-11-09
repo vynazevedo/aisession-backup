@@ -3,7 +3,6 @@ use std::path::Path;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, Paragraph, Wrap};
 
 use crate::backup;
 use crate::discover::{self, DiscoveredSession};
@@ -11,8 +10,9 @@ use crate::engine::{self, BackupRequest, ClaudeSelection, Passphrase};
 use crate::plan::Plan;
 use crate::ui::sanitize;
 
-use super::groups::{GroupPicker, PICKER_HELP};
-use super::{render_plan_lines, with_terminal, Tui};
+use super::groups::{GroupPicker, PICKER_HELP_KEYS, PICKER_KEYS};
+use super::theme::{self, Scroll};
+use super::{with_terminal, Tui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupStep {
@@ -30,6 +30,8 @@ pub enum BackupAction {
 pub struct BackupApp {
     pub sessions: Vec<DiscoveredSession>,
     pub picker: GroupPicker,
+    pub show_help: bool,
+    plan_scroll: Scroll,
     pub step: BackupStep,
     pub plan: Option<Plan>,
     pub action: Option<BackupAction>,
@@ -52,6 +54,8 @@ impl BackupApp {
         Self {
             sessions,
             picker: GroupPicker::new(entries, Vec::new()),
+            show_help: false,
+            plan_scroll: Scroll::default(),
             step: BackupStep::Select,
             plan: None,
             action: None,
@@ -76,6 +80,14 @@ impl BackupApp {
     }
 
     pub fn handle_key(&mut self, code: KeyCode) {
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+        if code == KeyCode::Char('?') && !self.picker.filtering && self.step != BackupStep::Done {
+            self.show_help = true;
+            return;
+        }
         match self.step {
             BackupStep::Select => {
                 if self.picker.filtering {
@@ -112,7 +124,9 @@ impl BackupApp {
                         self.step = BackupStep::Done;
                     }
                 }
-                _ => {}
+                _ => {
+                    self.plan_scroll.handle_key(code);
+                }
             },
             BackupStep::Done => {}
         }
@@ -127,6 +141,7 @@ impl BackupApp {
     ) -> Result<BackupAction> {
         loop {
             if self.step == BackupStep::Confirm && self.plan.is_none() {
+                self.plan_scroll = Scroll::default();
                 let req = BackupRequest {
                     output: output.to_path_buf(),
                     overwrite: false,
@@ -161,55 +176,54 @@ impl BackupApp {
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(1),
-                Constraint::Length(2),
-            ])
-            .split(f.area());
-
+        let theme = theme::current();
+        let [top, body, bottom] = theme::frame_layout(f.area());
+        let selected = self.selected_count();
         if self.step == BackupStep::Confirm {
-            let header = Paragraph::new("Confirm Backup Plan")
-                .style(Style::default().add_modifier(Modifier::BOLD));
-            f.render_widget(header, chunks[0]);
-
-            let body = Paragraph::new(render_plan_lines(self.plan.as_ref()))
-                .block(Block::default().borders(Borders::ALL).title("Plan"))
-                .wrap(Wrap { trim: false });
-            f.render_widget(body, chunks[1]);
-
-            let help = Paragraph::new("enter/y confirm | esc back | q quit")
-                .style(Style::default().fg(Color::DarkGray))
-                .wrap(Wrap { trim: true });
-            f.render_widget(help, chunks[2]);
-            return;
+            f.render_widget(
+                theme::header(theme, "Backup plan", &format!("{selected} session(s)")),
+                top,
+            );
+            theme::render_plan(f, body, theme, self.plan.as_ref(), &mut self.plan_scroll);
+            let mut keys = theme::PLAN_KEYS.to_vec();
+            if !self.plan.as_ref().is_some_and(Plan::has_refusals) {
+                keys.insert(0, ("enter", "write backup"));
+            }
+            keys.extend([("esc", "back"), ("q", "quit")]);
+            f.render_widget(theme::footer(theme, &keys), bottom);
+        } else {
+            f.render_widget(
+                theme::header(
+                    theme,
+                    "Backup",
+                    &format!("{selected}/{} session(s) selected", self.sessions.len()),
+                ),
+                top,
+            );
+            self.picker.render(f, body, theme, "Directories");
+            let mut keys = PICKER_KEYS.to_vec();
+            if selected > 0 {
+                keys.insert(0, ("b", "backup"));
+            }
+            keys.push(("q", "quit"));
+            f.render_widget(theme::footer(theme, &keys), bottom);
         }
-
-        let header = Paragraph::new(format!(
-            "Backup - {}/{} selected{}",
-            self.selected_count(),
-            self.sessions.len(),
-            self.picker.filter_suffix()
-        ))
-        .style(Style::default().add_modifier(Modifier::BOLD));
-        f.render_widget(header, chunks[0]);
-
-        let list = List::new(self.picker.list_items())
-            .block(Block::default().borders(Borders::ALL).title("Directories"))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-        f.render_stateful_widget(list, chunks[1], &mut self.picker.state);
-
-        let help = Paragraph::new(format!("{PICKER_HELP} | b backup | q quit"))
-            .style(Style::default().fg(Color::DarkGray))
-            .wrap(Wrap { trim: true });
-        f.render_widget(help, chunks[2]);
+        if self.show_help {
+            let keys: Vec<(&str, &str)> = if self.step == BackupStep::Confirm {
+                vec![
+                    ("j/k", "scroll the plan"),
+                    ("g / G", "top or end of the plan"),
+                    ("enter / y", "write the backup"),
+                    ("esc", "back to the selection"),
+                    ("q", "quit without writing"),
+                ]
+            } else {
+                let mut keys = PICKER_HELP_KEYS.to_vec();
+                keys.push(("b", "review the backup plan"));
+                keys
+            };
+            theme::render_help(f, theme, "Keys", &keys);
+        }
     }
 }
 

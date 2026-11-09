@@ -867,7 +867,7 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
     let ext = if args.encrypt { "tar.gz.age" } else { "tar.gz" };
     let output_str = args.output.unwrap_or_else(|| {
         format!(
-            "claude-backup-{}.{ext}",
+            "aisession-backup-{}.{ext}",
             chrono::Local::now().format("%Y%m%d-%H%M%S")
         )
     });
