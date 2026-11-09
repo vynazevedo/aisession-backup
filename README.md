@@ -8,7 +8,7 @@ AI session backup and migration for terminal coding tools: Claude Code, Codex,
 Grok, Gemini, Antigravity, Maestri and OpenCode.
 
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![version](https://img.shields.io/badge/version-3.5.0-success?style=flat-square)](Cargo.toml)
+[![version](https://img.shields.io/badge/version-3.6.0-success?style=flat-square)](Cargo.toml)
 [![CI](https://img.shields.io/github/actions/workflow/status/vynazevedo/aisession-backup/ci.yml?style=flat-square&label=CI&branch=main)](https://github.com/vynazevedo/aisession-backup/actions/workflows/ci.yml)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square)](https://www.rust-lang.org)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square)](#instalação)
