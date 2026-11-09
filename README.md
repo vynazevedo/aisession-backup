@@ -13,6 +13,8 @@ Grok, Gemini, Antigravity, Maestri and OpenCode.
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square)](https://www.rust-lang.org)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square)](#instalação)
 
+![Tela inicial do aisession-backup com os provedores detectados](docs/images/tui-home.jpg)
+
 ---
 
 ## Provedores suportados
@@ -383,6 +385,11 @@ aisession-backup restore tudo.tar.gz.age --dest /tmp/teste/.claude --provider cl
 ```
 
 ### Interface interativa
+
+Ao abrir, uma tela de carregamento mostra cada provedor sendo escaneado, o progresso
+da leitura das sessões do Claude Code e o tempo decorrido. Os provedores são lidos em
+paralelo, e `q` cancela sem escrever nada. O restore mostra a mesma tela enquanto
+verifica e extrai o arquivo.
 
 Na tela inicial, `enter` abre os itens de um provedor e `d` abre os de todos os
 provedores juntos. Tecle `b` para o backup ou `r` para o restore. Toda escrita passa
