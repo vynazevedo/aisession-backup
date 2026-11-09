@@ -141,6 +141,9 @@ aisession-backup repo prune ~/backups/ai --keep-last 14
 
 - **Restore igual ao do arquivo.** `restore --repo` passa pelo mesmo plano, mapeamento,
   confirmação e rollback. `--snapshot` aceita um id de `repo snapshots` ou `latest`.
+- **Várias máquinas no mesmo repositório.** Cada snapshot registra a máquina de origem.
+  `repo snapshots --host NOME` filtra por ela, e `restore --repo --host NOME` restaura o
+  snapshot mais recente daquela máquina.
 - **Criptografia.** Com `--encrypt`, uma chave age protegida pela senha cifra os blocos e
   os snapshots, e os ids dos blocos não revelam o conteúdo. A senha vem do prompt ou de
   `AISESSION_BACKUP_PASSPHRASE`.
