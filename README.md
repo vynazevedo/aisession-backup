@@ -144,6 +144,11 @@ aisession-backup repo prune ~/backups/ai --keep-last 14
 - **Criptografia.** Com `--encrypt`, uma chave age protegida pela senha cifra os blocos e
   os snapshots, e os ids dos blocos não revelam o conteúdo. A senha vem do prompt ou de
   `AISESSION_BACKUP_PASSPHRASE`.
+- **Snapshots autenticados.** Em repositórios criptografados, cada snapshot leva um
+  HMAC-SHA256 com uma chave derivada da chave secreta. Quem tem acesso de escrita ao
+  bucket, mas não tem a senha, não consegue forjar nem alterar um snapshot, e os blocos
+  também são conferidos contra ids que dependem da chave secreta. Repositórios sem
+  criptografia só detectam corrupção, como os arquivos `.tar.gz`.
 - **Integridade.** Cada bloco e cada arquivo são conferidos por SHA-256 no restore.
   `repo check` acha blocos ausentes ou corrompidos, e `--read-data` lê todos.
 - **Retenção.** `repo prune --keep-last N` mantém os N snapshots mais novos e apaga os
