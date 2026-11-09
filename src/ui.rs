@@ -451,6 +451,12 @@ pub fn format_backup_report(report: &BackupReport, color: bool) -> String {
         human_size(report.bytes),
         report.secret_findings
     );
+    if report.redacted_secrets > 0 {
+        out.push_str(&format!(
+            "  Redacted: {} replaced in the backup copy\n",
+            plural(report.redacted_secrets, "secret")
+        ));
+    }
     if report.sqlite_snapshots > 0 {
         out.push_str(&format!(
             "  SQLite: {} copied with the SQLite backup API and checked\n",

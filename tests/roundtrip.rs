@@ -70,6 +70,7 @@ fn backup_request(root: &Path, extras: bool) -> engine::BackupRequest {
         overwrite: false,
         providers: Vec::new(),
         passphrase: engine::Passphrase::None,
+        redact: false,
         claude: Some(engine::ClaudeSelection {
             claude_dir: root.join("src/.claude"),
             session_ids: None,

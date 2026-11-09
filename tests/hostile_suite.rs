@@ -121,6 +121,7 @@ fn backup_request(root: &Path, claude_dir: &Path) -> BackupRequest {
         }),
         providers: Vec::new(),
         passphrase: Passphrase::None,
+        redact: false,
     }
 }
 

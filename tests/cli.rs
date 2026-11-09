@@ -775,12 +775,14 @@ fn backup_report_warns_about_secrets_and_changes() {
         changed_during_backup: vec!["evil\u{1b}[31m.jsonl".into()],
         sqlite_snapshots: 2,
         sqlite_fallbacks: vec!["providers/codex/state_5.sqlite: locked\u{7}".into()],
+        redacted_secrets: 3,
     };
     let text = ui::format_backup_report(&report, false);
     assert!(text.contains("--encrypt"));
     assert!(text.contains("1 file changed"));
     assert!(text.contains("SQLite: 2 databases copied"));
     assert!(text.contains("1 database could not be opened"));
+    assert!(text.contains("Redacted: 3 secrets replaced"));
     assert!(!text.contains('\u{1b}'));
 }
 
@@ -1390,4 +1392,82 @@ fn tui_search_screen_selects_and_converts_results() {
     assert_eq!(home.screen, HomeScreen::Search);
     home.handle_key(KeyCode::Esc);
     assert_eq!(home.screen, HomeScreen::Providers);
+}
+
+#[test]
+fn redacted_backups_hide_secrets_and_keep_sessions_valid() {
+    let env = TestEnv::new();
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let secret = "sk-ant-api03-SECRETSECRETSECRETSECRET";
+    env.write_claude_session(
+        id,
+        "/work/keys",
+        &format!("my key is {secret} and Bearer tok_abcdefghijkl"),
+    );
+    let session = env
+        .claude_dir
+        .join("projects")
+        .join(claudepath::encode("/work/keys"))
+        .join(format!("{id}.jsonl"));
+    let original = fs::read(&session).unwrap();
+
+    let archive = env.root.join("redacted.tar.gz");
+    let out = env.run(&[
+        "backup",
+        "--all",
+        "--redact",
+        "-o",
+        archive.to_str().unwrap(),
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(
+        code_of(&out),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["redacted_secrets"], 2);
+    assert_eq!(report["secret_findings"], 0);
+    assert_eq!(
+        fs::read(&session).unwrap(),
+        original,
+        "the source must not change"
+    );
+
+    let verify = env.run(&["verify", archive.to_str().unwrap()]);
+    assert_eq!(code_of(&verify), EXIT_OK);
+    let dest = env.root.join("restored/.claude");
+    let restore = env.run(&[
+        "restore",
+        archive.to_str().unwrap(),
+        "--dest",
+        dest.to_str().unwrap(),
+        "--provider",
+        "claude",
+        "--allow-running",
+        "--yes",
+    ]);
+    assert_eq!(
+        code_of(&restore),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let restored = fs::read_to_string(
+        dest.join("projects")
+            .join(claudepath::encode("/work/keys"))
+            .join(format!("{id}.jsonl")),
+    )
+    .unwrap();
+    assert!(!restored.contains(secret));
+    assert!(!restored.contains("tok_abcdefghijkl"));
+    for line in restored.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(value["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:anthropic]"));
+    }
 }

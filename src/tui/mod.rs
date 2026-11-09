@@ -391,6 +391,7 @@ impl HomeState {
             claude,
             providers,
             passphrase: Passphrase::None,
+            redact: false,
         }
     }
 

@@ -30,6 +30,75 @@ fn detectors() -> &'static Vec<(&'static str, Regex)> {
     })
 }
 
+fn redactors() -> &'static Vec<(&'static str, Regex, usize)> {
+    static REDACTORS: OnceLock<Vec<(&str, Regex, usize)>> = OnceLock::new();
+    REDACTORS.get_or_init(|| {
+        [
+            (
+                "private_key",
+                r"(?s)-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----",
+                0,
+            ),
+            ("anthropic", r"\bsk-ant-[A-Za-z0-9_-]{16,}", 0),
+            ("openai", r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}", 0),
+            ("xai", r"\bxai-[A-Za-z0-9_-]{20,}", 0),
+            ("google", r"\bAIza[A-Za-z0-9_-]{30,}", 0),
+            (
+                "github",
+                r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})",
+                0,
+            ),
+            ("aws", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", 0),
+            (
+                "aws_secret",
+                r#"(?i)\b(?:aws_secret_access_key|secret_access_key|secretAccessKey)["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})"#,
+                1,
+            ),
+            ("slack", r"\b(?:xox[baprs]-|xoxe[.-])[A-Za-z0-9.-]{10,}", 0),
+            ("bearer", r"(?i)\bBearer\s+([A-Za-z0-9._~+/-]{8,}=*)", 1),
+        ]
+        .into_iter()
+        .map(|(name, pattern, group)| (name, Regex::new(pattern).expect("valid redactor"), group))
+        .collect()
+    })
+}
+
+pub fn redact(bytes: &[u8]) -> (Vec<u8>, usize) {
+    let mut current = bytes.to_vec();
+    let mut total = 0;
+    for (name, regex, group) in redactors() {
+        let marker = format!("[REDACTED:{name}]");
+        let mut out = Vec::with_capacity(current.len());
+        let mut last = 0;
+        for captures in regex.captures_iter(&current) {
+            let Some(target) = captures.get(*group) else {
+                continue;
+            };
+            out.extend_from_slice(&current[last..target.start()]);
+            out.extend_from_slice(marker.as_bytes());
+            last = target.end();
+            total += 1;
+        }
+        if last > 0 {
+            out.extend_from_slice(&current[last..]);
+            current = out;
+        }
+    }
+    (current, total)
+}
+
+pub fn redactable(rel: &str, bytes: &[u8]) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    let text_like = [
+        ".jsonl", ".json", ".toml", ".md", ".txt", ".yaml", ".yml", ".log", ".env", ".sh",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext));
+    text_like
+        && !bytes.starts_with(crate::sqlite_snapshot::HEADER)
+        && !bytes[..bytes.len().min(8192)].contains(&0)
+}
+
 pub fn scan(provider: &str, rel: &str, bytes: &[u8]) -> Vec<SecretFinding> {
     scan_reader(provider, rel, bytes).expect("byte slice reads cannot fail")
 }
@@ -174,5 +243,52 @@ mod tests {
             .iter()
             .any(|f| f.detector == "aws_secret" && f.count == 1));
         assert!(scan("fixture", "config", b"prefixxoxe-abcdefghijklmnop prefixAWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::*;
+
+    #[test]
+    fn secrets_are_replaced_and_json_stays_valid() {
+        let line = serde_json::json!({
+            "message": "use sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA and ghp_BBBBBBBBBBBBBBBBBBBBBBBB",
+            "auth": "Authorization: Bearer abcdefghijklmnop",
+            "env": "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEYAB",
+            "key": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\ndef\n-----END OPENSSH PRIVATE KEY-----",
+            "safe": "sk-ant is just a prefix"
+        })
+        .to_string();
+        let (redacted, count) = redact(line.as_bytes());
+        let text = String::from_utf8(redacted).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(count, 5, "{text}");
+        assert!(!text.contains("AAAAAAAA") && !text.contains("BBBBBBBB"));
+        assert!(!text.contains("abcdefghijklmnop"));
+        assert!(!text.contains("wJalrXUtnFEMI"));
+        assert!(!text.contains("abc\\ndef"));
+        assert!(value["auth"]
+            .as_str()
+            .unwrap()
+            .contains("Bearer [REDACTED:bearer]"));
+        assert!(value["env"]
+            .as_str()
+            .unwrap()
+            .starts_with("aws_secret_access_key = [REDACTED:aws_secret]"));
+        assert_eq!(value["safe"], "sk-ant is just a prefix");
+        assert!(scan("x", "y", text.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn only_text_files_are_redacted() {
+        assert!(redactable("projects/a/s.jsonl", b"{}"));
+        assert!(redactable("config.TOML", b"a=1"));
+        assert!(!redactable("state.sqlite", b"x"));
+        assert!(!redactable("notes.json", b"SQLite format 3\0rest"));
+        assert!(!redactable("image.json", b"{\0}"));
+        assert!(!redactable("blob.bin", b"text"));
+        let (same, count) = redact(b"nothing here");
+        assert_eq!((same.as_slice(), count), (&b"nothing here"[..], 0));
     }
 }

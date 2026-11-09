@@ -39,6 +39,7 @@ pub struct BackupRequest {
     pub claude: Option<ClaudeSelection>,
     pub providers: Vec<ProviderSelection>,
     pub passphrase: Passphrase,
+    pub redact: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,12 +56,15 @@ pub struct BackupReport {
     pub sqlite_snapshots: usize,
     #[serde(default)]
     pub sqlite_fallbacks: Vec<String>,
+    #[serde(default)]
+    pub redacted_secrets: usize,
 }
 
 struct SnapshotSummary {
     changed: Vec<String>,
     sqlite: usize,
     sqlite_fallbacks: Vec<String>,
+    redacted: usize,
 }
 
 #[derive(Clone)]
@@ -334,6 +338,7 @@ pub struct PreparedBackup {
     pub changed_during_backup: Vec<String>,
     pub sqlite_snapshots: usize,
     pub sqlite_fallbacks: Vec<String>,
+    pub redacted_secrets: usize,
     _snapshots: tempfile::TempDir,
     _staging: tempfile::TempDir,
 }
@@ -364,7 +369,7 @@ fn prepare_backup_after_scan(
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
     let snapshots = builder.tempdir_in(workdir)?;
-    let summary = snapshot_inputs(&mut input, snapshots.path())?;
+    let summary = snapshot_inputs(&mut input, snapshots.path(), request.redact)?;
     let mut secret_findings = 0;
     let mut bytes = 0;
     for (name, path) in &input.files {
@@ -383,6 +388,7 @@ fn prepare_backup_after_scan(
         changed_during_backup: summary.changed,
         sqlite_snapshots: summary.sqlite,
         sqlite_fallbacks: summary.sqlite_fallbacks,
+        redacted_secrets: summary.redacted,
         _snapshots: snapshots,
         _staging: input._staging,
     })
@@ -421,14 +427,29 @@ fn run_backup_after_scan(
         changed_during_backup: prepared.changed_during_backup,
         sqlite_snapshots: prepared.sqlite_snapshots,
         sqlite_fallbacks: prepared.sqlite_fallbacks,
+        redacted_secrets: prepared.redacted_secrets,
     })
+}
+
+fn redact_snapshot(root: &std::path::Path, rel: &str) -> Result<usize> {
+    let path = crate::safety::safe_join(root, rel)?;
+    let bytes = std::fs::read(&path)?;
+    if !crate::secrets::redactable(rel, &bytes) {
+        return Ok(0);
+    }
+    let (redacted, count) = crate::secrets::redact(&bytes);
+    if count > 0 {
+        crate::safety::atomic_write(root, rel, &redacted, crate::safety::WriteMode::Replace)?;
+    }
+    Ok(count)
 }
 
 fn snapshot_file(
     source: &std::path::Path,
     root: &std::path::Path,
     rel: &str,
-) -> Result<Option<(String, u64, bool)>> {
+    redact: bool,
+) -> Result<Option<(String, u64, bool, usize)>> {
     use std::io::Read;
     for attempt in 0..2 {
         let before = match std::fs::symlink_metadata(source) {
@@ -463,13 +484,23 @@ fn snapshot_file(
         if changed && attempt == 0 {
             continue;
         }
+        let redacted = if redact {
+            redact_snapshot(root, rel)?
+        } else {
+            0
+        };
         let (digest, size) = crate::backup::hash_file(&crate::safety::safe_join(root, rel)?)?;
-        return Ok(Some((digest, size, changed)));
+        return Ok(Some((digest, size, changed, redacted)));
     }
     unreachable!()
 }
 
-fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<SnapshotSummary> {
+fn snapshot_inputs(
+    input: &mut BackupInputs,
+    root: &std::path::Path,
+    redact: bool,
+) -> Result<SnapshotSummary> {
+    let mut redacted = 0;
     use std::collections::BTreeSet;
     let mut changed = BTreeSet::new();
     let mut digests = BTreeMap::new();
@@ -500,8 +531,9 @@ fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<S
         if digests.contains_key(rel) {
             bail!("duplicate snapshot entry: {rel}")
         }
-        match snapshot_file(source, root, rel)? {
-            Some((digest, size, unstable)) => {
+        match snapshot_file(source, root, rel, redact)? {
+            Some((digest, size, unstable, secrets)) => {
+                redacted += secrets;
                 digests.insert(rel.clone(), (digest, size));
                 if unstable {
                     changed.insert(rel.clone());
@@ -607,6 +639,7 @@ fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<S
         changed: changed.into_iter().collect(),
         sqlite: consistent.len(),
         sqlite_fallbacks,
+        redacted,
     })
 }
 
@@ -1487,6 +1520,7 @@ mod tests {
             }),
             providers: Vec::new(),
             passphrase: Passphrase::None,
+            redact: false,
         }
     }
     fn restore_request(root: &Path) -> RestoreRequest {

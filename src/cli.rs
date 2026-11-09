@@ -136,6 +136,11 @@ pub enum Commands {
             help = "Write an incremental snapshot to a repository (directory or s3://bucket/prefix)"
         )]
         repo: Option<String>,
+        #[arg(
+            long,
+            help = "Replace detected secrets with [REDACTED:kind] in the backup copy; the original files are not changed"
+        )]
+        redact: bool,
         #[arg(long, help = "Print the backup plan and exit without writing")]
         dry_run: bool,
         #[arg(long, help = "Output JSON to stdout")]
@@ -411,6 +416,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             output,
             overwrite,
             repo,
+            redact,
             dry_run,
             json,
             yes,
@@ -425,6 +431,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             output,
             overwrite,
             repo,
+            redact,
             dry_run,
             json,
             yes,
@@ -552,6 +559,7 @@ struct BackupArgs {
     output: Option<String>,
     overwrite: bool,
     repo: Option<String>,
+    redact: bool,
     dry_run: bool,
     json: bool,
     yes: bool,
@@ -1194,6 +1202,7 @@ fn build_selection_request(
         claude,
         providers,
         passphrase,
+        redact: false,
     })
 }
 
@@ -1322,6 +1331,7 @@ struct RepoBackupReport {
     changed_during_backup: Vec<String>,
     sqlite_snapshots: usize,
     sqlite_fallbacks: Vec<String>,
+    redacted_secrets: usize,
 }
 
 fn cmd_backup_repo(request: &engine::BackupRequest, location: &str, json: bool) -> Result<()> {
@@ -1347,9 +1357,16 @@ fn cmd_backup_repo(request: &engine::BackupRequest, location: &str, json: bool) 
         changed_during_backup: prepared.changed_during_backup,
         sqlite_snapshots: prepared.sqlite_snapshots,
         sqlite_fallbacks: prepared.sqlite_fallbacks,
+        redacted_secrets: prepared.redacted_secrets,
     };
     if json {
         return ui::print_json(&report);
+    }
+    if report.redacted_secrets > 0 {
+        println!(
+            "  Redacted: {} replaced in the snapshot",
+            ui::plural(report.redacted_secrets, "secret")
+        );
     }
     let s = &report.snapshot;
     println!(
@@ -1390,7 +1407,7 @@ fn cmd_backup_repo(request: &engine::BackupRequest, location: &str, json: bool) 
 
 fn cmd_backup(args: BackupArgs) -> Result<()> {
     if let Some(location) = args.repo.clone() {
-        let request = build_selection_request(
+        let mut request = build_selection_request(
             SelectionSpec {
                 provider: args.provider,
                 match_path: args.match_path,
@@ -1403,6 +1420,7 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
             false,
             Passphrase::None,
         )?;
+        request.redact = args.redact;
         let plan = engine::plan_backup(&request)?;
         if args.dry_run {
             if args.json {
@@ -1431,7 +1449,7 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
     let output = expand_path(&output_str);
     let passphrase = resolve_encrypt_passphrase(args.encrypt)?;
 
-    let request = build_selection_request(
+    let mut request = build_selection_request(
         SelectionSpec {
             provider: args.provider,
             match_path: args.match_path,
@@ -1444,6 +1462,7 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
         args.overwrite,
         passphrase,
     )?;
+    request.redact = args.redact;
 
     let plan = engine::plan_backup(&request)?;
     if args.dry_run {
