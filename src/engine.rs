@@ -39,6 +39,7 @@ pub struct BackupRequest {
     pub claude: Option<ClaudeSelection>,
     pub providers: Vec<ProviderSelection>,
     pub passphrase: Passphrase,
+    pub redact: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,12 +56,15 @@ pub struct BackupReport {
     pub sqlite_snapshots: usize,
     #[serde(default)]
     pub sqlite_fallbacks: Vec<String>,
+    #[serde(default)]
+    pub redacted_secrets: usize,
 }
 
 struct SnapshotSummary {
     changed: Vec<String>,
     sqlite: usize,
     sqlite_fallbacks: Vec<String>,
+    redacted: usize,
 }
 
 #[derive(Clone)]
@@ -326,21 +330,37 @@ pub fn run_backup(request: &BackupRequest) -> Result<BackupReport> {
     run_backup_after_scan(request, |_| Ok(()))
 }
 
-fn run_backup_after_scan(
+pub struct PreparedBackup {
+    pub manifest: crate::model::Manifest,
+    pub files: Vec<(String, PathBuf)>,
+    pub bytes: u64,
+    pub secret_findings: usize,
+    pub changed_during_backup: Vec<String>,
+    pub sqlite_snapshots: usize,
+    pub sqlite_fallbacks: Vec<String>,
+    pub redacted_secrets: usize,
+    _snapshots: tempfile::TempDir,
+    _staging: tempfile::TempDir,
+}
+
+pub fn prepare_backup(
     request: &BackupRequest,
+    workdir: &std::path::Path,
+) -> Result<PreparedBackup> {
+    prepare_backup_after_scan(request, workdir, |_| Ok(()))
+}
+
+fn prepare_backup_after_scan(
+    request: &BackupRequest,
+    workdir: &std::path::Path,
     after_scan: impl FnOnce(&BackupInputs) -> Result<()>,
-) -> Result<BackupReport> {
+) -> Result<PreparedBackup> {
     let mut input = collect_inputs(request, false, true)?;
     let plan = backup_plan(request, &input)?;
     if plan.has_refusals() {
         bail!("backup plan contains refusals")
     }
     after_scan(&input)?;
-    let parent = request
-        .output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
     let mut builder = tempfile::Builder::new();
     builder.prefix(".aisession-backup-snapshot-");
     #[cfg(unix)]
@@ -348,43 +368,88 @@ fn run_backup_after_scan(
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    let snapshots = builder.tempdir_in(parent)?;
-    let summary = snapshot_inputs(&mut input, snapshots.path())?;
-    let mut findings = 0;
+    let snapshots = builder.tempdir_in(workdir)?;
+    let summary = snapshot_inputs(&mut input, snapshots.path(), request.redact)?;
+    let mut secret_findings = 0;
     let mut bytes = 0;
     for (name, path) in &input.files {
         bytes += std::fs::metadata(path)?.len();
-        findings += crate::secrets::scan_reader("archive", name, std::fs::File::open(path)?)?
-            .iter()
-            .map(|f| f.count)
-            .sum::<usize>();
+        secret_findings +=
+            crate::secrets::scan_reader("archive", name, std::fs::File::open(path)?)?
+                .iter()
+                .map(|f| f.count)
+                .sum::<usize>();
     }
+    Ok(PreparedBackup {
+        manifest: input.manifest,
+        files: input.files,
+        bytes,
+        secret_findings,
+        changed_during_backup: summary.changed,
+        sqlite_snapshots: summary.sqlite,
+        sqlite_fallbacks: summary.sqlite_fallbacks,
+        redacted_secrets: summary.redacted,
+        _snapshots: snapshots,
+        _staging: input._staging,
+    })
+}
+
+fn run_backup_after_scan(
+    request: &BackupRequest,
+    after_scan: impl FnOnce(&BackupInputs) -> Result<()>,
+) -> Result<BackupReport> {
+    let parent = request
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let prepared = prepare_backup_after_scan(request, parent, after_scan)?;
     crate::archive::write(
         &request.output,
         request.overwrite,
-        &input.manifest,
-        &input.files,
+        &prepared.manifest,
+        &prepared.files,
         &request.passphrase,
     )?;
     Ok(BackupReport {
         output: request.output.clone(),
         encrypted: matches!(request.passphrase, Passphrase::Value(_)),
-        sessions: input.manifest.sessions.len(),
-        provider_items: input.manifest.providers.iter().map(|p| p.items.len()).sum(),
-        files: input.files.len(),
-        bytes,
-        secret_findings: findings,
-        changed_during_backup: summary.changed,
-        sqlite_snapshots: summary.sqlite,
-        sqlite_fallbacks: summary.sqlite_fallbacks,
+        sessions: prepared.manifest.sessions.len(),
+        provider_items: prepared
+            .manifest
+            .providers
+            .iter()
+            .map(|p| p.items.len())
+            .sum(),
+        files: prepared.files.len(),
+        bytes: prepared.bytes,
+        secret_findings: prepared.secret_findings,
+        changed_during_backup: prepared.changed_during_backup,
+        sqlite_snapshots: prepared.sqlite_snapshots,
+        sqlite_fallbacks: prepared.sqlite_fallbacks,
+        redacted_secrets: prepared.redacted_secrets,
     })
+}
+
+fn redact_snapshot(root: &std::path::Path, rel: &str) -> Result<usize> {
+    let path = crate::safety::safe_join(root, rel)?;
+    let bytes = std::fs::read(&path)?;
+    if !crate::secrets::redactable(rel, &bytes) {
+        return Ok(0);
+    }
+    let (redacted, count) = crate::secrets::redact(&bytes);
+    if count > 0 {
+        crate::safety::atomic_write(root, rel, &redacted, crate::safety::WriteMode::Replace)?;
+    }
+    Ok(count)
 }
 
 fn snapshot_file(
     source: &std::path::Path,
     root: &std::path::Path,
     rel: &str,
-) -> Result<Option<(String, u64, bool)>> {
+    redact: bool,
+) -> Result<Option<(String, u64, bool, usize)>> {
     use std::io::Read;
     for attempt in 0..2 {
         let before = match std::fs::symlink_metadata(source) {
@@ -419,13 +484,23 @@ fn snapshot_file(
         if changed && attempt == 0 {
             continue;
         }
+        let redacted = if redact {
+            redact_snapshot(root, rel)?
+        } else {
+            0
+        };
         let (digest, size) = crate::backup::hash_file(&crate::safety::safe_join(root, rel)?)?;
-        return Ok(Some((digest, size, changed)));
+        return Ok(Some((digest, size, changed, redacted)));
     }
     unreachable!()
 }
 
-fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<SnapshotSummary> {
+fn snapshot_inputs(
+    input: &mut BackupInputs,
+    root: &std::path::Path,
+    redact: bool,
+) -> Result<SnapshotSummary> {
+    let mut redacted = 0;
     use std::collections::BTreeSet;
     let mut changed = BTreeSet::new();
     let mut digests = BTreeMap::new();
@@ -456,8 +531,9 @@ fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<S
         if digests.contains_key(rel) {
             bail!("duplicate snapshot entry: {rel}")
         }
-        match snapshot_file(source, root, rel)? {
-            Some((digest, size, unstable)) => {
+        match snapshot_file(source, root, rel, redact)? {
+            Some((digest, size, unstable, secrets)) => {
+                redacted += secrets;
                 digests.insert(rel.clone(), (digest, size));
                 if unstable {
                     changed.insert(rel.clone());
@@ -563,6 +639,7 @@ fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<S
         changed: changed.into_iter().collect(),
         sqlite: consistent.len(),
         sqlite_fallbacks,
+        redacted,
     })
 }
 
@@ -968,8 +1045,15 @@ pub(crate) fn checked_dest(base: &std::path::Path, rel: &str) -> Result<PathBuf>
 }
 
 pub fn prepare_restore(request: RestoreRequest) -> Result<PreparedRestore> {
-    use crate::provider::FileClass;
     let staged = crate::archive::stage(&request.archive, &request.passphrase)?;
+    prepare_restore_from(request, staged)
+}
+
+pub fn prepare_restore_from(
+    request: RestoreRequest,
+    staged: crate::archive::StagedArchive,
+) -> Result<PreparedRestore> {
+    use crate::provider::FileClass;
     let mut planner = Planner {
         request: &request,
         staging: staged.staging.path(),
@@ -1436,6 +1520,7 @@ mod tests {
             }),
             providers: Vec::new(),
             passphrase: Passphrase::None,
+            redact: false,
         }
     }
     fn restore_request(root: &Path) -> RestoreRequest {

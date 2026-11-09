@@ -775,12 +775,14 @@ fn backup_report_warns_about_secrets_and_changes() {
         changed_during_backup: vec!["evil\u{1b}[31m.jsonl".into()],
         sqlite_snapshots: 2,
         sqlite_fallbacks: vec!["providers/codex/state_5.sqlite: locked\u{7}".into()],
+        redacted_secrets: 3,
     };
     let text = ui::format_backup_report(&report, false);
     assert!(text.contains("--encrypt"));
     assert!(text.contains("1 file changed"));
     assert!(text.contains("SQLite: 2 databases copied"));
     assert!(text.contains("1 database could not be opened"));
+    assert!(text.contains("Redacted: 3 secrets replaced"));
     assert!(!text.contains('\u{1b}'));
 }
 
@@ -1162,4 +1164,343 @@ fn live_sqlite_databases_are_backed_up_consistently() {
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();
     assert_eq!(check, "ok");
+}
+
+#[test]
+fn incremental_repository_backup_restore_and_prune() {
+    let env = TestEnv::new();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let cwd = "/work/repo-demo";
+    env.write_claude_session(id, cwd, "first message");
+    let session = env
+        .claude_dir
+        .join("projects")
+        .join(claudepath::encode(cwd))
+        .join(format!("{id}.jsonl"));
+    let mut big = fs::read_to_string(&session).unwrap();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let noise: String = (0..5_000_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'a' + (state % 26) as u8)
+        })
+        .collect();
+    let filler = serde_json::json!({"type":"user","cwd":cwd,"sessionId":id,"message":{"role":"user","content":noise}});
+    big.push_str(&format!("{filler}\n"));
+    fs::write(&session, &big).unwrap();
+
+    let repo = env.root.join("repo");
+    let repo_arg = repo.to_str().unwrap();
+    let with_pass = |args: &[&str], pass: &str| {
+        env.cmd()
+            .args(args)
+            .env("AISESSION_BACKUP_PASSPHRASE", pass)
+            .output()
+            .unwrap()
+    };
+    let init = with_pass(&["repo", "init", repo_arg, "--encrypt"], "correct horse");
+    assert_eq!(
+        code_of(&init),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let first = with_pass(
+        &["backup", "--all", "--repo", repo_arg, "--yes", "--json"],
+        "correct horse",
+    );
+    assert_eq!(
+        code_of(&first),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(first["new_chunks"].as_u64().unwrap() >= 1);
+
+    let extra = serde_json::json!({"type":"assistant","cwd":cwd,"sessionId":id,"message":{"role":"assistant","model":"m","content":[{"type":"text","text":"appended answer"}]}});
+    fs::write(&session, format!("{big}{extra}\n")).unwrap();
+    let second = with_pass(
+        &["backup", "--all", "--repo", repo_arg, "--yes", "--json"],
+        "correct horse",
+    );
+    assert_eq!(code_of(&second), EXIT_OK);
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(second["reused_chunks"].as_u64().unwrap() >= 1, "{second}");
+    assert!(
+        second["new_bytes"].as_u64().unwrap() < first["new_bytes"].as_u64().unwrap(),
+        "{first} {second}"
+    );
+
+    let wrong = with_pass(&["repo", "snapshots", repo_arg], "wrong");
+    assert_ne!(code_of(&wrong), EXIT_OK);
+    let listed = with_pass(&["repo", "snapshots", repo_arg, "--json"], "correct horse");
+    let snapshots: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(snapshots.as_array().unwrap().len(), 2);
+    let check = with_pass(&["repo", "check", repo_arg, "--read-data"], "correct horse");
+    let host = snapshots[0]["host"].as_str().unwrap().to_string();
+    let by_host = with_pass(
+        &["repo", "snapshots", repo_arg, "--host", &host, "--json"],
+        "correct horse",
+    );
+    let by_host: serde_json::Value = serde_json::from_slice(&by_host.stdout).unwrap();
+    assert_eq!(by_host.as_array().unwrap().len(), 2);
+    let none = with_pass(
+        &[
+            "repo",
+            "snapshots",
+            repo_arg,
+            "--host",
+            "no-such-host",
+            "--json",
+        ],
+        "correct horse",
+    );
+    let none: serde_json::Value = serde_json::from_slice(&none.stdout).unwrap();
+    assert!(none.as_array().unwrap().is_empty());
+    let missing_host = with_pass(
+        &[
+            "restore",
+            "--repo",
+            repo_arg,
+            "--host",
+            "no-such-host",
+            "--dry-run",
+        ],
+        "correct horse",
+    );
+    assert_ne!(code_of(&missing_host), EXIT_OK);
+    assert!(String::from_utf8_lossy(&missing_host.stderr).contains("no snapshot from host"));
+    assert_eq!(
+        code_of(&check),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+
+    let dest = env.root.join("restored/.claude");
+    let restore = with_pass(
+        &[
+            "restore",
+            "--repo",
+            repo_arg,
+            "--dest",
+            dest.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "-m",
+            "/work:/srv",
+            "--allow-running",
+            "--yes",
+            "--json",
+        ],
+        "correct horse",
+    );
+    assert_eq!(
+        code_of(&restore),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let restored = fs::read_to_string(
+        dest.join("projects")
+            .join(claudepath::encode("/srv/repo-demo"))
+            .join(format!("{id}.jsonl")),
+    )
+    .unwrap();
+    assert!(restored.contains("appended answer"));
+    assert!(restored.contains("\"cwd\":\"/srv/repo-demo\""));
+
+    let prune = with_pass(
+        &[
+            "repo",
+            "prune",
+            repo_arg,
+            "--keep-last",
+            "1",
+            "--yes",
+            "--json",
+        ],
+        "correct horse",
+    );
+    assert_eq!(
+        code_of(&prune),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let prune: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(prune["snapshots_removed"].as_array().unwrap().len(), 1);
+    let check = with_pass(&["repo", "check", repo_arg, "--read-data"], "correct horse");
+    assert_eq!(code_of(&check), EXIT_OK);
+
+    let both = env.run(&["restore", "a.tar.gz", "--repo", repo_arg]);
+    assert_eq!(code_of(&both), EXIT_USAGE);
+    let conflict = env.run(&["backup", "--repo", repo_arg, "-o", "x.tar.gz"]);
+    assert_eq!(code_of(&conflict), EXIT_USAGE);
+}
+
+#[test]
+fn tui_search_screen_selects_and_converts_results() {
+    let env = TestEnv::new();
+    env.write_claude_session(
+        "99999999-9999-4999-8999-999999999999",
+        "/work/find",
+        "needle in a haystack",
+    );
+    let session = env
+        .claude_dir
+        .join("projects")
+        .join(claudepath::encode("/work/find"))
+        .join("99999999-9999-4999-8999-999999999999.jsonl");
+    let item = Item {
+        id: "99999999-9999-4999-8999-999999999999".into(),
+        kind: ItemKind::Session,
+        label: "needle in a haystack".into(),
+        cwd: Some("/work/find".into()),
+        updated_at: None,
+        files: vec![ItemFile {
+            rel: "projects/-work-find/99999999-9999-4999-8999-999999999999.jsonl".into(),
+            size: 10,
+            class: FileClass::Plain,
+        }],
+    };
+    let mut home = HomeState::new(vec![
+        ProviderEntry {
+            id: ProviderId::Claude,
+            display_name: "Claude Code".into(),
+            home: Some(env.claude_dir.clone()),
+            items: vec![item],
+            selected: vec![false],
+            scan_error: None,
+        },
+        ProviderEntry {
+            id: ProviderId::Codex,
+            display_name: "Codex CLI".into(),
+            home: Some(env.codex_dir.clone()),
+            items: Vec::new(),
+            selected: Vec::new(),
+            scan_error: None,
+        },
+    ]);
+    home.handle_key(KeyCode::Char('s'));
+    assert_eq!(home.screen, HomeScreen::Search);
+    for c in "needle".chars() {
+        home.handle_key(KeyCode::Char(c));
+    }
+    home.handle_key(KeyCode::Char('?'));
+    assert!(!home.show_help, "typing ? goes into the query");
+    home.handle_key(KeyCode::Backspace);
+    home.handle_key(KeyCode::Enter);
+    assert_eq!(home.pending_search.as_deref(), Some("needle"));
+    let query = home.pending_search.take().unwrap();
+    let hits = aisession_backup::search::search(
+        &query,
+        &aisession_backup::provider::LocateEnv {
+            user_home: Some(env.home.clone()),
+            overrides: std::collections::BTreeMap::from([(
+                ProviderId::Claude,
+                env.claude_dir.clone(),
+            )]),
+        },
+        &aisession_backup::search::SEARCHABLE,
+        10,
+    )
+    .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].path, session);
+    home.set_search_results(hits);
+    home.handle_key(KeyCode::Char(' '));
+    assert_eq!(home.total_selected_items(), 1);
+    home.handle_key(KeyCode::Char('t'));
+    assert_eq!(home.screen, HomeScreen::ConvertPlan);
+    assert_eq!(
+        home.conversion.as_ref().unwrap().request.to,
+        ProviderId::Codex
+    );
+    home.handle_key(KeyCode::Esc);
+    assert_eq!(home.screen, HomeScreen::Search);
+    home.handle_key(KeyCode::Esc);
+    assert_eq!(home.screen, HomeScreen::Providers);
+}
+
+#[test]
+fn redacted_backups_hide_secrets_and_keep_sessions_valid() {
+    let env = TestEnv::new();
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let secret = "sk-ant-api03-SECRETSECRETSECRETSECRET";
+    env.write_claude_session(
+        id,
+        "/work/keys",
+        &format!("my key is {secret} and Bearer tok_abcdefghijkl"),
+    );
+    let session = env
+        .claude_dir
+        .join("projects")
+        .join(claudepath::encode("/work/keys"))
+        .join(format!("{id}.jsonl"));
+    let original = fs::read(&session).unwrap();
+
+    let archive = env.root.join("redacted.tar.gz");
+    let out = env.run(&[
+        "backup",
+        "--all",
+        "--redact",
+        "-o",
+        archive.to_str().unwrap(),
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(
+        code_of(&out),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["redacted_secrets"], 2);
+    assert_eq!(report["secret_findings"], 0);
+    assert_eq!(
+        fs::read(&session).unwrap(),
+        original,
+        "the source must not change"
+    );
+
+    let verify = env.run(&["verify", archive.to_str().unwrap()]);
+    assert_eq!(code_of(&verify), EXIT_OK);
+    let dest = env.root.join("restored/.claude");
+    let restore = env.run(&[
+        "restore",
+        archive.to_str().unwrap(),
+        "--dest",
+        dest.to_str().unwrap(),
+        "--provider",
+        "claude",
+        "--allow-running",
+        "--yes",
+    ]);
+    assert_eq!(
+        code_of(&restore),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let restored = fs::read_to_string(
+        dest.join("projects")
+            .join(claudepath::encode("/work/keys"))
+            .join(format!("{id}.jsonl")),
+    )
+    .unwrap();
+    assert!(!restored.contains(secret));
+    assert!(!restored.contains("tok_abcdefghijkl"));
+    for line in restored.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(value["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:anthropic]"));
+    }
 }

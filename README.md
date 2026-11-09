@@ -123,6 +123,78 @@ Sem terminal, mostra a ajuda.
 
 ---
 
+## Backup incremental em repositório
+
+Além do arquivo `.tar.gz`, o backup pode ir para um **repositório incremental**, numa
+pasta local ou num bucket S3, como Cloudflare R2, AWS S3 ou RustFS. Cada backup vira um
+snapshot, e os arquivos são divididos em blocos pelo conteúdo: uma sessão que só
+cresceu reaproveita os blocos antigos e grava apenas o trecho novo.
+
+```bash
+aisession-backup repo init ~/backups/ai --encrypt
+aisession-backup backup --provider all --all --repo ~/backups/ai
+aisession-backup repo snapshots ~/backups/ai
+aisession-backup restore --repo ~/backups/ai --snapshot latest -m '/home/ana:/Users/ana' --dry-run
+aisession-backup repo check ~/backups/ai --read-data
+aisession-backup repo prune ~/backups/ai --keep-last 14
+```
+
+- **Restore igual ao do arquivo.** `restore --repo` passa pelo mesmo plano, mapeamento,
+  confirmação e rollback. `--snapshot` aceita um id de `repo snapshots` ou `latest`.
+- **Várias máquinas no mesmo repositório.** Cada snapshot registra a máquina de origem.
+  `repo snapshots --host NOME` filtra por ela, e `restore --repo --host NOME` restaura o
+  snapshot mais recente daquela máquina.
+- **Criptografia.** Com `--encrypt`, uma chave age protegida pela senha cifra os blocos e
+  os snapshots, e os ids dos blocos não revelam o conteúdo. A senha vem do prompt ou de
+  `AISESSION_BACKUP_PASSPHRASE`.
+- **Snapshots autenticados.** Em repositórios criptografados, cada snapshot leva um
+  HMAC-SHA256 com uma chave derivada da chave secreta. Quem tem acesso de escrita ao
+  bucket, mas não tem a senha, não consegue forjar nem alterar um snapshot, e os blocos
+  também são conferidos contra ids que dependem da chave secreta. Repositórios sem
+  criptografia só detectam corrupção, como os arquivos `.tar.gz`.
+- **Integridade.** Cada bloco e cada arquivo são conferidos por SHA-256 no restore.
+  `repo check` acha blocos ausentes ou corrompidos, e `--read-data` lê todos.
+- **Retenção.** `repo prune --keep-last N` mantém os N snapshots mais novos e apaga os
+  blocos que nenhum deles usa. `--dry-run` mostra o que sairia.
+- **Escrita exclusiva.** Um lock `writer.lock` impede que um backup e um `prune` rodem
+  juntos. Se um processo cair no meio, o lock fica para trás de propósito. Confira que
+  nenhum backup está rodando e apague `writer.lock` na raiz do repositório.
+
+### Repositório em S3, R2 ou RustFS
+
+Use `s3://bucket/prefixo` como local. As credenciais vêm de `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` e, se houver, `AWS_SESSION_TOKEN`.
+
+```bash
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+export AISESSION_BACKUP_S3_ENDPOINT=https://<conta>.r2.cloudflarestorage.com
+export AISESSION_BACKUP_S3_REGION=auto
+aisession-backup repo init s3://meus-backups/ai --encrypt
+aisession-backup backup --provider all --all --repo s3://meus-backups/ai
+```
+
+Sem `AISESSION_BACKUP_S3_ENDPOINT`, o destino é a AWS na região configurada. O endpoint
+precisa usar HTTPS, exceto em `localhost`. Para criar os locks, o servidor precisa
+aceitar escrita condicional (`If-None-Match: *`), como fazem AWS S3, R2 e RustFS.
+
+---
+
+## Buscando nas sessões
+
+`search` procura no conteúdo das conversas do Claude Code e do Codex. Todas as palavras
+precisam aparecer na sessão, em qualquer ordem e sem diferenciar maiúsculas:
+
+```bash
+aisession-backup search redis timeout
+aisession-backup search "cargo test" --provider codex --limit 5
+```
+
+O resultado traz provedor, data, diretório, número de ocorrências e um trecho da
+conversa. O contexto injetado pelas ferramentas fica de fora. Nada é indexado nem
+copiado: as sessões são lidas na hora, em paralelo.
+
+---
+
 ## Convertendo sessões entre Claude Code e Codex
 
 `convert` leva uma conversa de uma ferramenta para a outra. Por exemplo, para
@@ -345,6 +417,8 @@ verifica que o histórico é exibido, não que o modelo responde.
 | `rollback <id>` | Desfaz um restore ou uma conversão |
 | `convert <sessão> --to <ferramenta>` | Converte uma sessão entre Claude Code e Codex |
 | `completions <shell>` | Gera autocomplete para bash, zsh, fish, elvish ou powershell |
+| `search <palavras>` | Procura no conteúdo das sessões do Claude Code e do Codex |
+| `repo init \| snapshots \| check \| prune` | Gerencia um repositório de backup incremental |
 | `version` | Mostra a versão |
 
 `doctor`, `scan`, `audit`, `backup`, `verify`, `list`, `restore`, `history` e
@@ -365,6 +439,8 @@ Sem `--provider`, o backup considera só o Claude Code.
 | `--include-state` | Inclui bancos de estado e histórico dos provedores |
 | `--include-credentials` | Inclui credenciais de login. Exige `--encrypt` |
 | `--encrypt` | Criptografa com senha usando age |
+| `--redact` | Troca segredos detectados por `[REDACTED:tipo]` na cópia do backup |
+| `--repo <LOCAL>` | Grava um snapshot incremental num repositório, em vez de um arquivo |
 | `-o, --output` | Arquivo de saída |
 | `--overwrite` | Permite substituir um arquivo de saída existente |
 | `--dry-run` | Mostra o plano e sai sem escrever |
@@ -507,6 +583,10 @@ O fluxo prioriza não perder dados e não executar nada inesperado:
 - **Saída limpa.** Sequências de controle vindas de manifestos são removidas
   antes da exibição.
 - **Senha fora do argv.** Use o prompt ou `AISESSION_BACKUP_PASSPHRASE`.
+- **Redaction opcional.** `backup --redact` troca chaves de API, tokens Bearer, chaves
+  da AWS e blocos de chave privada por `[REDACTED:tipo]` na cópia que vai para o
+  backup. Só arquivos de texto são alterados, o JSON continua válido e os arquivos
+  originais não mudam. O relatório informa quantos segredos foram trocados.
 
 O que essas proteções não garantem:
 
@@ -542,6 +622,9 @@ O que essas proteções não garantem:
 | `AISESSION_BACKUP_MAX_ARCHIVE_BYTES` | Limite do tamanho total extraído |
 | `NO_COLOR` | Desativa cores |
 | `AISESSION_BACKUP_ICONS` | Conjunto de ícones da interface: `unicode`, `nerd` ou `ascii` |
+| `AISESSION_BACKUP_S3_ENDPOINT` | Endpoint S3 para R2, RustFS ou outro serviço compatível |
+| `AISESSION_BACKUP_S3_REGION` | Região S3. O padrão é `us-east-1` |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Credenciais do repositório em S3 |
 
 ---
 
@@ -616,6 +699,11 @@ existe no Linux, a única plataforma com essa detecção.
 | `plan` | Ações, riscos e resumo do plano |
 | `provider` | Adaptadores de cada ferramenta |
 | `remap` | Mapeamento de paths e reescrita de JSONL |
+| `repo` | Repositório incremental: blocos por conteúdo, snapshots, criptografia, prune e check |
+| `remote` | Backend S3 do repositório |
+| `sqlite_snapshot` | Cópia consistente de bancos SQLite |
+| `convert` | Conversão de sessões entre Claude Code e Codex |
+| `search` | Busca no conteúdo das sessões |
 | `discover`, `backup`, `config`, `claudepath`, `model` | Domínio do Claude Code e manifesto |
 | `cli`, `ui`, `tui` | Linha de comando, formatação e interface interativa |
 

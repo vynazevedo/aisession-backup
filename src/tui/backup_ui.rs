@@ -158,6 +158,7 @@ impl BackupApp {
                     }),
                     providers: Vec::new(),
                     passphrase: Passphrase::None,
+                    redact: false,
                 };
                 self.plan = Some(match engine::plan_backup(&req) {
                     Ok(plan) => plan,
@@ -296,6 +297,7 @@ pub fn run_backup(claude_dir: &Path, output: &Path, opts: backup::BackupOptions)
         }),
         providers: Vec::new(),
         passphrase: Passphrase::None,
+        redact: false,
     };
     let report = engine::run_backup(&req)?;
     print!(

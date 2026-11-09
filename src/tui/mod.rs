@@ -149,6 +149,7 @@ pub enum HomeScreen {
     ConfirmBackup,
     RestoreInput,
     ConvertPlan,
+    Search,
     Done,
 }
 
@@ -176,6 +177,13 @@ pub struct HomeState {
     pub status: Option<(String, bool)>,
     pub conversion: Option<Conversion>,
     plan_return: HomeScreen,
+    convert_return: HomeScreen,
+    pub search_input: String,
+    pub search_editing: bool,
+    pub search_results: Vec<crate::search::SearchHit>,
+    pub search_state: ratatui::widgets::ListState,
+    pub search_ran: bool,
+    pub pending_search: Option<String>,
 }
 
 pub struct Conversion {
@@ -223,6 +231,13 @@ impl HomeState {
             status: None,
             conversion: None,
             plan_return: HomeScreen::Providers,
+            convert_return: HomeScreen::ItemPicker,
+            search_input: String::new(),
+            search_editing: true,
+            search_results: Vec::new(),
+            search_state: ratatui::widgets::ListState::default(),
+            search_ran: false,
+            pending_search: None,
         }
     }
 
@@ -376,6 +391,7 @@ impl HomeState {
             claude,
             providers,
             passphrase: Passphrase::None,
+            redact: false,
         }
     }
 
@@ -387,6 +403,7 @@ impl HomeState {
         let typing = match self.screen {
             HomeScreen::ItemPicker => self.picker.as_ref().is_some_and(|p| p.filtering),
             HomeScreen::RestoreInput | HomeScreen::Done => true,
+            HomeScreen::Search => self.search_editing,
             HomeScreen::ConvertPlan => false,
             _ => false,
         };
@@ -400,6 +417,7 @@ impl HomeState {
             HomeScreen::ConfirmBackup => self.handle_confirm_key(code),
             HomeScreen::RestoreInput => self.handle_restore_input_key(code),
             HomeScreen::ConvertPlan => self.handle_convert_key(code),
+            HomeScreen::Search => self.handle_search_key(code),
             HomeScreen::Done => {}
         }
     }
@@ -429,6 +447,11 @@ impl HomeState {
                 }
             }
             KeyCode::Char('d') => self.open_picker(None),
+            KeyCode::Char('s') => {
+                self.search_editing = true;
+                self.status = None;
+                self.screen = HomeScreen::Search;
+            }
             KeyCode::Char(' ') => {
                 if let Some(entry) = self.providers.get_mut(self.provider_cursor) {
                     let all_selected =
@@ -498,6 +521,25 @@ impl HomeState {
             ));
             return;
         };
+        let label = self
+            .picker
+            .as_ref()
+            .and_then(|picker| match picker.current() {
+                Some(PickRow::Entry { entry, .. }) => Some(picker.entry_label(entry)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        self.convert_return = HomeScreen::ItemPicker;
+        self.begin_conversion(source, from, to, label);
+    }
+
+    fn begin_conversion(
+        &mut self,
+        source: PathBuf,
+        from: ProviderId,
+        to: ProviderId,
+        label: String,
+    ) {
         let Some(target_home) = self
             .providers
             .iter()
@@ -510,14 +552,6 @@ impl HomeState {
             ));
             return;
         };
-        let label = self
-            .picker
-            .as_ref()
-            .and_then(|picker| match picker.current() {
-                Some(PickRow::Entry { entry, .. }) => Some(picker.entry_label(entry)),
-                _ => None,
-            })
-            .unwrap_or_default();
         let mut conversion = Conversion {
             label,
             request: crate::convert::ConvertRequest {
@@ -546,7 +580,7 @@ impl HomeState {
         match code {
             KeyCode::Esc => {
                 self.conversion = None;
-                self.screen = HomeScreen::ItemPicker;
+                self.screen = self.convert_return;
             }
             KeyCode::Char('q') => {
                 self.outcome = Some(HomeOutcome::Cancelled);
@@ -590,11 +624,246 @@ impl HomeState {
                     Err(err) => (format!("Conversion failed: {err:#}"), true),
                 });
                 self.conversion = None;
-                self.screen = HomeScreen::ItemPicker;
+                self.screen = self.convert_return;
             }
             _ => {
                 self.plan_scroll.handle_key(code);
             }
+        }
+    }
+
+    fn hit_item(&self, index: usize) -> Option<(usize, usize)> {
+        let hit = self.search_results.get(index)?;
+        let provider = self.providers.iter().position(|p| p.id == hit.provider)?;
+        let item = self.providers[provider]
+            .items
+            .iter()
+            .position(|item| item.id == hit.id)?;
+        Some((provider, item))
+    }
+
+    fn move_search(&mut self, delta: isize) {
+        let len = self.search_results.len() as isize;
+        if len == 0 {
+            return;
+        }
+        let current = self.search_state.selected().unwrap_or(0) as isize;
+        self.search_state
+            .select(Some((current + delta).rem_euclid(len) as usize));
+    }
+
+    pub fn set_search_results(&mut self, results: Vec<crate::search::SearchHit>) {
+        self.search_ran = true;
+        self.search_state
+            .select(if results.is_empty() { None } else { Some(0) });
+        self.search_results = results;
+    }
+
+    fn handle_search_key(&mut self, code: KeyCode) {
+        if self.search_editing {
+            match code {
+                KeyCode::Esc => {
+                    if self.search_results.is_empty() {
+                        self.screen = HomeScreen::Providers;
+                    } else {
+                        self.search_editing = false;
+                    }
+                }
+                KeyCode::Enter => {
+                    let query = self.search_input.trim().to_string();
+                    if query.is_empty() {
+                        return;
+                    }
+                    self.search_editing = false;
+                    self.pending_search = Some(query);
+                }
+                KeyCode::Backspace => {
+                    self.search_input.pop();
+                }
+                KeyCode::Char(c) => self.search_input.push(c),
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Esc => self.screen = HomeScreen::Providers,
+            KeyCode::Char('q') => {
+                self.outcome = Some(HomeOutcome::Cancelled);
+                self.screen = HomeScreen::Done;
+            }
+            KeyCode::Char('/') | KeyCode::Char('e') => self.search_editing = true,
+            KeyCode::Down | KeyCode::Char('j') => self.move_search(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_search(-1),
+            KeyCode::Char(' ') => {
+                if let Some((provider, item)) =
+                    self.search_state.selected().and_then(|i| self.hit_item(i))
+                {
+                    if let Some(flag) = self.providers[provider].selected.get_mut(item) {
+                        *flag = !*flag;
+                    }
+                }
+            }
+            KeyCode::Char('b') => {
+                if self.total_selected_items() > 0 {
+                    self.plan_return = HomeScreen::Search;
+                    self.screen = HomeScreen::ConfirmBackup;
+                }
+            }
+            KeyCode::Char('t') => {
+                let Some(hit) = self
+                    .search_state
+                    .selected()
+                    .and_then(|i| self.search_results.get(i))
+                    .cloned()
+                else {
+                    return;
+                };
+                let to = match hit.provider {
+                    ProviderId::Claude => ProviderId::Codex,
+                    _ => ProviderId::Claude,
+                };
+                self.convert_return = HomeScreen::Search;
+                let label = hit.label.lines().next().unwrap_or_default().to_string();
+                self.begin_conversion(hit.path, hit.provider, to, label);
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_search(&mut self, f: &mut Frame, body: Rect, theme: &Theme) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(body);
+        let width = usize::from(chunks[0].width.saturating_sub(8)).max(4);
+        let mut field = vec![
+            Span::styled(
+                format!("{} ", theme.icon(theme::Icon::Search)),
+                theme.accent(),
+            ),
+            Span::styled(
+                theme::truncate_left(&sanitize(&self.search_input), width),
+                theme.strong(),
+            ),
+        ];
+        if self.search_editing {
+            field.push(Span::styled("_", theme.accent()));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(field)).block(theme.panel("Search sessions")),
+            chunks[0],
+        );
+        let (list_area, detail_area) = theme::split_with_details(chunks[1]);
+        let title = if self.search_ran {
+            format!(
+                "Results  {}",
+                theme::plural(self.search_results.len(), "session")
+            )
+        } else {
+            "Results".to_string()
+        };
+        if self.search_results.is_empty() {
+            let message = if self.search_ran {
+                "No session matches. Every word must appear in the conversation."
+            } else {
+                "Type words and press enter. Claude Code and Codex conversations are searched."
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(message, theme.muted())))
+                    .wrap(ratatui::widgets::Wrap { trim: true })
+                    .block(theme.panel(&title)),
+                list_area,
+            );
+        } else {
+            let selected: Vec<bool> = (0..self.search_results.len())
+                .map(|i| {
+                    self.hit_item(i)
+                        .and_then(|(p, item)| self.providers[p].selected.get(item).copied())
+                        .unwrap_or(false)
+                })
+                .collect();
+            let items: Vec<ratatui::widgets::ListItem> = self
+                .search_results
+                .iter()
+                .zip(selected)
+                .map(|(hit, chosen)| {
+                    let mark = if chosen {
+                        Span::styled(theme.icon(theme::Icon::Check).to_string(), theme.success())
+                    } else {
+                        Span::styled(theme.icon(theme::Icon::Empty).to_string(), theme.muted())
+                    };
+                    let date = hit
+                        .updated_at
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "-".into());
+                    let matches = if hit.matches == 1 {
+                        "1 match".to_string()
+                    } else {
+                        format!("{} matches", hit.matches)
+                    };
+                    ratatui::widgets::ListItem::new(vec![
+                        Line::from(vec![
+                            mark,
+                            Span::raw(" "),
+                            Span::styled(
+                                format!("{:<7}", hit.provider.as_str()),
+                                theme.provider(hit.provider.as_str()),
+                            ),
+                            Span::styled(format!(" {date} "), theme.muted()),
+                            Span::styled(
+                                hit.cwd.as_deref().map(sanitize).unwrap_or_default(),
+                                theme.strong(),
+                            ),
+                            Span::styled(format!("  {matches}"), theme.muted()),
+                        ]),
+                        Line::from(Span::styled(format!("    {}", hit.snippet), theme.muted())),
+                    ])
+                })
+                .collect();
+            f.render_stateful_widget(
+                ratatui::widgets::List::new(items)
+                    .block(theme.panel(&title))
+                    .highlight_style(theme.selected_row())
+                    .highlight_symbol("> "),
+                list_area,
+                &mut self.search_state,
+            );
+        }
+        if let Some(area) = detail_area {
+            let lines = match self
+                .search_state
+                .selected()
+                .and_then(|i| self.search_results.get(i))
+            {
+                Some(hit) => vec![
+                    Line::from(Span::styled(
+                        sanitize(hit.label.lines().next().unwrap_or_default()),
+                        theme.accent(),
+                    )),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(format!("{:<10}", "provider"), theme.muted()),
+                        Span::styled(hit.provider.as_str(), theme.provider(hit.provider.as_str())),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(format!("{:<10}", "id"), theme.muted()),
+                        Span::raw(sanitize(&hit.id)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(format!("{:<10}", "directory"), theme.muted()),
+                        Span::raw(hit.cwd.as_deref().map(sanitize).unwrap_or_default()),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::raw(hit.snippet.clone())),
+                ],
+                None => vec![Line::from(Span::styled("Nothing selected.", theme.muted()))],
+            };
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .block(theme.panel("Details")),
+                area,
+            );
         }
     }
 
@@ -666,6 +935,7 @@ impl HomeState {
                 ("a / n", "select or clear everything"),
                 ("b", "review the backup plan"),
                 ("r", "restore an archive"),
+                ("s", "search inside Claude Code and Codex sessions"),
                 ("q / esc", "quit"),
             ],
             HomeScreen::ItemPicker => {
@@ -674,6 +944,16 @@ impl HomeState {
                 keys.push(("t", "convert the session to the other tool"));
                 keys
             }
+            HomeScreen::Search => vec![
+                ("enter", "run the search"),
+                ("/ or e", "edit the words"),
+                ("j/k", "move between results"),
+                ("space", "select the session for backup"),
+                ("b", "review the backup plan"),
+                ("t", "convert the session to the other tool"),
+                ("esc", "back"),
+                ("q", "quit"),
+            ],
             HomeScreen::ConvertPlan => vec![
                 ("enter / y", "convert, when nothing is refused"),
                 ("r", "allow writing while the target tool runs"),
@@ -821,6 +1101,7 @@ impl HomeState {
                 let mut keys = vec![
                     ("enter", "items"),
                     ("d", "by directory"),
+                    ("s", "search"),
                     ("space", "select"),
                     ("r", "restore"),
                 ];
@@ -922,6 +1203,33 @@ impl HomeState {
                 keys.extend([("esc", "back"), ("?", "help"), ("q", "quit")]);
                 theme::render_footer(f, bottom, theme, &keys);
             }
+            HomeScreen::Search => {
+                f.render_widget(
+                    theme::header(
+                        theme,
+                        "Search",
+                        &format!("{} selected", theme::plural(selected, "item")),
+                    ),
+                    top,
+                );
+                self.draw_search(f, body, theme);
+                let keys: Vec<(&str, &str)> = if self.search_editing {
+                    vec![("enter", "search"), ("esc", "results / back")]
+                } else {
+                    let mut keys = vec![
+                        ("space", "select"),
+                        ("t", "convert"),
+                        ("/", "edit"),
+                        ("?", "help"),
+                        ("esc", "back"),
+                    ];
+                    if selected > 0 {
+                        keys.insert(0, ("b", "backup"));
+                    }
+                    keys
+                };
+                theme::render_footer(f, bottom, theme, &keys);
+            }
             HomeScreen::RestoreInput => {
                 f.render_widget(theme::header(theme, "Restore", "choose an archive"), top);
                 let field_width = usize::from(body.width).saturating_sub(8).max(4);
@@ -987,6 +1295,31 @@ pub fn run_home(claude_dir: &Path) -> Result<()> {
                     }
                 } else if state.screen != HomeScreen::ConfirmBackup {
                     state.plan = None;
+                }
+                if let Some(query) = state.pending_search.take() {
+                    let search_env = env.clone();
+                    let found = loading::run_with_loading(
+                        terminal,
+                        "Searching",
+                        "Reading Claude Code and Codex conversations. Nothing is written.",
+                        (ProviderId::Claude, "Sessions", "searching"),
+                        move || {
+                            crate::search::search(
+                                &query,
+                                &search_env,
+                                &crate::search::SEARCHABLE,
+                                200,
+                            )
+                        },
+                    )?;
+                    match found {
+                        Some(Ok(results)) => state.set_search_results(results),
+                        Some(Err(err)) => {
+                            state.set_search_results(Vec::new());
+                            state.status = Some((format!("Search failed: {err:#}"), true));
+                        }
+                        None => state.search_editing = true,
+                    }
                 }
                 terminal.draw(|f| state.draw(f))?;
                 if state.screen == HomeScreen::Done {
