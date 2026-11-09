@@ -1,5 +1,6 @@
 pub mod backup_ui;
 pub mod groups;
+pub mod loading;
 pub mod restore_ui;
 pub mod theme;
 
@@ -126,6 +127,7 @@ pub struct ProviderEntry {
     pub home: Option<PathBuf>,
     pub items: Vec<Item>,
     pub selected: Vec<bool>,
+    pub scan_error: Option<String>,
 }
 
 impl ProviderEntry {
@@ -200,11 +202,12 @@ impl HomeState {
         let mut entries = Vec::new();
         for prov in provider::registry() {
             let home = prov.locate(env);
-            let items = match &home {
-                Some(h) if h.exists() => {
-                    prov.scan(h, opts).map(|inv| inv.items).unwrap_or_default()
-                }
-                _ => Vec::new(),
+            let (items, scan_error) = match &home {
+                Some(h) if h.exists() => match prov.scan(h, opts) {
+                    Ok(inv) => (inv.items, None),
+                    Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+                },
+                _ => (Vec::new(), None),
             };
             let selected = vec![false; items.len()];
             entries.push(ProviderEntry {
@@ -213,6 +216,7 @@ impl HomeState {
                 home,
                 items,
                 selected,
+                scan_error,
             });
         }
         Self::new(entries)
@@ -548,7 +552,9 @@ impl HomeState {
                     .iter()
                     .map(|p| {
                         let detected = p.home.as_ref().is_some_and(|h| h.exists());
-                        let status = if detected {
+                        let status = if p.scan_error.is_some() {
+                            Span::styled("scan failed", theme.danger())
+                        } else if detected {
                             Span::styled("detected", theme.success())
                         } else {
                             Span::styled("not found", theme.muted())
@@ -692,33 +698,43 @@ pub fn run_home(claude_dir: &Path) -> Result<()> {
         env.overrides
             .insert(ProviderId::Claude, claude_dir.to_path_buf());
     }
-    let mut state = HomeState::from_env(&env, &ScanOptions::default());
     let output = PathBuf::from(format!(
         "aisession-backup-{}.tar.gz",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     ));
 
-    with_terminal(|terminal| loop {
-        if state.screen == HomeScreen::ConfirmBackup && state.plan.is_none() {
-            let req = state.build_backup_request(output.clone(), claude_dir);
-            state.plan_scroll = theme::Scroll::default();
-            match engine::plan_backup(&req) {
-                Ok(plan) => state.set_plan(plan),
-                Err(err) => state.set_plan(Plan::failed(format!("{err:#}"))),
+    let finished = with_terminal(|terminal| {
+        let Some(entries) = loading::scan_providers(terminal, &env, &ScanOptions::default())?
+        else {
+            return Ok(None);
+        };
+        let mut state = HomeState::new(entries);
+        loop {
+            if state.screen == HomeScreen::ConfirmBackup && state.plan.is_none() {
+                let req = state.build_backup_request(output.clone(), claude_dir);
+                state.plan_scroll = theme::Scroll::default();
+                match engine::plan_backup(&req) {
+                    Ok(plan) => state.set_plan(plan),
+                    Err(err) => state.set_plan(Plan::failed(format!("{err:#}"))),
+                }
+            } else if state.screen != HomeScreen::ConfirmBackup {
+                state.plan = None;
             }
-        } else if state.screen != HomeScreen::ConfirmBackup {
-            state.plan = None;
-        }
-        terminal.draw(|f| state.draw(f))?;
-        if state.screen == HomeScreen::Done {
-            break Ok(());
-        }
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                state.handle_key(key.code);
+            terminal.draw(|f| state.draw(f))?;
+            if state.screen == HomeScreen::Done {
+                return Ok(Some(state));
+            }
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    state.handle_key(key.code);
+                }
             }
         }
     })?;
+    let Some(state) = finished else {
+        println!("Cancelled.");
+        return Ok(());
+    };
 
     match state.outcome {
         Some(HomeOutcome::BackupConfirmed) => {

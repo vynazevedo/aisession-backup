@@ -592,15 +592,32 @@ pub fn run_restore(
     flags: super::RestoreFlags,
 ) -> Result<()> {
     let passphrase = crate::cli::resolve_decrypt_passphrase(backup_path)?;
-    let staged = crate::archive::stage(backup_path, &passphrase)?;
-    if !flags.no_verify_checksum && !staged.report.ok() {
-        bail!("archive verification failed; pass --no-verify-checksum to override");
-    }
-
-    let mut app = RestoreApp::new(staged.manifest, backup_path, claude_dir, flags);
-    app.passphrase = passphrase;
-    app.provider_homes = crate::cli::default_provider_homes(claude_dir);
-    with_terminal(|t| app.run(t))?;
+    let archive = backup_path.to_path_buf();
+    let stage_passphrase = passphrase.clone();
+    let finished = with_terminal(|t| {
+        let Some(staged) = super::loading::run_with_loading(
+            t,
+            "Verifying and extracting the archive",
+            (ProviderId::Claude, "Archive"),
+            move || crate::archive::stage(&archive, &stage_passphrase),
+        )?
+        else {
+            return Ok(None);
+        };
+        let staged = staged?;
+        if !flags.no_verify_checksum && !staged.report.ok() {
+            bail!("archive verification failed; pass --no-verify-checksum to override");
+        }
+        let mut app = RestoreApp::new(staged.manifest, backup_path, claude_dir, flags);
+        app.passphrase = passphrase;
+        app.provider_homes = crate::cli::default_provider_homes(claude_dir);
+        app.run(t)?;
+        Ok(Some(app))
+    })?;
+    let Some(mut app) = finished else {
+        println!("Cancelled.");
+        return Ok(());
+    };
 
     if app.cancelled || !app.confirmed {
         println!("Cancelled.");
