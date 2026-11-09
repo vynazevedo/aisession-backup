@@ -15,5 +15,6 @@ pub mod provider;
 pub mod remap;
 pub mod safety;
 pub mod secrets;
+pub mod sqlite_snapshot;
 pub mod tui;
 pub mod ui;

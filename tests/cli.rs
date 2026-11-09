@@ -773,10 +773,14 @@ fn backup_report_warns_about_secrets_and_changes() {
         bytes: 1,
         secret_findings: 2,
         changed_during_backup: vec!["evil\u{1b}[31m.jsonl".into()],
+        sqlite_snapshots: 2,
+        sqlite_fallbacks: vec!["providers/codex/state_5.sqlite: locked\u{7}".into()],
     };
     let text = ui::format_backup_report(&report, false);
     assert!(text.contains("--encrypt"));
-    assert!(text.contains("1 file(s) changed"));
+    assert!(text.contains("1 file changed"));
+    assert!(text.contains("SQLite: 2 databases copied"));
+    assert!(text.contains("1 database could not be opened"));
     assert!(!text.contains('\u{1b}'));
 }
 
@@ -1064,4 +1068,98 @@ fn tui_t_key_opens_an_in_app_conversion_plan() {
         .unwrap()
         .count();
     assert_eq!(converted, 1);
+}
+
+#[test]
+fn live_sqlite_databases_are_backed_up_consistently() {
+    let env = TestEnv::new();
+    let db = env.codex_dir.join("state_5.sqlite");
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    let mode: String = writer
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    writer
+        .execute_batch(
+            "PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE threads (id INTEGER PRIMARY KEY, title TEXT);
+             INSERT INTO threads (title) VALUES ('one'), ('two'), ('three');",
+        )
+        .unwrap();
+    assert!(
+        env.codex_dir
+            .join("state_5.sqlite-wal")
+            .metadata()
+            .unwrap()
+            .len()
+            > 0
+    );
+
+    let archive = env.root.join("state.tar.gz");
+    let out = env.run(&[
+        "backup",
+        "--provider",
+        "codex",
+        "--include-state",
+        "-o",
+        archive.to_str().unwrap(),
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(
+        code_of(&out),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["sqlite_snapshots"], 1);
+    assert_eq!(report["sqlite_fallbacks"].as_array().unwrap().len(), 0);
+    drop(writer);
+
+    let listing = env.run(&["list", archive.to_str().unwrap(), "--json"]);
+    let manifest: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    let rels: Vec<String> = manifest["providers"][0]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["rel"].as_str().unwrap().to_string())
+        .collect();
+    assert!(rels.contains(&"state_5.sqlite".to_string()), "{rels:?}");
+    assert!(
+        !rels
+            .iter()
+            .any(|rel| rel.ends_with("-wal") || rel.ends_with("-shm")),
+        "{rels:?}"
+    );
+
+    let dest = env.root.join("restored");
+    let restore = env.run(&[
+        "restore",
+        archive.to_str().unwrap(),
+        "--dest",
+        dest.join(".claude").to_str().unwrap(),
+        "--provider",
+        "codex",
+        "--provider-home",
+        &format!("codex={}", dest.join(".codex").display()),
+        "--allow-running",
+        "--yes",
+    ]);
+    assert_eq!(
+        code_of(&restore),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let restored = dest.join(".codex/state_5.sqlite");
+    let conn = rusqlite::Connection::open(&restored).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM threads", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 3);
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
 }

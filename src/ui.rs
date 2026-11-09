@@ -451,10 +451,25 @@ pub fn format_backup_report(report: &BackupReport, color: bool) -> String {
         human_size(report.bytes),
         report.secret_findings
     );
+    if report.sqlite_snapshots > 0 {
+        out.push_str(&format!(
+            "  SQLite: {} copied with the SQLite backup API and checked\n",
+            plural(report.sqlite_snapshots, "database")
+        ));
+    }
+    if !report.sqlite_fallbacks.is_empty() {
+        out.push_str(&format!(
+            "  Warning: {} could not be opened by SQLite and were copied as plain files; close the tool and back up again for a consistent copy\n",
+            plural(report.sqlite_fallbacks.len(), "database")
+        ));
+        for reason in report.sqlite_fallbacks.iter().take(10) {
+            out.push_str(&format!("    {}\n", sanitize(reason)));
+        }
+    }
     if !report.changed_during_backup.is_empty() {
         out.push_str(&format!(
-            "  Warning: {} file(s) changed during the backup; the archive holds the copy taken at that moment\n",
-            report.changed_during_backup.len()
+            "  Warning: {} changed during the backup; the archive holds the copy taken at that moment\n",
+            plural(report.changed_during_backup.len(), "file")
         ));
         for path in report.changed_during_backup.iter().take(10) {
             out.push_str(&format!("    {}\n", sanitize(path)));

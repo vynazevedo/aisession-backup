@@ -51,6 +51,16 @@ pub struct BackupReport {
     pub bytes: u64,
     pub secret_findings: usize,
     pub changed_during_backup: Vec<String>,
+    #[serde(default)]
+    pub sqlite_snapshots: usize,
+    #[serde(default)]
+    pub sqlite_fallbacks: Vec<String>,
+}
+
+struct SnapshotSummary {
+    changed: Vec<String>,
+    sqlite: usize,
+    sqlite_fallbacks: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -339,7 +349,7 @@ fn run_backup_after_scan(
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
     let snapshots = builder.tempdir_in(parent)?;
-    let changed_during_backup = snapshot_inputs(&mut input, snapshots.path())?;
+    let summary = snapshot_inputs(&mut input, snapshots.path())?;
     let mut findings = 0;
     let mut bytes = 0;
     for (name, path) in &input.files {
@@ -364,7 +374,9 @@ fn run_backup_after_scan(
         files: input.files.len(),
         bytes,
         secret_findings: findings,
-        changed_during_backup,
+        changed_during_backup: summary.changed,
+        sqlite_snapshots: summary.sqlite,
+        sqlite_fallbacks: summary.sqlite_fallbacks,
     })
 }
 
@@ -413,12 +425,34 @@ fn snapshot_file(
     unreachable!()
 }
 
-fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<Vec<String>> {
+fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<SnapshotSummary> {
     use std::collections::BTreeSet;
     let mut changed = BTreeSet::new();
     let mut digests = BTreeMap::new();
+    let mut consistent = BTreeSet::new();
+    let mut companions = BTreeSet::new();
+    let mut sqlite_fallbacks = Vec::new();
     for (rel, source) in &input.files {
         crate::safety::validate_rel(rel)?;
+        if consistent.contains(rel) || !crate::sqlite_snapshot::is_sqlite(source) {
+            continue;
+        }
+        let dest = crate::safety::safe_join(root, rel)?;
+        match crate::sqlite_snapshot::snapshot(source, &dest) {
+            Ok(()) => {
+                digests.insert(rel.clone(), crate::backup::hash_file(&dest)?);
+                consistent.insert(rel.clone());
+                for suffix in crate::sqlite_snapshot::COMPANIONS {
+                    companions.insert(format!("{rel}{suffix}"));
+                }
+            }
+            Err(err) => sqlite_fallbacks.push(format!("{rel}: {err:#}")),
+        }
+    }
+    for (rel, source) in &input.files {
+        if consistent.contains(rel) || companions.contains(rel) {
+            continue;
+        }
         if digests.contains_key(rel) {
             bail!("duplicate snapshot entry: {rel}")
         }
@@ -525,7 +559,11 @@ fn snapshot_inputs(input: &mut BackupInputs, root: &std::path::Path) -> Result<V
     });
     input.manifest.total_size = input.files.iter().map(|(rel, _)| digests[rel].1).sum();
     input.manifest.checksum = crate::backup::global_checksum(&input.manifest.sessions);
-    Ok(changed.into_iter().collect())
+    Ok(SnapshotSummary {
+        changed: changed.into_iter().collect(),
+        sqlite: consistent.len(),
+        sqlite_fallbacks,
+    })
 }
 
 pub fn audit_selection(request: &BackupRequest) -> Result<Vec<SecretFinding>> {
