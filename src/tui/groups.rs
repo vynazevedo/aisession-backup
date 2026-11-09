@@ -47,24 +47,31 @@ pub struct GroupPicker {
     short_ids: bool,
 }
 
+fn normalized(path: &str) -> String {
+    path.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
 fn is_ancestor(parent: &str, child: &str) -> bool {
-    let parent = parent.trim_end_matches(['/', '\\']);
+    let parent = normalized(parent);
+    let child = normalized(child);
     child.len() > parent.len()
-        && child.starts_with(parent)
-        && child[parent.len()..].starts_with(['/', '\\'])
+        && child.starts_with(&parent)
+        && child[parent.len()..].starts_with('/')
 }
 
 fn tree_order(groups: &[DirGroup]) -> (Vec<usize>, Vec<usize>) {
     let parent: Vec<Option<usize>> = groups
         .iter()
-        .map(|group| {
+        .enumerate()
+        .map(|(own, group)| {
             let cwd = group.cwd.as_deref()?;
             groups
                 .iter()
                 .enumerate()
+                .filter(|(index, _)| *index != own)
                 .filter_map(|(index, other)| {
                     let other_cwd = other.cwd.as_deref()?;
-                    is_ancestor(other_cwd, cwd).then_some((index, other_cwd.len()))
+                    is_ancestor(other_cwd, cwd).then_some((index, normalized(other_cwd).len()))
                 })
                 .max_by_key(|(_, len)| *len)
                 .map(|(index, _)| index)
@@ -78,20 +85,22 @@ fn tree_order(groups: &[DirGroup]) -> (Vec<usize>, Vec<usize>) {
             None => roots.push(index),
         }
     }
-    fn latest(
-        index: usize,
-        groups: &[DirGroup],
-        children: &[Vec<usize>],
-    ) -> Option<chrono::DateTime<chrono::Utc>> {
-        children[index]
-            .iter()
-            .filter_map(|&child| latest(child, groups, children))
-            .chain(groups[index].latest)
-            .max()
+    let mut newest: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+        groups.iter().map(|group| group.latest).collect();
+    let mut changed = true;
+    let mut rounds = 0;
+    while changed && rounds < groups.len() {
+        changed = false;
+        rounds += 1;
+        for (index, parent) in parent.iter().enumerate() {
+            if let Some(parent) = parent {
+                if newest[index] > newest[*parent] {
+                    newest[*parent] = newest[index];
+                    changed = true;
+                }
+            }
+        }
     }
-    let newest: Vec<_> = (0..groups.len())
-        .map(|index| latest(index, groups, &children))
-        .collect();
     let key = |index: &usize| {
         (
             groups[*index].cwd.is_none(),
@@ -105,12 +114,23 @@ fn tree_order(groups: &[DirGroup]) -> (Vec<usize>, Vec<usize>) {
     }
     let mut order = Vec::with_capacity(groups.len());
     let mut depth = vec![0; groups.len()];
+    let mut seen = vec![false; groups.len()];
     let mut stack: Vec<(usize, usize)> = roots.into_iter().rev().map(|root| (root, 0)).collect();
     while let Some((index, level)) = stack.pop() {
+        if std::mem::replace(&mut seen[index], true) {
+            continue;
+        }
         order.push(index);
         depth[index] = level;
         for &child in children[index].iter().rev() {
-            stack.push((child, level + 1));
+            if !seen[child] {
+                stack.push((child, level + 1));
+            }
+        }
+    }
+    for (index, visited) in seen.iter().enumerate() {
+        if !visited {
+            order.push(index);
         }
     }
     (order, depth)
@@ -905,6 +925,44 @@ mod tests {
             .map(|span| span.content.to_string())
             .collect();
         assert!(row.contains("0/2"));
+    }
+
+    #[test]
+    fn odd_path_spellings_never_loop_and_every_group_is_listed() {
+        let spellings = [
+            "/proj/",
+            "/proj//",
+            "/proj",
+            "C:\\work\\",
+            "C:/work",
+            "C:\\work\\app",
+            "/",
+            "\\",
+            "",
+        ];
+        let entries: Vec<Entry> = spellings
+            .iter()
+            .enumerate()
+            .map(|(i, cwd)| entry(&format!("e{i}"), Some(cwd), "x", 1 + i as u32))
+            .collect();
+        let picker = GroupPicker::new(entries, Vec::new());
+        let mut listed: Vec<usize> = picker
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                PickRow::Group(g) => Some(*g),
+                PickRow::Entry { .. } => None,
+            })
+            .collect();
+        listed.sort_unstable();
+        listed.dedup();
+        assert_eq!(listed.len(), picker.groups.len());
+        let app = picker
+            .groups
+            .iter()
+            .position(|g| g.cwd.as_deref() == Some("C:\\work\\app"))
+            .unwrap();
+        assert_eq!(picker.depth[app], 1);
     }
 
     #[test]

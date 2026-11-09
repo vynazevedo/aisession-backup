@@ -49,7 +49,12 @@ pub fn bar_lines(theme: &Theme, providers: &[&ProviderEntry], width: usize) -> V
         .max()
         .unwrap_or(0)
         .max(1);
-    let label_width = 9;
+    let label_width = providers
+        .iter()
+        .map(|p| p.id.as_str().chars().count() + 1)
+        .max()
+        .unwrap_or(9)
+        .max(9);
     let value_width = 9;
     let bar_width = width.saturating_sub(label_width + value_width + 1).max(1);
     providers
@@ -292,7 +297,9 @@ mod tests {
             scan_error: None,
         };
         let theme = Theme::new(false, IconSet::Unicode);
-        let lines = bar_lines(&theme, &[&big, &big], 40);
+        let mut long = big.clone();
+        long.id = ProviderId::Antigravity;
+        let lines = bar_lines(&theme, &[&big, &long], 40);
         for line in &lines {
             let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
             assert_eq!(text.chars().count(), 40, "{text}");
