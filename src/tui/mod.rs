@@ -1,6 +1,7 @@
 pub mod backup_ui;
 pub mod groups;
 pub mod restore_ui;
+pub mod theme;
 
 use std::io::{self, IsTerminal, Stdout};
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use ratatui::crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 
 use crate::engine::{self, BackupRequest, ClaudeSelection, Passphrase, ProviderSelection};
 use crate::plan::Plan;
@@ -25,6 +26,7 @@ use crate::ui::{human_size, sanitize};
 pub use backup_ui::{run_backup, BackupApp, BackupStep};
 pub use groups::{GroupPicker, Mark, PickRow};
 pub use restore_ui::{run_restore, MapRow, RestoreApp, RestoreStep};
+pub use theme::{IconSet, Theme};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RestoreFlags {
@@ -149,6 +151,11 @@ pub enum HomeScreen {
 pub enum HomeOutcome {
     BackupConfirmed,
     RestoreArchive(PathBuf),
+    Convert {
+        source: PathBuf,
+        from: ProviderId,
+        to: ProviderId,
+    },
     Cancelled,
 }
 
@@ -156,7 +163,9 @@ pub struct HomeState {
     pub providers: Vec<ProviderEntry>,
     pub screen: HomeScreen,
     pub provider_cursor: usize,
-    pub provider_list_state: ListState,
+    pub provider_list_state: TableState,
+    pub show_help: bool,
+    plan_scroll: theme::Scroll,
     pub picker: Option<GroupPicker>,
     picker_refs: Vec<(usize, usize)>,
     picker_all_providers: bool,
@@ -167,7 +176,7 @@ pub struct HomeState {
 
 impl HomeState {
     pub fn new(providers: Vec<ProviderEntry>) -> Self {
-        let mut provider_list_state = ListState::default();
+        let mut provider_list_state = TableState::default();
         if !providers.is_empty() {
             provider_list_state.select(Some(0));
         }
@@ -176,6 +185,8 @@ impl HomeState {
             screen: HomeScreen::Providers,
             provider_cursor: 0,
             provider_list_state,
+            show_help: false,
+            plan_scroll: theme::Scroll::default(),
             picker: None,
             picker_refs: Vec::new(),
             picker_all_providers: false,
@@ -240,6 +251,31 @@ impl HomeState {
         self.picker_refs = refs;
         self.picker_all_providers = only_provider.is_none();
         self.screen = HomeScreen::ItemPicker;
+    }
+
+    pub fn convertible_current(&self) -> Option<(PathBuf, ProviderId, ProviderId)> {
+        let picker = self.picker.as_ref()?;
+        let Some(PickRow::Entry { entry, .. }) = picker.current() else {
+            return None;
+        };
+        let &(provider_index, item_index) = self.picker_refs.get(entry)?;
+        let provider = self.providers.get(provider_index)?;
+        let item = provider.items.get(item_index)?;
+        if item.kind != provider::ItemKind::Session {
+            return None;
+        }
+        let to = match provider.id {
+            ProviderId::Claude => ProviderId::Codex,
+            ProviderId::Codex => ProviderId::Claude,
+            _ => return None,
+        };
+        let home = provider.home.as_ref()?;
+        let file = item.files.iter().find(|file| {
+            file.rel.ends_with(".jsonl")
+                && (provider.id == ProviderId::Codex
+                    || file.rel.ends_with(&format!("{}.jsonl", item.id)))
+        })?;
+        Some((home.join(&file.rel), provider.id, to))
     }
 
     fn sync_picker_selection(&mut self) {
@@ -312,6 +348,19 @@ impl HomeState {
     }
 
     pub fn handle_key(&mut self, code: KeyCode) {
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+        let typing = match self.screen {
+            HomeScreen::ItemPicker => self.picker.as_ref().is_some_and(|p| p.filtering),
+            HomeScreen::RestoreInput | HomeScreen::Done => true,
+            _ => false,
+        };
+        if code == KeyCode::Char('?') && !typing {
+            self.show_help = true;
+            return;
+        }
         match self.screen {
             HomeScreen::Providers => self.handle_providers_key(code),
             HomeScreen::ItemPicker => self.handle_item_picker_key(code),
@@ -394,6 +443,12 @@ impl HomeState {
                     self.screen = HomeScreen::ConfirmBackup;
                 }
             }
+            KeyCode::Char('t') => {
+                if let Some((source, from, to)) = self.convertible_current() {
+                    self.outcome = Some(HomeOutcome::Convert { source, from, to });
+                    self.screen = HomeScreen::Done;
+                }
+            }
             KeyCode::Left | KeyCode::Char('h') => {
                 if !picker.handle_key(code) {
                     self.screen = HomeScreen::Providers;
@@ -422,7 +477,9 @@ impl HomeState {
                     self.screen = HomeScreen::Done;
                 }
             }
-            _ => {}
+            _ => {
+                self.plan_scroll.handle_key(code);
+            }
         }
     }
 
@@ -448,60 +505,109 @@ impl HomeState {
         }
     }
 
-    pub fn draw(&mut self, f: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(1),
-                Constraint::Length(2),
-            ])
-            .split(f.area());
+    fn help_keys(&self) -> Vec<(&'static str, &'static str)> {
+        match self.screen {
+            HomeScreen::Providers => vec![
+                ("j/k", "move between providers"),
+                ("enter", "open the items of the provider"),
+                ("d", "open every provider grouped by directory"),
+                ("space", "select or clear the whole provider"),
+                ("a / n", "select or clear everything"),
+                ("b", "review the backup plan"),
+                ("r", "restore an archive"),
+                ("q", "quit"),
+            ],
+            HomeScreen::ItemPicker => {
+                let mut keys = groups::PICKER_HELP_KEYS.to_vec();
+                keys.push(("b", "review the backup plan"));
+                keys.push(("t", "convert the session to the other tool"));
+                keys
+            }
+            _ => vec![
+                ("j/k", "scroll the plan"),
+                ("g / G", "top or end of the plan"),
+                ("enter / y", "write, when nothing is refused"),
+                ("esc", "go back without writing"),
+                ("q", "quit without writing"),
+            ],
+        }
+    }
 
+    pub fn draw(&mut self, f: &mut Frame) {
+        let theme = theme::current();
+        let [top, body, bottom] = theme::frame_layout(f.area());
+        let selected = self.total_selected_items();
         match self.screen {
             HomeScreen::Providers => {
-                let header = Paragraph::new(format!(
-                    "aisession-backup Home | {} item(s) selected across providers",
-                    self.total_selected_items()
-                ))
-                .style(Style::default().add_modifier(Modifier::BOLD));
-                f.render_widget(header, chunks[0]);
-
-                let items: Vec<ListItem> = self
+                f.render_widget(
+                    theme::header(theme, "Home", &format!("{selected} item(s) selected")),
+                    top,
+                );
+                let rows: Vec<Row> = self
                     .providers
                     .iter()
                     .map(|p| {
-                        let status = match &p.home {
-                            Some(h) if h.exists() => sanitize(&h.display().to_string()),
-                            _ => "not detected".to_string(),
+                        let detected = p.home.as_ref().is_some_and(|h| h.exists());
+                        let status = if detected {
+                            Span::styled("detected", theme.success())
+                        } else {
+                            Span::styled("not found", theme.muted())
                         };
-                        let line = format!(
-                            "{:<16} [{}/{} selected] ({}) - {}",
-                            sanitize(&p.display_name),
-                            p.selected_count(),
-                            p.items.len(),
-                            human_size(p.total_bytes()),
-                            status
-                        );
-                        ListItem::new(line)
+                        let location = p
+                            .home
+                            .as_ref()
+                            .filter(|_| detected)
+                            .map(|h| sanitize(&h.display().to_string()))
+                            .unwrap_or_default();
+                        let count_style = if p.selected_count() > 0 {
+                            theme.accent()
+                        } else {
+                            Style::default()
+                        };
+                        Row::new(vec![
+                            Cell::from(Span::styled(
+                                sanitize(&p.display_name),
+                                theme.provider(p.id.as_str()),
+                            )),
+                            Cell::from(status),
+                            Cell::from(Span::styled(
+                                format!("{}/{}", p.selected_count(), p.items.len()),
+                                count_style,
+                            )),
+                            Cell::from(Span::styled(human_size(p.total_bytes()), theme.muted())),
+                            Cell::from(Span::styled(location, theme.muted())),
+                        ])
                     })
                     .collect();
-                let list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title("Providers"))
-                    .highlight_style(
-                        Style::default()
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .highlight_symbol("> ");
-                f.render_stateful_widget(list, chunks[1], &mut self.provider_list_state);
-
-                let help = Paragraph::new(
-                    "enter/l items | d all providers by directory | space toggle provider | a all | n none | b backup | r restore | q quit",
+                let table = Table::new(
+                    rows,
+                    [
+                        Constraint::Length(17),
+                        Constraint::Length(10),
+                        Constraint::Length(10),
+                        Constraint::Length(10),
+                        Constraint::Min(10),
+                    ],
                 )
-                .style(Style::default().fg(Color::DarkGray))
-                .wrap(Wrap { trim: true });
-                f.render_widget(help, chunks[2]);
+                .header(
+                    Row::new(["Provider", "Status", "Selected", "Size", "Location"])
+                        .style(theme.muted().add_modifier(Modifier::BOLD)),
+                )
+                .block(theme.panel("Providers"))
+                .row_highlight_style(theme.selected_row())
+                .highlight_symbol("> ");
+                f.render_stateful_widget(table, body, &mut self.provider_list_state);
+                let mut keys = vec![
+                    ("enter", "items"),
+                    ("d", "by directory"),
+                    ("space", "select"),
+                    ("r", "restore"),
+                ];
+                if selected > 0 {
+                    keys.insert(0, ("b", "backup"));
+                }
+                keys.extend([("?", "help"), ("q", "quit")]);
+                f.render_widget(theme::footer(theme, &keys), bottom);
             }
             HomeScreen::ItemPicker => {
                 let scope = if self.picker_all_providers {
@@ -512,147 +618,72 @@ impl HomeState {
                         .map(|p| sanitize(&p.display_name))
                         .unwrap_or_default()
                 };
-                let selected_total = self.total_selected_items();
-                let Some(picker) = self.picker.as_mut() else {
-                    return;
-                };
-                let header = Paragraph::new(format!(
-                    "Directories - {scope} ({selected_total} total selected){}",
-                    picker.filter_suffix()
-                ))
-                .style(Style::default().add_modifier(Modifier::BOLD));
-                f.render_widget(header, chunks[0]);
-
-                let list = List::new(picker.list_items())
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Sessions & Items"),
-                    )
-                    .highlight_style(
-                        Style::default()
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .highlight_symbol("> ");
-                f.render_stateful_widget(list, chunks[1], &mut picker.state);
-
-                let help = Paragraph::new(format!(
-                    "{} | b backup | esc back | q quit",
-                    groups::PICKER_HELP
-                ))
-                .style(Style::default().fg(Color::DarkGray))
-                .wrap(Wrap { trim: true });
-                f.render_widget(help, chunks[2]);
+                f.render_widget(
+                    theme::header(
+                        theme,
+                        "Select",
+                        &format!("{scope}  |  {selected} item(s) selected"),
+                    ),
+                    top,
+                );
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.render(f, body, theme, "Directories");
+                }
+                let mut keys = groups::PICKER_KEYS.to_vec();
+                if selected > 0 {
+                    keys.insert(0, ("b", "backup"));
+                }
+                match self.convertible_current() {
+                    Some((_, _, ProviderId::Codex)) => keys.insert(0, ("t", "to codex")),
+                    Some((_, _, _)) => keys.insert(0, ("t", "to claude")),
+                    None => {}
+                }
+                keys.push(("esc", "back"));
+                f.render_widget(theme::footer(theme, &keys), bottom);
             }
             HomeScreen::ConfirmBackup => {
-                let header = Paragraph::new("Confirm Backup Plan")
-                    .style(Style::default().add_modifier(Modifier::BOLD));
-                f.render_widget(header, chunks[0]);
-
-                let lines = render_plan_lines(self.plan.as_ref());
-                let body = Paragraph::new(lines)
-                    .block(Block::default().borders(Borders::ALL).title("Plan"))
-                    .wrap(Wrap { trim: false });
-                f.render_widget(body, chunks[1]);
-
-                let help = Paragraph::new("enter/y confirm | esc back | q quit")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .wrap(Wrap { trim: true });
-                f.render_widget(help, chunks[2]);
+                f.render_widget(
+                    theme::header(theme, "Backup plan", &format!("{selected} item(s)")),
+                    top,
+                );
+                theme::render_plan(f, body, theme, self.plan.as_ref(), &mut self.plan_scroll);
+                let blocked = self.plan.as_ref().is_some_and(Plan::has_refusals);
+                let mut keys = theme::PLAN_KEYS.to_vec();
+                if !blocked {
+                    keys.insert(0, ("enter", "write backup"));
+                }
+                keys.extend([("esc", "back"), ("q", "quit")]);
+                f.render_widget(theme::footer(theme, &keys), bottom);
             }
             HomeScreen::RestoreInput => {
-                let header = Paragraph::new("Restore Wizard - Enter Archive Path")
-                    .style(Style::default().add_modifier(Modifier::BOLD));
-                f.render_widget(header, chunks[0]);
-
-                let body =
-                    Paragraph::new(format!("Archive file: {}_", sanitize(&self.restore_input)))
-                        .block(Block::default().borders(Borders::ALL).title("Archive"));
-                f.render_widget(body, chunks[1]);
-
-                let help = Paragraph::new("type path | enter open restore wizard | esc back")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .wrap(Wrap { trim: true });
-                f.render_widget(help, chunks[2]);
+                f.render_widget(theme::header(theme, "Restore", "choose an archive"), top);
+                let lines = vec![
+                    Line::from(Span::styled(
+                        "Path to a backup archive (.tar.gz or .tar.gz.age)",
+                        theme.muted(),
+                    )),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{} ", theme.icon(theme::Icon::Archive)),
+                            theme.accent(),
+                        ),
+                        Span::styled(sanitize(&self.restore_input), theme.strong()),
+                        Span::styled("_", theme.accent()),
+                    ]),
+                ];
+                f.render_widget(Paragraph::new(lines).block(theme.panel("Archive")), body);
+                f.render_widget(
+                    theme::footer(theme, &[("enter", "open"), ("esc", "back")]),
+                    bottom,
+                );
             }
             HomeScreen::Done => {}
         }
+        if self.show_help {
+            theme::render_help(f, theme, "Keys", &self.help_keys());
+        }
     }
-}
-
-pub(crate) fn render_plan_lines(plan: Option<&Plan>) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let Some(plan) = plan else {
-        lines.push(Line::from("No plan available."));
-        return lines;
-    };
-    let summary = plan.summary();
-    lines.push(Line::from(Span::styled(
-        format!(
-            "Summary: create={}, overwrite={}, merge={}, skip={}, refuse={} | size={}",
-            summary.create,
-            summary.overwrite,
-            summary.merge,
-            summary.skip,
-            summary.refuse,
-            human_size(summary.bytes)
-        ),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(vec![
-        Span::raw("Risks: "),
-        Span::styled(
-            format!("executes_code={}", summary.executes_code),
-            if summary.executes_code > 0 {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
-        ),
-        Span::raw(", "),
-        Span::styled(
-            format!("sensitive={}", summary.sensitive),
-            if summary.sensitive > 0 {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
-        ),
-    ]));
-    lines.push(Line::from(""));
-
-    for warn in &plan.warnings {
-        lines.push(Line::from(Span::styled(
-            format!("! warning: {}", sanitize(warn)),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-
-    for op in &plan.ops {
-        let act = crate::ui::action_label(&op.action);
-        let risk = crate::ui::risk_label(op.risk);
-        let dest = sanitize(&op.dest.display().to_string());
-        let prov = sanitize(&op.provider);
-        let note = sanitize(&op.note);
-        let style = match op.action {
-            crate::plan::Action::Refuse(_) => Style::default().fg(Color::Red),
-            crate::plan::Action::Overwrite => Style::default().fg(Color::Yellow),
-            crate::plan::Action::Create => Style::default().fg(Color::Green),
-            crate::plan::Action::Merge => Style::default().fg(Color::Cyan),
-            crate::plan::Action::Skip(_) => Style::default().fg(Color::DarkGray),
-        };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "[{prov}] {act} ({risk}, {}) -> {dest} {note}",
-                human_size(op.size)
-            ),
-            style,
-        )));
-    }
-    lines
 }
 
 pub fn run_home(claude_dir: &Path) -> Result<()> {
@@ -663,13 +694,14 @@ pub fn run_home(claude_dir: &Path) -> Result<()> {
     }
     let mut state = HomeState::from_env(&env, &ScanOptions::default());
     let output = PathBuf::from(format!(
-        "claude-backup-{}.tar.gz",
+        "aisession-backup-{}.tar.gz",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     ));
 
     with_terminal(|terminal| loop {
         if state.screen == HomeScreen::ConfirmBackup && state.plan.is_none() {
             let req = state.build_backup_request(output.clone(), claude_dir);
+            state.plan_scroll = theme::Scroll::default();
             match engine::plan_backup(&req) {
                 Ok(plan) => state.set_plan(plan),
                 Err(err) => state.set_plan(Plan::failed(format!("{err:#}"))),
@@ -700,6 +732,10 @@ pub fn run_home(claude_dir: &Path) -> Result<()> {
         }
         Some(HomeOutcome::RestoreArchive(path)) => {
             run_restore(&path, claude_dir, RestoreFlags::default())
+        }
+        Some(HomeOutcome::Convert { source, from, to }) => {
+            let request = crate::cli::conversion_request(source, from, to, claude_dir)?;
+            crate::cli::run_conversion(&request, false, false, false)
         }
         _ => {
             println!("Cancelled.");

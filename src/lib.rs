@@ -3,6 +3,7 @@ pub mod backup;
 pub mod claudepath;
 pub mod cli;
 pub mod config;
+pub mod convert;
 pub mod crypto;
 pub mod discover;
 pub mod engine;

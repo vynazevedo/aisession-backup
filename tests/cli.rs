@@ -877,3 +877,158 @@ fn legacy_env_and_journal_directory_keep_working() {
     assert_eq!(code_of(&rollback), EXIT_OK);
     assert!(!restored.exists());
 }
+
+#[test]
+fn convert_codex_session_into_claude_and_roll_it_back() {
+    let env = TestEnv::new();
+    let day = env.codex_dir.join("sessions/2026/01/01");
+    fs::create_dir_all(&day).unwrap();
+    let id = "44444444-4444-4444-8444-444444444444";
+    let lines = [
+        serde_json::json!({"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":id,"cwd":"/work/api","timestamp":"2026-01-01T00:00:00Z"}}),
+        serde_json::json!({"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Add a cache layer"}]}}),
+        serde_json::json!({"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"x"}}),
+        serde_json::json!({"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done \u{1b}[31m"}]}}),
+    ];
+    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    fs::write(
+        day.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl")),
+        body,
+    )
+    .unwrap();
+
+    let dry = env.run(&[
+        "convert",
+        id,
+        "--to",
+        "claude",
+        "-m",
+        "/work:/srv",
+        "--dry-run",
+    ]);
+    assert_eq!(
+        code_of(&dry),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(!env.claude_dir.join("projects/-srv-api").exists());
+
+    let out = env.run(&[
+        "convert",
+        id,
+        "--to",
+        "claude",
+        "-m",
+        "/work:/srv",
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(
+        code_of(&out),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["written"], 1);
+    assert_eq!(report["dropped"]["reasoning"], 1);
+    let session = report["session_id"].as_str().unwrap();
+    let file = env
+        .claude_dir
+        .join("projects/-srv-api")
+        .join(format!("{session}.jsonl"));
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("Add a cache layer"));
+    assert!(text.contains("\"cwd\":\"/srv/api\""));
+
+    let again = env.run(&[
+        "convert",
+        id,
+        "--to",
+        "claude",
+        "-m",
+        "/work:/srv",
+        "--yes",
+        "--json",
+    ]);
+    let again: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(again["written"], 0);
+    assert_eq!(again["already_converted"], true);
+
+    let human = env.run(&[
+        "convert",
+        file.to_str().unwrap(),
+        "--to",
+        "codex",
+        "--dry-run",
+    ]);
+    assert_eq!(code_of(&human), EXIT_OK);
+    assert!(!String::from_utf8_lossy(&human.stderr).contains('\x1b'));
+
+    let journal = report["journal_id"].as_str().unwrap();
+    let rollback = env.run(&["rollback", journal, "--yes"]);
+    assert_eq!(code_of(&rollback), EXIT_OK);
+    assert!(!file.exists());
+
+    let bad = env.run(&["convert", id, "--to", "gemini"]);
+    assert_eq!(code_of(&bad), EXIT_USAGE);
+    let missing = env.run(&[
+        "convert",
+        "55555555-5555-4555-8555-555555555555",
+        "--to",
+        "claude",
+    ]);
+    assert_ne!(code_of(&missing), EXIT_OK);
+}
+
+#[test]
+fn tui_t_key_converts_only_claude_and_codex_sessions() {
+    let codex_session = Item {
+        id: "x-1".into(),
+        kind: ItemKind::Session,
+        label: "codex work".into(),
+        cwd: Some("/work/api".into()),
+        updated_at: None,
+        files: vec![ItemFile {
+            rel: "sessions/2026/01/01/rollout-2026-01-01T00-00-00-x-1.jsonl".into(),
+            size: 10,
+            class: FileClass::Plain,
+        }],
+    };
+    let codex_config = Item {
+        id: "config".into(),
+        kind: ItemKind::Config,
+        label: "config".into(),
+        cwd: None,
+        updated_at: None,
+        files: Vec::new(),
+    };
+    let mut home = HomeState::new(vec![ProviderEntry {
+        id: ProviderId::Codex,
+        display_name: "Codex CLI".into(),
+        home: Some(PathBuf::from("/tmp/fake-codex")),
+        items: vec![codex_session, codex_config],
+        selected: vec![false, false],
+    }]);
+    home.handle_key(KeyCode::Enter);
+    home.handle_key(KeyCode::Char('t'));
+    assert_eq!(
+        home.screen,
+        HomeScreen::ItemPicker,
+        "a directory row is not a session"
+    );
+    home.handle_key(KeyCode::Enter);
+    home.handle_key(KeyCode::Down);
+    home.handle_key(KeyCode::Char('t'));
+    assert_eq!(
+        home.outcome,
+        Some(HomeOutcome::Convert {
+            source: PathBuf::from(
+                "/tmp/fake-codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-x-1.jsonl"
+            ),
+            from: ProviderId::Codex,
+            to: ProviderId::Claude,
+        })
+    );
+}

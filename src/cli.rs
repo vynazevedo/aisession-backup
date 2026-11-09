@@ -252,6 +252,34 @@ pub enum Commands {
         #[arg(long, help = "Output JSON to stdout")]
         json: bool,
     },
+    #[command(
+        about = "Convert a session between Claude Code and Codex",
+        long_about = "Convert a session between Claude Code and Codex.\n\nMessages are carried over as text. Tool calls and results become readable text, reasoning and images stay behind, and the plan lists everything that is left out. Every conversion is journaled, so `rollback` undoes it."
+    )]
+    Convert {
+        #[arg(value_name = "SESSION", help = "Session id or path to a session file")]
+        session: String,
+        #[arg(long, value_name = "TOOL", help = "Target tool (claude or codex)")]
+        to: String,
+        #[arg(long, value_name = "TOOL", help = "Source tool, detected when omitted")]
+        from: Option<String>,
+        #[arg(short, long, help = "Remap the working directory (old:new)")]
+        mappings: Option<String>,
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Target tool directory instead of the default one"
+        )]
+        dest: Option<String>,
+        #[arg(long, help = "Allow writing while the target tool is running")]
+        allow_running: bool,
+        #[arg(long, help = "Print the plan and exit without writing")]
+        dry_run: bool,
+        #[arg(short, long, help = "Skip confirmation prompt")]
+        yes: bool,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
     #[command(about = "Generate shell completion scripts")]
     Completions {
         #[arg(
@@ -411,6 +439,27 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             flat,
             json,
         } => cmd_list(backup_file.as_deref(), flat, json),
+        Commands::Convert {
+            session,
+            to,
+            from,
+            mappings,
+            dest,
+            allow_running,
+            dry_run,
+            yes,
+            json,
+        } => cmd_convert(ConvertArgs {
+            session,
+            to,
+            from,
+            mappings,
+            dest,
+            allow_running,
+            dry_run,
+            yes,
+            json,
+        }),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "aisession-backup", &mut io::stdout());
@@ -665,6 +714,136 @@ pub(crate) fn resolve_decrypt_passphrase(path: &Path) -> Result<Passphrase> {
     Ok(Passphrase::None)
 }
 
+struct ConvertArgs {
+    session: String,
+    to: String,
+    from: Option<String>,
+    mappings: Option<String>,
+    dest: Option<String>,
+    allow_running: bool,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+}
+
+fn convert_tool(raw: &str) -> Result<ProviderId> {
+    match ProviderId::parse(raw.trim()) {
+        Some(id @ (ProviderId::Claude | ProviderId::Codex)) => Ok(id),
+        _ => Err(CliExit::new(
+            EXIT_USAGE,
+            format!("unsupported tool '{}': use claude or codex", sanitize(raw)),
+        )
+        .into()),
+    }
+}
+
+fn cmd_convert(args: ConvertArgs) -> Result<()> {
+    let to = convert_tool(&args.to)?;
+    let from = args.from.as_deref().map(convert_tool).transpose()?;
+    let mappings = parse_mappings(args.mappings.as_deref().unwrap_or(""))
+        .map_err(|err| CliExit::new(EXIT_USAGE, format!("{err:#}")))?;
+    let claude_dir = resolve_claude_dir(None);
+    let homes = default_provider_homes(&claude_dir);
+    let (found_from, source) = crate::convert::find_session(&args.session, from, &homes)?;
+    let target_home = match &args.dest {
+        Some(dest) => expand_path(dest),
+        None => homes
+            .get(&to)
+            .cloned()
+            .context("target tool directory not found; pass --dest")?,
+    };
+    let request = crate::convert::ConvertRequest {
+        source,
+        from: Some(from.unwrap_or(found_from)),
+        to,
+        target_home,
+        mappings,
+        allow_running: args.allow_running,
+    };
+    run_conversion(&request, args.dry_run, args.yes, args.json)
+}
+
+pub(crate) fn conversion_request(
+    source: PathBuf,
+    from: ProviderId,
+    to: ProviderId,
+    claude_dir: &Path,
+) -> Result<crate::convert::ConvertRequest> {
+    let target_home = default_provider_homes(claude_dir)
+        .remove(&to)
+        .context("target tool directory not found")?;
+    Ok(crate::convert::ConvertRequest {
+        source,
+        from: Some(from),
+        to,
+        target_home,
+        mappings: BTreeMap::new(),
+        allow_running: false,
+    })
+}
+
+pub(crate) fn run_conversion(
+    request: &crate::convert::ConvertRequest,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    let prepared = crate::convert::prepare(request)?;
+    let summary = &prepared.summary;
+    if !json {
+        eprintln!(
+            "{} session {} -> {} ({} message(s)) in {}",
+            summary.from.as_str(),
+            sanitize(&summary.source_session),
+            summary.to.as_str(),
+            summary.messages,
+            sanitize(&summary.cwd)
+        );
+    }
+    if dry_run {
+        if json {
+            ui::print_json(&serde_json::json!({"summary": summary, "plan": prepared.plan}))?;
+        } else {
+            ui::print_plan(&prepared.plan, false);
+        }
+        return Ok(());
+    }
+    if prepared.plan.has_refusals() {
+        if json {
+            ui::print_json(&prepared.plan)?;
+        } else {
+            ui::print_plan(&prepared.plan, false);
+        }
+        return Err(CliExit::new(
+            EXIT_PLAN_REFUSED,
+            "conversion plan contains refused operations",
+        )
+        .into());
+    }
+    confirm_or_abort(&prepared.plan, yes, json)?;
+    let report = crate::convert::apply(prepared)?;
+    if json {
+        return ui::print_json(&report);
+    }
+    if report.written == 0 {
+        println!(
+            "Already converted: {}",
+            sanitize(&report.summary.session_id)
+        );
+    } else {
+        println!(
+            "Converted into {} session {}",
+            report.summary.to.as_str(),
+            sanitize(&report.summary.session_id)
+        );
+        if let Some(id) = &report.journal_id {
+            println!("  Undo with: aisession-backup rollback {}", sanitize(id));
+        }
+    }
+    println!("  Resume with: {}", sanitize(&report.summary.resume));
+    Ok(())
+}
+
 fn confirm_or_abort(plan: &crate::plan::Plan, yes: bool, json_mode: bool) -> Result<()> {
     if yes {
         return Ok(());
@@ -867,7 +1046,7 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
     let ext = if args.encrypt { "tar.gz.age" } else { "tar.gz" };
     let output_str = args.output.unwrap_or_else(|| {
         format!(
-            "claude-backup-{}.{ext}",
+            "aisession-backup-{}.{ext}",
             chrono::Local::now().format("%Y%m%d-%H%M%S")
         )
     });

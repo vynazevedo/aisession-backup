@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::engine::{self, Passphrase, PreparedRestore, RestoreReport, RestoreRequest};
 use crate::model::{Manifest, Session};
@@ -13,8 +13,9 @@ use crate::provider::ProviderId;
 use crate::remap;
 use crate::ui::sanitize;
 
-use super::groups::{GroupPicker, PICKER_HELP};
-use super::{current_user, render_plan_lines, with_terminal, Tui};
+use super::groups::{GroupPicker, PICKER_HELP_KEYS, PICKER_KEYS};
+use super::theme::{self, Icon, Scroll, Theme};
+use super::{current_user, with_terminal, Tui};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RestoreStep {
@@ -37,6 +38,8 @@ pub struct RestoreApp {
     pub claude_dir: PathBuf,
     pub flags: super::RestoreFlags,
     pub picker: GroupPicker,
+    pub show_help: bool,
+    plan_scroll: Scroll,
     item_refs: Vec<(ProviderId, String, Option<String>)>,
     pub step: RestoreStep,
     pub rows: Vec<MapRow>,
@@ -75,6 +78,8 @@ impl RestoreApp {
             claude_dir: claude_dir.to_path_buf(),
             flags,
             picker,
+            show_help: false,
+            plan_scroll: Scroll::default(),
             item_refs,
             step: RestoreStep::Select,
             rows: Vec::new(),
@@ -192,6 +197,19 @@ impl RestoreApp {
     }
 
     pub fn handle_key(&mut self, code: KeyCode) {
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+        let help_allowed = match self.step {
+            RestoreStep::Select => !self.picker.filtering,
+            RestoreStep::Preview => true,
+            _ => false,
+        };
+        if code == KeyCode::Char('?') && help_allowed {
+            self.show_help = true;
+            return;
+        }
         match self.step {
             RestoreStep::Select => {
                 if self.picker.filtering {
@@ -286,7 +304,9 @@ impl RestoreApp {
                     self.flags.overwrite_config = !self.flags.overwrite_config;
                     self.invalidate_plan();
                 }
-                _ => {}
+                _ => {
+                    self.plan_scroll.handle_key(code);
+                }
             },
             RestoreStep::Done => {}
         }
@@ -316,6 +336,7 @@ impl RestoreApp {
     fn run(&mut self, terminal: &mut Tui) -> Result<()> {
         loop {
             if self.step == RestoreStep::Preview && self.plan.is_none() {
+                self.plan_scroll = Scroll::default();
                 let req = self.build_restore_request();
                 match engine::prepare_restore(req) {
                     Ok(prepared) => {
@@ -349,150 +370,220 @@ impl RestoreApp {
     }
 
     fn draw_select(&mut self, f: &mut Frame) {
-        let chunks = vchunks(f.area(), &[2, 0, 2]);
+        let theme = theme::current();
+        let [top, body, bottom] = theme::frame_layout(f.area());
         let m = &self.manifest;
-        let header = Paragraph::new(format!(
-            "Restore - {}/{} selected | source: {} ({}){}",
+        let context = format!(
+            "{}/{} selected  |  from {} ({})",
             self.picker.selected_count(),
             self.picker.entries.len(),
             sanitize(&m.source_host),
-            sanitize(&m.source_os),
-            self.picker.filter_suffix()
-        ))
-        .style(bold());
-        f.render_widget(header, chunks[0]);
-
-        let list = List::new(self.picker.list_items())
-            .block(Block::default().borders(Borders::ALL).title("Directories"))
-            .highlight_style(highlight())
-            .highlight_symbol("> ");
-        f.render_stateful_widget(list, chunks[1], &mut self.picker.state);
-
-        let hint = format!("{PICKER_HELP} | p proceed | q quit");
-        f.render_widget(help(&hint), chunks[2]);
+            sanitize(&m.source_os)
+        );
+        f.render_widget(theme::header(theme, "Restore", &context), top);
+        self.picker
+            .render(f, body, theme, "Directories in the archive");
+        let mut keys = PICKER_KEYS.to_vec();
+        if self.selected_count() > 0 {
+            keys.insert(0, ("p", "proceed"));
+        }
+        keys.push(("q", "quit"));
+        f.render_widget(theme::footer(theme, &keys), bottom);
+        if self.show_help {
+            let mut keys = PICKER_HELP_KEYS.to_vec();
+            keys.push(("p", "map paths and review the plan"));
+            theme::render_help(f, theme, "Keys", &keys);
+        }
     }
 
     fn draw_mapping(&mut self, f: &mut Frame) {
-        let chunks = vchunks(f.area(), &[3, 0, 2]);
-        let info = Paragraph::new(format!(
-            "Path Mapping  (source {} -> target {})\nEdit destination for each project root:",
+        let theme = theme::current();
+        let [top, body, bottom] = theme::frame_layout(f.area());
+        let context = format!(
+            "{} {} {}",
             sanitize(&self.manifest.source_os),
+            theme.icon(Icon::Arrow),
             std::env::consts::OS
-        ))
-        .style(bold());
-        f.render_widget(info, chunks[0]);
+        );
+        f.render_widget(theme::header(theme, "Path mapping", &context), top);
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                "Type the destination of each directory. Leave it unchanged to keep the path.",
+                theme.muted(),
+            )),
+            Line::from(""),
+        ];
         for (i, row) in self.rows.iter().enumerate() {
-            let marker = if i == self.focus { "> " } else { "  " };
-            lines.push(Line::from(vec![Span::styled(
-                format!(
-                    "{}{}  ({} sessions)",
-                    marker,
-                    sanitize(&row.root),
-                    row.count
-                ),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            )]));
-            let cursor = if i == self.focus { "_" } else { "" };
-            lines.push(Line::from(format!(
-                "    -> {}{}",
-                sanitize(&row.value),
-                cursor
-            )));
+            let focused = i == self.focus;
+            lines.push(Line::from(vec![
+                Span::styled(if focused { "> " } else { "  " }, theme.accent()),
+                Span::styled(format!("{} ", theme.icon(Icon::Folder)), theme.accent()),
+                Span::styled(sanitize(&row.root), theme.strong()),
+                Span::styled(format!("  {} item(s)", row.count), theme.muted()),
+            ]));
+            let value_style = if focused {
+                theme.selected_row()
+            } else if row.value == row.root {
+                theme.muted()
+            } else {
+                theme.success()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {} ", theme.icon(Icon::Arrow)), theme.accent()),
+                Span::styled(sanitize(&row.value), value_style),
+                Span::styled(if focused { "_" } else { "" }, theme.accent()),
+            ]));
             lines.push(Line::from(""));
         }
-        let body = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL))
-            .wrap(Wrap { trim: false });
-        f.render_widget(body, chunks[1]);
+        if self.rows.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No directory to map in the selection.",
+                theme.muted(),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(theme.panel("Destinations"))
+                .wrap(Wrap { trim: false }),
+            body,
+        );
+        match &self.mapping_error {
+            Some(err) => f.render_widget(theme::status_line(theme, err, true), bottom),
+            None => f.render_widget(
+                theme::footer(
+                    theme,
+                    &[
+                        ("enter", "review plan"),
+                        ("tab", "next"),
+                        ("shift-tab", "previous"),
+                        ("type", "edit"),
+                        ("esc", "back"),
+                    ],
+                ),
+                bottom,
+            ),
+        }
+    }
 
-        let hint = match &self.mapping_error {
-            Some(err) => sanitize(err),
-            None => "tab/down next | shift-tab/up prev | type to edit | enter confirm | esc back"
-                .to_string(),
-        };
-        f.render_widget(help(&hint), chunks[2]);
+    fn toggle_spans(&self, theme: &Theme) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        for (key, label, on) in [
+            ("r", "allow-running", self.flags.allow_running),
+            ("x", "exec-config", self.flags.allow_exec_config),
+            ("c", "credentials", self.flags.allow_credentials),
+            ("o", "overwrite", self.flags.overwrite_config),
+        ] {
+            spans.push(Span::styled(format!(" {key} "), theme.key()));
+            spans.push(Span::styled(format!(" {label} "), theme.muted()));
+            spans.push(if on {
+                Span::styled("ON  ", theme.warning())
+            } else {
+                Span::styled("off  ", theme.muted())
+            });
+        }
+        spans
     }
 
     fn draw_preview(&mut self, f: &mut Frame) {
-        let chunks = vchunks(f.area(), &[2, 0, 2]);
-        let title = Paragraph::new(if self.flags.dry_run {
-            "Confirm Restore Plan (DRY RUN)"
+        let theme = theme::current();
+        let [top, body, bottom] = theme::frame_layout(f.area());
+        let title = if self.flags.dry_run {
+            "Restore plan (dry run)"
         } else {
-            "Confirm Restore Plan"
-        })
-        .style(bold());
-        f.render_widget(title, chunks[0]);
-
-        let lines = render_plan_lines(self.plan.as_ref());
-        let body = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Plan"))
-            .wrap(Wrap { trim: false });
-        f.render_widget(body, chunks[1]);
-
-        let hint = self.preview_help();
-        f.render_widget(help(&hint), chunks[2]);
+            "Restore plan"
+        };
+        f.render_widget(
+            theme::header(
+                theme,
+                title,
+                &format!("{} item(s) selected", self.selected_count()),
+            ),
+            top,
+        );
+        theme::render_plan(f, body, theme, self.plan.as_ref(), &mut self.plan_scroll);
+        let blocked = self.plan.as_ref().is_some_and(Plan::has_refusals);
+        let mut keys = theme::PLAN_KEYS.to_vec();
+        keys.insert(
+            0,
+            if blocked {
+                ("blocked", "resolve REFUSE first")
+            } else {
+                ("enter", "restore")
+            },
+        );
+        keys.extend([("esc", "back"), ("?", "help"), ("q", "quit")]);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(bottom);
+        f.render_widget(theme::footer(theme, &keys), rows[0]);
+        f.render_widget(
+            Paragraph::new(Line::from(self.toggle_spans(theme))),
+            rows[1],
+        );
+        if self.show_help {
+            theme::render_help(
+                f,
+                theme,
+                "Keys",
+                &[
+                    ("j/k", "scroll the plan"),
+                    ("g / G", "top or end of the plan"),
+                    ("r", "allow restoring while the provider runs"),
+                    ("x", "allow config that executes code"),
+                    ("c", "allow login credentials"),
+                    ("o", "allow overwriting existing files"),
+                    ("enter / y", "restore, when nothing is refused"),
+                    ("esc", "back to the mapping"),
+                    ("q", "quit without writing"),
+                ],
+            );
+        }
     }
 
     fn draw_done(&mut self, f: &mut Frame) {
-        let chunks = vchunks(f.area(), &[2, 0, 2]);
-        f.render_widget(Paragraph::new("Restore Complete").style(bold()), chunks[0]);
-
+        let theme = theme::current();
+        let [top, body, bottom] = theme::frame_layout(f.area());
+        f.render_widget(theme::header(theme, "Restore complete", ""), top);
         let mut lines: Vec<Line> = Vec::new();
         if let Some(r) = &self.report {
-            lines.push(Line::from(format!("Written: {}", r.written)));
-            lines.push(Line::from(format!("Merged:  {}", r.merged)));
-            lines.push(Line::from(format!("Skipped: {}", r.skipped)));
-            lines.push(Line::from(format!("Failed:  {}", r.failed.len())));
+            let failed_style = if r.failed.is_empty() {
+                theme.muted()
+            } else {
+                theme.danger()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("written  {}", r.written),
+                theme.success(),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("merged   {}", r.merged),
+                theme.info(),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("skipped  {}", r.skipped),
+                theme.muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("failed   {}", r.failed.len()),
+                failed_style,
+            )));
             for err in &r.failed {
                 lines.push(Line::from(Span::styled(
-                    format!("x {}", sanitize(err)),
-                    Style::default().fg(Color::Red),
+                    format!("{} {}", theme.icon(Icon::Warning), sanitize(err)),
+                    theme.danger(),
                 )));
             }
         }
-        let body = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL))
-            .wrap(Wrap { trim: false });
-        f.render_widget(body, chunks[1]);
-        f.render_widget(help("enter or q to exit"), chunks[2]);
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(theme.panel("Result"))
+                .wrap(Wrap { trim: false }),
+            body,
+        );
+        f.render_widget(theme::footer(theme, &[("enter", "exit")]), bottom);
     }
-}
-
-fn vchunks(area: Rect, sizes: &[u16]) -> std::rc::Rc<[Rect]> {
-    let constraints: Vec<Constraint> = sizes
-        .iter()
-        .map(|&s| {
-            if s == 0 {
-                Constraint::Min(1)
-            } else {
-                Constraint::Length(s)
-            }
-        })
-        .collect();
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area)
-}
-
-fn bold() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-
-fn highlight() -> Style {
-    Style::default()
-        .bg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD)
-}
-
-fn help(text: &str) -> Paragraph<'_> {
-    Paragraph::new(text)
-        .style(Style::default().fg(Color::DarkGray))
-        .wrap(Wrap { trim: true })
 }
 
 pub fn run_restore(
