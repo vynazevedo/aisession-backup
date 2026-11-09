@@ -98,3 +98,34 @@ jobs:
           merge-multiple: true
       - name: Restore archives from every platform
         run: python .github/scripts/portability.py restore portability ${{ matrix.runner }}
+
+  resume-check:
+    name: Resume check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLAUDE_VERSION: "2.1.319"
+      CODEX_VERSION: "0.167.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build
+        run: cargo build --locked
+      - name: Install pinned real CLIs
+        shell: bash
+        run: |
+          export HOME="$(mktemp -d)"
+          export CLAUDE_CONFIG_DIR="$HOME/.claude"
+          export CODEX_HOME="$HOME/.codex"
+          export AISESSION_BACKUP_DATA_DIR="$HOME/data"
+          export NPM_CONFIG_USERCONFIG=/dev/null
+          npm install --global "@anthropic-ai/claude-code@$CLAUDE_VERSION" "@openai/codex@$CODEX_VERSION"
+      - name: Resume converted and restored sessions in real CLIs
+        run: python .github/scripts/resume_check.py
