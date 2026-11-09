@@ -29,14 +29,20 @@ Grok, Gemini, Antigravity, Maestri and OpenCode.
 | Maestri | `maestri` | Workspaces, notas, preferências e layout | `workingDirectory` dos workspaces e terminais |
 | OpenCode | `opencode` | `storage/` | Nenhum: cópia literal, formato não validado |
 
+Bancos SQLite, como o estado do Codex, as conversas do Antigravity e os índices do
+Grok, são copiados pela API de backup do próprio SQLite. A cópia é consistente
+mesmo com a ferramenta aberta, inclui o que ainda estava só no WAL e passa por
+`quick_check` antes de entrar no arquivo. Os `-wal` e `-shm` desses bancos ficam
+de fora, porque a cópia já é completa. Se o SQLite não conseguir abrir o banco, ele
+é copiado como arquivo comum e o relatório do backup avisa.
+
 Limitações conhecidas:
 
 - Conversas do Antigravity (`conversations/*.db`) e bancos SQLite do Codex são
   copiados sem reescrita interna. Eles continuam citando os paths antigos, e o
   índice de threads do Codex não é atualizado.
 - Diretórios do Gemini identificados por hash continuam sob o hash antigo.
-- Um banco SQLite em uso pode ser copiado em estado intermediário. Para esses
-  arquivos, feche a ferramenta antes do backup.
+
 
 ---
 
