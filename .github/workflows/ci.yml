@@ -156,7 +156,7 @@ jobs:
           done
           echo "RustFS answered with HTTP $code"
       - name: Repository contract and round trip against S3
-        run: cargo test --locked --test remote_s3 -- --nocapture
+        run: cargo test --locked --test remote_s3 --test hostile_repo -- --nocapture
       - name: Server log on failure
         if: failure()
         run: docker logs rustfs 2>&1 | tail -n 100
