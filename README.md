@@ -341,7 +341,18 @@ aisession-backup restore tudo.tar.gz.age --dest /tmp/teste/.claude --provider cl
 
 Na tela inicial, `enter` abre os itens de um provedor e `d` abre os de todos os
 provedores juntos. Tecle `b` para o backup ou `r` para o restore. Toda escrita passa
-por uma tela com o plano real.
+por uma tela com o plano real, com contadores por ação e risco e rolagem com `j`, `k`,
+`g` e `G`. Em qualquer tela de seleção ou de plano, `?` mostra todas as teclas.
+
+Cada provedor tem uma cor, e telas com 100 colunas ou mais mostram um painel de
+detalhes do diretório ou item selecionado. `NO_COLOR` desativa as cores. Para usar
+ícones, instale uma [Nerd Font](https://www.nerdfonts.com) no terminal e defina:
+
+```bash
+export AISESSION_BACKUP_ICONS=nerd
+```
+
+Sem essa variável, a interface usa só texto, que funciona em qualquer terminal.
 
 As telas de seleção mostram uma linha por diretório, com itens selecionados, tamanho,
 última atividade e quantidade por provedor. A ordem é da atividade mais recente para
@@ -446,6 +457,7 @@ O que essas proteções não garantem:
 | `AISESSION_BACKUP_DATA_DIR` | Base do journal de restores |
 | `AISESSION_BACKUP_MAX_ARCHIVE_BYTES` | Limite do tamanho total extraído |
 | `NO_COLOR` | Desativa cores |
+| `AISESSION_BACKUP_ICONS` | `nerd` ativa ícones da Nerd Font na interface |
 
 ---
 
