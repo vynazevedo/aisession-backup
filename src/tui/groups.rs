@@ -41,6 +41,79 @@ pub struct GroupPicker {
     expanded: Vec<bool>,
     opened_by_filter: Vec<bool>,
     visible: Vec<Vec<usize>>,
+    order: Vec<usize>,
+    depth: Vec<usize>,
+    multi_provider: bool,
+    short_ids: bool,
+}
+
+fn is_ancestor(parent: &str, child: &str) -> bool {
+    let parent = parent.trim_end_matches(['/', '\\']);
+    child.len() > parent.len()
+        && child.starts_with(parent)
+        && child[parent.len()..].starts_with(['/', '\\'])
+}
+
+fn tree_order(groups: &[DirGroup]) -> (Vec<usize>, Vec<usize>) {
+    let parent: Vec<Option<usize>> = groups
+        .iter()
+        .map(|group| {
+            let cwd = group.cwd.as_deref()?;
+            groups
+                .iter()
+                .enumerate()
+                .filter_map(|(index, other)| {
+                    let other_cwd = other.cwd.as_deref()?;
+                    is_ancestor(other_cwd, cwd).then_some((index, other_cwd.len()))
+                })
+                .max_by_key(|(_, len)| *len)
+                .map(|(index, _)| index)
+        })
+        .collect();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); groups.len()];
+    let mut roots = Vec::new();
+    for (index, parent) in parent.iter().enumerate() {
+        match parent {
+            Some(parent) => children[*parent].push(index),
+            None => roots.push(index),
+        }
+    }
+    fn latest(
+        index: usize,
+        groups: &[DirGroup],
+        children: &[Vec<usize>],
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        children[index]
+            .iter()
+            .filter_map(|&child| latest(child, groups, children))
+            .chain(groups[index].latest)
+            .max()
+    }
+    let newest: Vec<_> = (0..groups.len())
+        .map(|index| latest(index, groups, &children))
+        .collect();
+    let key = |index: &usize| {
+        (
+            groups[*index].cwd.is_none(),
+            std::cmp::Reverse(newest[*index]),
+            groups[*index].cwd.clone(),
+        )
+    };
+    roots.sort_by_key(key);
+    for list in &mut children {
+        list.sort_by_key(key);
+    }
+    let mut order = Vec::with_capacity(groups.len());
+    let mut depth = vec![0; groups.len()];
+    let mut stack: Vec<(usize, usize)> = roots.into_iter().rev().map(|root| (root, 0)).collect();
+    while let Some((index, level)) = stack.pop() {
+        order.push(index);
+        depth[index] = level;
+        for &child in children[index].iter().rev() {
+            stack.push((child, level + 1));
+        }
+    }
+    (order, depth)
 }
 
 impl GroupPicker {
@@ -48,6 +121,13 @@ impl GroupPicker {
         selected.resize(entries.len(), false);
         let groups = group_entries(&entries);
         let count = groups.len();
+        let (order, depth) = tree_order(&groups);
+        let multi_provider = entries
+            .iter()
+            .map(|entry| entry.provider.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1;
         let mut picker = Self {
             entries,
             selected,
@@ -59,6 +139,10 @@ impl GroupPicker {
             expanded: vec![false; count],
             opened_by_filter: vec![false; count],
             visible: vec![Vec::new(); count],
+            order,
+            depth,
+            multi_provider,
+            short_ids: false,
         };
         picker.apply_filter();
         picker
@@ -121,7 +205,8 @@ impl GroupPicker {
     fn rebuild_rows(&mut self) {
         let current = self.current();
         self.rows.clear();
-        for group in 0..self.groups.len() {
+        for position in 0..self.order.len() {
+            let group = self.order[position];
             if self.visible[group].is_empty() {
                 continue;
             }
@@ -231,6 +316,11 @@ impl GroupPicker {
             }
             return true;
         }
+        if code == KeyCode::Esc && !self.filter.is_empty() {
+            self.filter.clear();
+            self.apply_filter();
+            return true;
+        }
         match code {
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
@@ -240,7 +330,9 @@ impl GroupPicker {
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Enter => self.toggle_open_current(),
             KeyCode::Right | KeyCode::Char('l') => self.expand_current(),
-            KeyCode::Left | KeyCode::Char('h') => return self.collapse_current(),
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.collapse_current();
+            }
             _ => return false,
         }
         true
@@ -315,7 +407,61 @@ impl GroupPicker {
         spans
     }
 
+    pub fn entry_label(&self, entry: usize) -> String {
+        let item = &self.entries[entry];
+        let same_as_cwd = item.cwd.as_deref() == Some(item.label.as_str());
+        if item.label.trim().is_empty() || same_as_cwd {
+            let short: String = item.id.chars().take(8).collect();
+            format!("session {}", sanitize(&short))
+        } else {
+            sanitize(item.label.lines().next().unwrap_or_default())
+        }
+    }
+
+    fn provider_column_width(&self) -> usize {
+        if !self.multi_provider {
+            return 0;
+        }
+        self.groups
+            .iter()
+            .map(|group| {
+                group
+                    .providers
+                    .iter()
+                    .map(|(name, count)| {
+                        sanitize(name).chars().count() + count.to_string().len() + 2
+                    })
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn matches(&self) -> usize {
+        self.visible.iter().map(Vec::len).sum()
+    }
+
+    fn fit(text: String, width: usize, keep_tail: bool) -> String {
+        let count = text.chars().count();
+        if count <= width {
+            return format!("{text:<width$}");
+        }
+        if keep_tail {
+            return super::theme::truncate_left(&text, width);
+        }
+        if width == 0 {
+            return String::new();
+        }
+        let head: String = text.chars().take(width - 1).collect();
+        format!("{head}\u{2026}")
+    }
+
     pub fn row_line(&self, row: PickRow, theme: &Theme) -> Line<'static> {
+        self.row_line_width(row, theme, 100)
+    }
+
+    pub fn row_line_width(&self, row: PickRow, theme: &Theme, width: usize) -> Line<'static> {
+        let right = 9 + 1 + 10;
         match row {
             PickRow::Group(index) => {
                 let group = &self.groups[index];
@@ -329,61 +475,86 @@ impl GroupPicker {
                 } else {
                     Icon::Folder
                 };
+                let indent = "  ".repeat(self.depth[index]);
+                let count = format!("{:>7}", format!("{chosen}/{}", group.members.len()));
+                let providers = if self.multi_provider {
+                    self.provider_spans(group, theme)
+                } else {
+                    Vec::new()
+                };
+                let provider_width = self.provider_column_width();
+                let fixed = indent.len() + 4 + 1 + count.len() + 1 + right + provider_width;
+                let name_width = width.saturating_sub(fixed).max(8);
                 let mut spans = vec![
+                    Span::raw(indent),
                     self.mark_span(self.mark(index), theme),
                     Span::raw(" "),
                     Span::styled(theme.icon(folder).to_string(), theme.accent()),
                     Span::raw(" "),
-                    Span::styled(group.title(), theme.strong()),
+                    Span::styled(Self::fit(group.title(), name_width, true), theme.strong()),
+                    Span::styled(format!(" {count}"), theme.muted()),
                     Span::styled(
                         format!(
-                            "  {chosen}/{}  {}  {}",
-                            group.members.len(),
+                            " {:>9} {:>10}",
                             human_size(group.size),
                             format_date(group.latest)
                         ),
                         theme.muted(),
                     ),
                 ];
-                spans.extend(self.provider_spans(group, theme));
+                spans.extend(providers);
                 Line::from(spans)
             }
-            PickRow::Entry { entry, .. } => {
+            PickRow::Entry { group, entry } => {
                 let item = &self.entries[entry];
                 let mark = if self.selected[entry] {
                     Mark::Full
                 } else {
                     Mark::Empty
                 };
-                let label = if item.label.is_empty() {
-                    sanitize(&item.id)
+                let indent = "  ".repeat(self.depth[group] + 2);
+                let provider = if self.multi_provider {
+                    format!(" {}", sanitize(&item.provider))
                 } else {
-                    sanitize(&item.label)
+                    String::new()
                 };
+                let fixed = indent.len() + 2 + 8 + right + 1 + self.provider_column_width();
+                let name_width = width.saturating_sub(fixed).max(8);
                 Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw(indent),
                     self.mark_span(mark, theme),
                     Span::raw(" "),
-                    Span::raw(label),
-                    Span::raw("  "),
-                    Span::styled(sanitize(&item.provider), theme.provider(&item.provider)),
+                    Span::raw(Self::fit(self.entry_label(entry), name_width, false)),
+                    Span::styled(
+                        if self.short_ids && !self.entry_label(entry).starts_with("session ") {
+                            format!(" {:<7}", item.id.chars().take(7).collect::<String>())
+                        } else {
+                            " ".repeat(8)
+                        },
+                        theme.muted(),
+                    ),
                     Span::styled(
                         format!(
-                            "  {}  {}",
+                            " {:>9} {:>10}",
                             human_size(item.size),
                             format_date(item.updated_at)
                         ),
                         theme.muted(),
                     ),
+                    Span::styled(provider, theme.provider(&item.provider)),
                 ])
             }
         }
     }
 
     pub fn list_items(&self, theme: &Theme) -> Vec<ListItem<'static>> {
+        self.list_items_width(theme, 100)
+    }
+
+    pub fn list_items_width(&self, theme: &Theme, width: usize) -> Vec<ListItem<'static>> {
         self.rows
             .iter()
-            .map(|&row| ListItem::new(self.row_line(row, theme)))
+            .map(|&row| ListItem::new(self.row_line_width(row, theme, width)))
             .collect()
     }
 
@@ -407,37 +578,29 @@ impl GroupPicker {
                     vec![Span::styled(format!("{:<10}", "providers"), theme.muted())];
                 providers.extend(self.provider_spans(group, theme));
                 vec![
+                    Line::from(Span::styled("Directory", theme.muted())),
                     Line::from(Span::styled(group.title(), theme.accent())),
                     Line::from(""),
-                    Self::field(theme, "items", group.members.len().to_string()),
-                    Self::field(theme, "selected", chosen.to_string()),
+                    Self::field(
+                        theme,
+                        "items",
+                        format!("{chosen} of {} selected", group.members.len()),
+                    ),
+                    Line::from(providers),
                     Self::field(theme, "size", human_size(group.size)),
                     Self::field(theme, "last", format_date(group.latest)),
-                    Line::from(providers),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "space selects the whole directory, enter opens it",
-                        theme.muted(),
-                    )),
                 ]
             }
             Some(PickRow::Entry { entry, .. }) => {
                 let item = &self.entries[entry];
-                let title = if item.label.is_empty() {
-                    sanitize(&item.id)
-                } else {
-                    sanitize(&item.label)
-                };
                 let mut lines = vec![
-                    Line::from(Span::styled(title, theme.accent())),
+                    Line::from(Span::styled(self.entry_label(entry), theme.accent())),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled(format!("{:<10}", "provider"), theme.muted()),
                         Span::styled(sanitize(&item.provider), theme.provider(&item.provider)),
                     ]),
                     Self::field(theme, "id", sanitize(&item.id)),
-                    Self::field(theme, "size", human_size(item.size)),
-                    Self::field(theme, "updated", format_date(item.updated_at)),
                     Self::field(
                         theme,
                         "directory",
@@ -446,45 +609,104 @@ impl GroupPicker {
                             .map(sanitize)
                             .unwrap_or_else(|| crate::grouping::NO_DIRECTORY.to_string()),
                     ),
+                    Self::field(theme, "size", human_size(item.size)),
+                    Self::field(theme, "updated", format_date(item.updated_at)),
                 ];
                 if !item.detail.is_empty() {
                     lines.push(Self::field(theme, "detail", sanitize(&item.detail)));
                 }
-                lines.push(Self::field(
-                    theme,
-                    "selected",
-                    if self.selected[entry] { "yes" } else { "no" }.to_string(),
-                ));
+                if !item.label.is_empty() && item.label.lines().count() > 1 {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        sanitize(&item.label),
+                        theme.muted(),
+                    )));
+                }
                 lines
             }
-            None => vec![Line::from(Span::styled(
-                if self.filter.is_empty() {
-                    "Nothing to show."
-                } else {
-                    "No item matches the filter."
-                },
-                theme.muted(),
-            ))],
+            None => vec![Line::from(Span::styled("Nothing selected.", theme.muted()))],
+        }
+    }
+
+    fn empty_message(&self) -> String {
+        if self.filter.is_empty() {
+            "Nothing to show here.".to_string()
+        } else {
+            format!("No item matches \"{}\".", sanitize(&self.filter))
+        }
+    }
+
+    pub fn esc_label(&self) -> &'static str {
+        if self.filtering {
+            "done"
+        } else if !self.filter.is_empty() {
+            "clear filter"
+        } else {
+            "back"
         }
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, theme: &Theme, title: &str) {
-        let (list_area, detail_area) = split_with_details(area);
-        let title = if self.filter.is_empty() && !self.filtering {
-            title.to_string()
+        let show_filter = self.filtering || !self.filter.is_empty();
+        let (filter_area, area) = if show_filter && area.height > 3 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(area);
+            (Some(chunks[0]), chunks[1])
         } else {
-            format!(
-                "{title}  {} {}{}",
-                theme.icon(Icon::Search),
-                sanitize(&self.filter),
-                if self.filtering { "_" } else { "" }
-            )
+            (None, area)
         };
-        let list = List::new(self.list_items(theme))
-            .block(theme.panel(&title))
-            .highlight_style(theme.selected_row())
-            .highlight_symbol("> ");
-        f.render_stateful_widget(list, list_area, &mut self.state);
+        if let Some(filter_area) = filter_area {
+            let mut spans = vec![
+                Span::styled(" / ", theme.key()),
+                Span::raw(" "),
+                Span::styled(sanitize(&self.filter), theme.strong()),
+            ];
+            if self.filtering {
+                spans.push(Span::styled("_", theme.accent()));
+            }
+            let matches = self.matches();
+            let count = if matches == 1 {
+                "1 match".to_string()
+            } else {
+                format!("{matches} matches")
+            };
+            spans.push(Span::styled(format!("   {count}"), theme.muted()));
+            spans.push(Span::raw("   "));
+            spans.extend(super::theme::chip_spans(
+                theme,
+                "esc",
+                if self.filtering { "done" } else { "clear" },
+            ));
+            f.render_widget(Paragraph::new(Line::from(spans)), filter_area);
+        }
+        let (list_area, detail_area) = split_with_details(area);
+        self.short_ids = detail_area.is_none();
+        let block = theme.panel(title);
+        if self.rows.is_empty() {
+            let inner = block.inner(list_area);
+            f.render_widget(block, list_area);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    self.empty_message(),
+                    theme.muted(),
+                ))),
+                Rect {
+                    x: inner.x.saturating_add(1),
+                    width: inner.width.saturating_sub(1),
+                    height: inner.height.min(1),
+                    ..inner
+                },
+            );
+        } else {
+            let width = usize::from(list_area.width.saturating_sub(4));
+            let list = List::new(self.list_items_width(theme, width))
+                .block(block)
+                .highlight_style(theme.selected_row())
+                .highlight_symbol("> ");
+            f.render_stateful_widget(list, list_area, &mut self.state);
+        }
         if let Some(detail_area) = detail_area {
             f.render_widget(
                 Paragraph::new(self.detail_lines(theme))
@@ -496,11 +718,9 @@ impl GroupPicker {
     }
 }
 
-pub const PICKER_KEYS: [(&str, &str); 6] = [
+pub const PICKER_KEYS: [(&str, &str); 4] = [
     ("space", "select"),
-    ("enter", "open"),
-    ("h", "close"),
-    ("a/n", "all/none"),
+    ("enter", "open/close"),
     ("/", "filter"),
     ("?", "help"),
 ];
@@ -513,7 +733,7 @@ pub const PICKER_HELP_KEYS: [(&str, &str); 9] = [
     ("j/k", "move"),
     ("a / n", "select or clear everything visible"),
     ("/", "filter by directory, name or id"),
-    ("esc", "leave the filter or go back"),
+    ("esc", "leave the filter, clear it, or go back"),
     ("q", "quit without writing"),
 ];
 
@@ -591,7 +811,9 @@ mod tests {
         picker.handle_key(KeyCode::Enter);
         assert_eq!(picker.rows.len(), 3);
         assert_eq!(picker.current(), Some(PickRow::Group(0)));
-        assert!(!picker.handle_key(KeyCode::Left));
+        let rows = picker.rows.clone();
+        assert!(picker.handle_key(KeyCode::Left));
+        assert_eq!(picker.rows, rows, "h on a closed group does nothing");
     }
 
     #[test]
@@ -682,7 +904,61 @@ mod tests {
             .iter()
             .map(|span| span.content.to_string())
             .collect();
-        assert!(row.contains("claude 2"));
+        assert!(row.contains("0/2"));
+    }
+
+    #[test]
+    fn subdirectories_nest_under_their_parent_and_esc_clears_the_filter() {
+        let mut picker = GroupPicker::new(
+            vec![
+                entry("child", Some("/w/web/admin"), "admin", 9),
+                entry("parent", Some("/w/web"), "web", 1),
+                entry("other", Some("/w/api"), "api", 5),
+                entry("sibling", Some("/w/website"), "site", 2),
+            ],
+            Vec::new(),
+        );
+        let titles: Vec<(String, usize)> = picker
+            .rows
+            .iter()
+            .map(|row| match row {
+                PickRow::Group(g) => (picker.groups[*g].title(), picker.depth[*g]),
+                PickRow::Entry { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                ("/w/web".to_string(), 0),
+                ("/w/web/admin".to_string(), 1),
+                ("/w/api".to_string(), 0),
+                ("/w/website".to_string(), 0),
+            ]
+        );
+        picker.handle_key(KeyCode::Char('/'));
+        picker.handle_key(KeyCode::Char('z'));
+        picker.handle_key(KeyCode::Enter);
+        assert!(picker.rows.is_empty());
+        assert_eq!(picker.empty_message(), "No item matches \"z\".");
+        picker.handle_key(KeyCode::Esc);
+        assert!(picker.filter.is_empty());
+        assert_eq!(picker.rows.len(), 4);
+    }
+
+    #[test]
+    fn rows_fit_the_width_and_hide_the_provider_on_single_provider_lists() {
+        let theme = Theme::new(false, crate::tui::theme::IconSet::Unicode);
+        let picker = picker();
+        for width in [30usize, 60, 120] {
+            let line: String = picker
+                .row_line_width(PickRow::Group(0), &theme, width)
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect();
+            assert!(line.chars().count() <= width.max(42), "{width}: {line}");
+            assert!(!line.contains("claude 2"));
+        }
     }
 
     #[test]

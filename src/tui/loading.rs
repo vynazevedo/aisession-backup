@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Gauge, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::provider::{self, Item, LocateEnv, ProviderId, ScanOptions};
 use crate::ui::{human_size, sanitize};
@@ -17,6 +17,7 @@ const TICK: Duration = Duration::from_millis(80);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadState {
     Scanning,
+    Working(String),
     Done { items: usize, bytes: u64 },
     Missing,
     Failed(String),
@@ -53,9 +54,10 @@ fn row_line(row: &LoadRow, theme: &Theme, frame: usize) -> Line<'static> {
     let (marker, status) = match &row.state {
         LoadState::Scanning => {
             let detail = match (row.id, session_progress()) {
-                (ProviderId::Claude, Some((done, total))) => {
+                (ProviderId::Claude, Some((done, total))) if done < total => {
                     format!("reading sessions {done}/{total}")
                 }
+                (ProviderId::Claude, Some(_)) => "finishing".to_string(),
                 _ => "scanning".to_string(),
             };
             (
@@ -63,10 +65,18 @@ fn row_line(row: &LoadRow, theme: &Theme, frame: usize) -> Line<'static> {
                 Span::styled(detail, theme.info()),
             )
         }
+        LoadState::Working(detail) => (
+            Span::styled(theme.spinner(frame).to_string(), theme.accent()),
+            Span::styled(sanitize(detail), theme.info()),
+        ),
+        LoadState::Done { items: 0, .. } => (
+            Span::styled(theme.icon(Icon::Partial).to_string(), theme.warning()),
+            Span::styled("empty".to_string(), theme.warning()),
+        ),
         LoadState::Done { items, bytes } => (
             Span::styled(theme.icon(Icon::Check).to_string(), theme.success()),
             Span::styled(
-                format!("{items} item(s)  {}", human_size(*bytes)),
+                format!("{}  {}", theme::plural(*items, "item"), human_size(*bytes)),
                 theme.muted(),
             ),
         ),
@@ -91,19 +101,46 @@ fn row_line(row: &LoadRow, theme: &Theme, frame: usize) -> Line<'static> {
     ])
 }
 
+pub struct Meter {
+    pub done: usize,
+    pub total: usize,
+    pub unit: &'static str,
+}
+
+fn meter_line(theme: &Theme, meter: &Meter, width: u16) -> Line<'static> {
+    let label = format!(" {}/{} {} ", meter.done, meter.total, meter.unit);
+    let bar_width = usize::from(width)
+        .saturating_sub(label.chars().count() + 1)
+        .max(1);
+    let filled = (meter.done * bar_width)
+        .checked_div(meter.total)
+        .unwrap_or(bar_width)
+        .min(bar_width);
+    let (full, empty) = if theme.color {
+        ("\u{2588}", "\u{2591}")
+    } else {
+        ("#", ".")
+    };
+    Line::from(vec![
+        Span::styled(full.repeat(filled), theme.accent()),
+        Span::styled(empty.repeat(bar_width - filled), theme.border()),
+        Span::raw(" "),
+        Span::styled(label, theme.key()),
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn draw_loading(
     f: &mut Frame,
     theme: &Theme,
     title: &str,
+    subtitle: &str,
     rows: &[LoadRow],
+    meter: Option<&Meter>,
     elapsed: Duration,
     frame: usize,
 ) {
     let [top, body, bottom] = theme::frame_layout(f.area());
-    let finished = rows
-        .iter()
-        .filter(|row| row.state != LoadState::Scanning)
-        .count();
     f.render_widget(
         theme::header(theme, "Loading", &format!("{:.1}s", elapsed.as_secs_f64())),
         top,
@@ -111,49 +148,47 @@ pub fn draw_loading(
     let block = theme.panel(title);
     let inner = block.inner(body);
     f.render_widget(block, body);
+    let inner = Rect {
+        x: inner.x.saturating_add(1),
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(inner);
-    let claude_reading = rows
-        .iter()
-        .any(|row| row.id == ProviderId::Claude && row.state == LoadState::Scanning);
-    let (ratio, label) = match session_progress() {
-        Some((done, total)) if claude_reading => (
-            done as f64 / total as f64,
-            format!("{done}/{total} Claude Code sessions"),
-        ),
-        _ => (
-            if rows.is_empty() {
-                1.0
-            } else {
-                finished as f64 / rows.len() as f64
-            },
-            format!("{finished}/{} provider(s)", rows.len()),
-        ),
-    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Looking for sessions and settings. Nothing is written while this runs.".to_string(),
+            subtitle.to_string(),
             theme.muted(),
         ))),
         chunks[0],
     );
-    f.render_widget(
-        Gauge::default()
-            .gauge_style(theme.accent())
-            .ratio(ratio.clamp(0.0, 1.0))
-            .label(label),
-        chunks[2],
-    );
+    if let Some(meter) = meter {
+        f.render_widget(
+            Paragraph::new(meter_line(theme, meter, chunks[2].width)),
+            chunks[2],
+        );
+    }
     let lines: Vec<Line> = rows.iter().map(|row| row_line(row, theme, frame)).collect();
-    f.render_widget(Paragraph::new(lines), chunks[3]);
-    f.render_widget(theme::footer(theme, &[("q", "cancel")]), bottom);
+    let list_height = (lines.len() as u16).min(chunks[4].height);
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(list_height),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(chunks[4]);
+    f.render_widget(Paragraph::new(lines), parts[0]);
+    super::art::render_centered(f, parts[2], super::art::logo(theme, frame / 3));
+    theme::render_footer(f, bottom, theme, &[("q", "cancel")]);
 }
 
 type ScanResult = (usize, Option<std::path::PathBuf>, Result<Vec<Item>, String>);
@@ -218,12 +253,22 @@ pub fn scan_providers(
                 scan_error,
             });
         }
+        let meter = Meter {
+            done: rows
+                .iter()
+                .filter(|row| !matches!(row.state, LoadState::Scanning))
+                .count(),
+            total: rows.len(),
+            unit: "providers",
+        };
         terminal.draw(|f| {
             draw_loading(
                 f,
                 theme,
                 "Scanning providers",
+                "Looking for sessions and settings. Nothing is written while this runs.",
                 &rows,
+                Some(&meter),
                 start.elapsed(),
                 frame,
             )
@@ -242,7 +287,8 @@ pub fn scan_providers(
 pub fn run_with_loading<T: Send + 'static>(
     terminal: &mut Tui,
     title: &str,
-    row: (ProviderId, &str),
+    subtitle: &str,
+    row: (ProviderId, &str, &str),
     task: impl FnOnce() -> T + Send + 'static,
 ) -> Result<Option<T>> {
     let (tx, rx) = mpsc::channel();
@@ -250,10 +296,15 @@ pub fn run_with_loading<T: Send + 'static>(
         let _ = tx.send(task());
     });
     let theme = theme::current();
+    let tracks_sessions = row.0 == ProviderId::Claude && row.2.is_empty();
     let rows = vec![LoadRow {
         id: row.0,
         name: row.1.to_string(),
-        state: LoadState::Scanning,
+        state: if tracks_sessions {
+            LoadState::Scanning
+        } else {
+            LoadState::Working(row.2.to_string())
+        },
     }];
     let start = Instant::now();
     let mut frame = 0usize;
@@ -265,7 +316,27 @@ pub fn run_with_loading<T: Send + 'static>(
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        terminal.draw(|f| draw_loading(f, theme, title, &rows, start.elapsed(), frame))?;
+        let meter = if tracks_sessions {
+            session_progress().map(|(done, total)| Meter {
+                done,
+                total,
+                unit: "sessions",
+            })
+        } else {
+            None
+        };
+        terminal.draw(|f| {
+            draw_loading(
+                f,
+                theme,
+                title,
+                subtitle,
+                &rows,
+                meter.as_ref(),
+                start.elapsed(),
+                frame,
+            )
+        })?;
         if cancel_requested(TICK)? {
             return Ok(None);
         }
@@ -309,7 +380,7 @@ mod tests {
 
     #[test]
     fn loading_screen_renders_every_state_at_any_size() {
-        for icons in [IconSet::Text, IconSet::Nerd] {
+        for icons in [IconSet::Text, IconSet::Unicode, IconSet::Nerd] {
             let theme = Theme::new(true, icons);
             for (width, height) in [(1, 1), (20, 5), (100, 20)] {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -320,7 +391,13 @@ mod tests {
                                 f,
                                 &theme,
                                 "Scanning providers",
+                                "Looking for sessions.",
                                 &rows(),
+                                Some(&Meter {
+                                    done: 2,
+                                    total: 4,
+                                    unit: "providers",
+                                }),
                                 Duration::from_millis(1500),
                                 frame,
                             )
@@ -344,15 +421,31 @@ mod tests {
                     .collect()
             })
             .collect();
-        assert!(text[1].contains("3 item(s)"));
+        assert!(text[1].contains("3 items"));
         assert!(text[2].contains("not found"));
         assert!(text[3].contains("scan failed"));
         assert!(text.iter().all(|line| !line.chars().any(char::is_control)));
     }
 
     #[test]
+    fn meter_fits_the_width_and_keeps_its_label() {
+        for color in [true, false] {
+            let theme = Theme::new(color, IconSet::Unicode);
+            let meter = Meter {
+                done: 3,
+                total: 7,
+                unit: "providers",
+            };
+            let line = meter_line(&theme, &meter, 40);
+            let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+            assert_eq!(text.chars().count(), 40, "{text}");
+            assert!(text.ends_with(" 3/7 providers "));
+        }
+    }
+
+    #[test]
     fn spinner_changes_between_frames() {
-        for icons in [IconSet::Text, IconSet::Nerd] {
+        for icons in [IconSet::Text, IconSet::Unicode, IconSet::Nerd] {
             let theme = Theme::new(true, icons);
             assert_ne!(theme.spinner(0), theme.spinner(1));
             assert_eq!(theme.spinner(0), theme.spinner(theme.spinner_len()));

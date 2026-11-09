@@ -1,4 +1,6 @@
+pub mod art;
 pub mod backup_ui;
+pub mod dashboard;
 pub mod groups;
 pub mod loading;
 pub mod restore_ui;
@@ -146,6 +148,7 @@ pub enum HomeScreen {
     ItemPicker,
     ConfirmBackup,
     RestoreInput,
+    ConvertPlan,
     Done,
 }
 
@@ -153,11 +156,6 @@ pub enum HomeScreen {
 pub enum HomeOutcome {
     BackupConfirmed,
     RestoreArchive(PathBuf),
-    Convert {
-        source: PathBuf,
-        from: ProviderId,
-        to: ProviderId,
-    },
     Cancelled,
 }
 
@@ -167,6 +165,7 @@ pub struct HomeState {
     pub provider_cursor: usize,
     pub provider_list_state: TableState,
     pub show_help: bool,
+    pub frame: usize,
     plan_scroll: theme::Scroll,
     pub picker: Option<GroupPicker>,
     picker_refs: Vec<(usize, usize)>,
@@ -174,6 +173,31 @@ pub struct HomeState {
     pub restore_input: String,
     pub plan: Option<Plan>,
     pub outcome: Option<HomeOutcome>,
+    pub status: Option<(String, bool)>,
+    pub conversion: Option<Conversion>,
+    plan_return: HomeScreen,
+}
+
+pub struct Conversion {
+    pub label: String,
+    pub request: crate::convert::ConvertRequest,
+    pub prepared: Option<crate::convert::PreparedConversion>,
+    pub error: Option<String>,
+}
+
+impl Conversion {
+    fn refresh(&mut self) {
+        match crate::convert::prepare(&self.request) {
+            Ok(prepared) => {
+                self.prepared = Some(prepared);
+                self.error = None;
+            }
+            Err(err) => {
+                self.prepared = None;
+                self.error = Some(format!("{err:#}"));
+            }
+        }
+    }
 }
 
 impl HomeState {
@@ -188,6 +212,7 @@ impl HomeState {
             provider_cursor: 0,
             provider_list_state,
             show_help: false,
+            frame: 0,
             plan_scroll: theme::Scroll::default(),
             picker: None,
             picker_refs: Vec::new(),
@@ -195,6 +220,9 @@ impl HomeState {
             restore_input: String::new(),
             plan: None,
             outcome: None,
+            status: None,
+            conversion: None,
+            plan_return: HomeScreen::Providers,
         }
     }
 
@@ -359,6 +387,7 @@ impl HomeState {
         let typing = match self.screen {
             HomeScreen::ItemPicker => self.picker.as_ref().is_some_and(|p| p.filtering),
             HomeScreen::RestoreInput | HomeScreen::Done => true,
+            HomeScreen::ConvertPlan => false,
             _ => false,
         };
         if code == KeyCode::Char('?') && !typing {
@@ -370,6 +399,7 @@ impl HomeState {
             HomeScreen::ItemPicker => self.handle_item_picker_key(code),
             HomeScreen::ConfirmBackup => self.handle_confirm_key(code),
             HomeScreen::RestoreInput => self.handle_restore_input_key(code),
+            HomeScreen::ConvertPlan => self.handle_convert_key(code),
             HomeScreen::Done => {}
         }
     }
@@ -417,6 +447,7 @@ impl HomeState {
                 }
             }
             KeyCode::Char('b') if self.total_selected_items() > 0 => {
+                self.plan_return = HomeScreen::Providers;
                 self.screen = HomeScreen::ConfirmBackup;
             }
             KeyCode::Char('r') => {
@@ -437,6 +468,9 @@ impl HomeState {
             return;
         }
         match code {
+            KeyCode::Esc if !picker.filter.is_empty() => {
+                picker.handle_key(code);
+            }
             KeyCode::Esc => self.screen = HomeScreen::Providers,
             KeyCode::Char('q') => {
                 self.outcome = Some(HomeOutcome::Cancelled);
@@ -444,20 +478,11 @@ impl HomeState {
             }
             KeyCode::Char('b') => {
                 if self.total_selected_items() > 0 {
+                    self.plan_return = HomeScreen::ItemPicker;
                     self.screen = HomeScreen::ConfirmBackup;
                 }
             }
-            KeyCode::Char('t') => {
-                if let Some((source, from, to)) = self.convertible_current() {
-                    self.outcome = Some(HomeOutcome::Convert { source, from, to });
-                    self.screen = HomeScreen::Done;
-                }
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if !picker.handle_key(code) {
-                    self.screen = HomeScreen::Providers;
-                }
-            }
+            KeyCode::Char('t') => self.start_conversion(),
             _ => {
                 picker.handle_key(code);
                 self.sync_picker_selection();
@@ -465,10 +490,118 @@ impl HomeState {
         }
     }
 
+    fn start_conversion(&mut self) {
+        let Some((source, from, to)) = self.convertible_current() else {
+            self.status = Some((
+                "Move the cursor to a Claude Code or Codex session to convert it.".into(),
+                false,
+            ));
+            return;
+        };
+        let Some(target_home) = self
+            .providers
+            .iter()
+            .find(|p| p.id == to)
+            .and_then(|p| p.home.clone())
+        else {
+            self.status = Some((
+                format!("{} was not found on this machine.", to.as_str()),
+                true,
+            ));
+            return;
+        };
+        let label = self
+            .picker
+            .as_ref()
+            .and_then(|picker| match picker.current() {
+                Some(PickRow::Entry { entry, .. }) => Some(picker.entry_label(entry)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut conversion = Conversion {
+            label,
+            request: crate::convert::ConvertRequest {
+                source,
+                from: Some(from),
+                to,
+                target_home,
+                mappings: std::collections::BTreeMap::new(),
+                allow_running: false,
+            },
+            prepared: None,
+            error: None,
+        };
+        conversion.refresh();
+        self.conversion = Some(conversion);
+        self.plan_scroll = theme::Scroll::default();
+        self.status = None;
+        self.screen = HomeScreen::ConvertPlan;
+    }
+
+    fn handle_convert_key(&mut self, code: KeyCode) {
+        let Some(conversion) = self.conversion.as_mut() else {
+            self.screen = HomeScreen::ItemPicker;
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.conversion = None;
+                self.screen = HomeScreen::ItemPicker;
+            }
+            KeyCode::Char('q') => {
+                self.outcome = Some(HomeOutcome::Cancelled);
+                self.screen = HomeScreen::Done;
+            }
+            KeyCode::Char('r') => {
+                conversion.request.allow_running = !conversion.request.allow_running;
+                conversion.refresh();
+            }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                let ready = conversion
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|prepared| !prepared.plan.has_refusals());
+                if !ready {
+                    return;
+                }
+                let Some(prepared) = conversion.prepared.take() else {
+                    return;
+                };
+                let label = conversion.label.clone();
+                self.status = Some(match crate::convert::apply(prepared) {
+                    Ok(report) if report.written == 0 => (
+                        format!(
+                            "\"{label}\" was already converted: {}",
+                            report.summary.resume
+                        ),
+                        false,
+                    ),
+                    Ok(report) => (
+                        format!(
+                            "Converted \"{label}\". Resume: {}{}",
+                            report.summary.resume,
+                            report
+                                .journal_id
+                                .map(|id| format!("   Undo: aisession-backup rollback {id}"))
+                                .unwrap_or_default()
+                        ),
+                        false,
+                    ),
+                    Err(err) => (format!("Conversion failed: {err:#}"), true),
+                });
+                self.conversion = None;
+                self.screen = HomeScreen::ItemPicker;
+            }
+            _ => {
+                self.plan_scroll.handle_key(code);
+            }
+        }
+    }
+
     fn handle_confirm_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => {
-                self.screen = HomeScreen::Providers;
+                self.screen = self.plan_return;
             }
             KeyCode::Char('q') => {
                 self.outcome = Some(HomeOutcome::Cancelled);
@@ -494,15 +627,29 @@ impl HomeState {
             }
             KeyCode::Backspace => {
                 self.restore_input.pop();
+                self.status = None;
             }
             KeyCode::Char(c) => {
                 self.restore_input.push(c);
+                self.status = None;
             }
             KeyCode::Enter => {
                 let trimmed = self.restore_input.trim();
-                if !trimmed.is_empty() {
-                    self.outcome = Some(HomeOutcome::RestoreArchive(PathBuf::from(trimmed)));
+                if trimmed.is_empty() {
+                    return;
+                }
+                let path = crate::cli::expand_path(trimmed);
+                if path.is_file() {
+                    self.status = None;
+                    self.outcome = Some(HomeOutcome::RestoreArchive(path));
                     self.screen = HomeScreen::Done;
+                } else {
+                    let reason = if path.exists() {
+                        "is not a file"
+                    } else {
+                        "was not found"
+                    };
+                    self.status = Some((format!("{} {reason}", sanitize(trimmed)), true));
                 }
             }
             _ => {}
@@ -519,7 +666,7 @@ impl HomeState {
                 ("a / n", "select or clear everything"),
                 ("b", "review the backup plan"),
                 ("r", "restore an archive"),
-                ("q", "quit"),
+                ("q / esc", "quit"),
             ],
             HomeScreen::ItemPicker => {
                 let mut keys = groups::PICKER_HELP_KEYS.to_vec();
@@ -527,6 +674,13 @@ impl HomeState {
                 keys.push(("t", "convert the session to the other tool"));
                 keys
             }
+            HomeScreen::ConvertPlan => vec![
+                ("enter / y", "convert, when nothing is refused"),
+                ("r", "allow writing while the target tool runs"),
+                ("j/k", "scroll the plan"),
+                ("esc", "back to the list"),
+                ("q", "quit without writing"),
+            ],
             _ => vec![
                 ("j/k", "scroll the plan"),
                 ("g / G", "top or end of the plan"),
@@ -537,72 +691,133 @@ impl HomeState {
         }
     }
 
+    fn provider_rows(&self, theme: &Theme, location_width: usize) -> Vec<Row<'static>> {
+        self.providers
+            .iter()
+            .map(|p| {
+                let detected = p.home.as_ref().is_some_and(|h| h.exists());
+                let status = if p.scan_error.is_some() {
+                    Span::styled("scan failed", theme.danger())
+                } else if detected && p.items.is_empty() {
+                    Span::styled("empty", theme.warning())
+                } else if detected {
+                    Span::styled("detected", theme.success())
+                } else {
+                    Span::styled("not found", theme.muted())
+                };
+                let location = p
+                    .home
+                    .as_ref()
+                    .filter(|_| detected)
+                    .map(|h| theme::truncate_left(&theme::home_relative(h), location_width))
+                    .unwrap_or_default();
+                let count_style = if p.selected_count() > 0 {
+                    theme.accent()
+                } else {
+                    Style::default()
+                };
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        sanitize(&p.display_name),
+                        theme.provider(p.id.as_str()),
+                    )),
+                    Cell::from(status),
+                    Cell::from(Span::styled(
+                        format!("{}/{}", p.selected_count(), p.items.len()),
+                        count_style,
+                    )),
+                    Cell::from(Span::styled(
+                        format!("{:>9}", human_size(p.total_bytes())),
+                        theme.muted(),
+                    )),
+                    Cell::from(Span::styled(location, theme.muted())),
+                ])
+            })
+            .collect()
+    }
+
+    fn status_area(&self, body: Rect) -> (Rect, Option<Rect>) {
+        if self.status.is_none() || body.height < 4 {
+            return (body, None);
+        }
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(body);
+        (chunks[0], Some(chunks[1]))
+    }
+
+    fn render_status(&self, f: &mut Frame, area: Option<Rect>, theme: &Theme) {
+        if let (Some(area), Some((message, danger))) = (area, &self.status) {
+            let style = if *danger {
+                theme.danger()
+            } else {
+                theme.success()
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(sanitize(message), style)))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                area,
+            );
+        }
+    }
+
     pub fn draw(&mut self, f: &mut Frame) {
         let theme = theme::current();
         let [top, body, bottom] = theme::frame_layout(f.area());
         let selected = self.total_selected_items();
+        let (body, status_area) = self.status_area(body);
         match self.screen {
             HomeScreen::Providers => {
                 f.render_widget(
-                    theme::header(theme, "Home", &format!("{selected} item(s) selected")),
+                    theme::header(
+                        theme,
+                        "Home",
+                        &format!("{} selected", theme::plural(selected, "item")),
+                    ),
                     top,
                 );
-                let rows: Vec<Row> = self
-                    .providers
-                    .iter()
-                    .map(|p| {
-                        let detected = p.home.as_ref().is_some_and(|h| h.exists());
-                        let status = if p.scan_error.is_some() {
-                            Span::styled("scan failed", theme.danger())
-                        } else if detected {
-                            Span::styled("detected", theme.success())
-                        } else {
-                            Span::styled("not found", theme.muted())
-                        };
-                        let location = p
-                            .home
-                            .as_ref()
-                            .filter(|_| detected)
-                            .map(|h| sanitize(&h.display().to_string()))
-                            .unwrap_or_default();
-                        let count_style = if p.selected_count() > 0 {
-                            theme.accent()
-                        } else {
-                            Style::default()
-                        };
-                        Row::new(vec![
-                            Cell::from(Span::styled(
-                                sanitize(&p.display_name),
-                                theme.provider(p.id.as_str()),
-                            )),
-                            Cell::from(status),
-                            Cell::from(Span::styled(
-                                format!("{}/{}", p.selected_count(), p.items.len()),
-                                count_style,
-                            )),
-                            Cell::from(Span::styled(human_size(p.total_bytes()), theme.muted())),
-                            Cell::from(Span::styled(location, theme.muted())),
-                        ])
-                    })
-                    .collect();
+                let (table_area, overview_area) = if body.width >= 110 {
+                    let columns = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Min(60), Constraint::Length(46)])
+                        .spacing(1)
+                        .split(body);
+                    (columns[0], Some(columns[1]))
+                } else {
+                    (body, None)
+                };
+                let location_width = usize::from(table_area.width)
+                    .saturating_sub(17 + 12 + 10 + 10 + 8)
+                    .max(8);
                 let table = Table::new(
-                    rows,
+                    self.provider_rows(theme, location_width),
                     [
                         Constraint::Length(17),
+                        Constraint::Length(12),
                         Constraint::Length(10),
                         Constraint::Length(10),
-                        Constraint::Length(10),
-                        Constraint::Min(10),
+                        Constraint::Min(8),
                     ],
                 )
                 .header(
-                    Row::new(["Provider", "Status", "Selected", "Size", "Location"])
+                    Row::new(["Provider", "Status", "Selected", "     Size", "Location"])
                         .style(theme.muted().add_modifier(Modifier::BOLD)),
                 )
                 .block(theme.panel("Providers"))
                 .row_highlight_style(theme.selected_row())
                 .highlight_symbol("> ");
-                f.render_stateful_widget(table, body, &mut self.provider_list_state);
+                f.render_stateful_widget(table, table_area, &mut self.provider_list_state);
+                if let Some(area) = overview_area {
+                    dashboard::render_overview(
+                        f,
+                        area,
+                        theme,
+                        &self.providers,
+                        chrono::Utc::now(),
+                        self.frame,
+                    );
+                }
                 let mut keys = vec![
                     ("enter", "items"),
                     ("d", "by directory"),
@@ -613,7 +828,7 @@ impl HomeState {
                     keys.insert(0, ("b", "backup"));
                 }
                 keys.extend([("?", "help"), ("q", "quit")]);
-                f.render_widget(theme::footer(theme, &keys), bottom);
+                theme::render_footer(f, bottom, theme, &keys);
             }
             HomeScreen::ItemPicker => {
                 let scope = if self.picker_all_providers {
@@ -628,7 +843,7 @@ impl HomeState {
                     theme::header(
                         theme,
                         "Select",
-                        &format!("{scope}  |  {selected} item(s) selected"),
+                        &format!("{scope}  |  {} selected", theme::plural(selected, "item")),
                     ),
                     top,
                 );
@@ -639,17 +854,24 @@ impl HomeState {
                 if selected > 0 {
                     keys.insert(0, ("b", "backup"));
                 }
+                keys.push((
+                    "esc",
+                    self.picker
+                        .as_ref()
+                        .map(GroupPicker::esc_label)
+                        .unwrap_or("back"),
+                ));
                 match self.convertible_current() {
-                    Some((_, _, ProviderId::Codex)) => keys.insert(0, ("t", "to codex")),
-                    Some((_, _, _)) => keys.insert(0, ("t", "to claude")),
+                    Some((_, _, ProviderId::Codex)) => keys.insert(0, ("t", "convert to codex")),
+                    Some((_, _, _)) => keys.insert(0, ("t", "convert to claude")),
                     None => {}
                 }
-                keys.push(("esc", "back"));
-                f.render_widget(theme::footer(theme, &keys), bottom);
+                keys.push(("q", "quit"));
+                theme::render_footer(f, bottom, theme, &keys);
             }
             HomeScreen::ConfirmBackup => {
                 f.render_widget(
-                    theme::header(theme, "Backup plan", &format!("{selected} item(s)")),
+                    theme::header(theme, "Backup plan", &theme::plural(selected, "item")),
                     top,
                 );
                 theme::render_plan(f, body, theme, self.plan.as_ref(), &mut self.plan_scroll);
@@ -658,14 +880,55 @@ impl HomeState {
                 if !blocked {
                     keys.insert(0, ("enter", "write backup"));
                 }
-                keys.extend([("esc", "back"), ("q", "quit")]);
-                f.render_widget(theme::footer(theme, &keys), bottom);
+                keys.extend([("esc", "back"), ("?", "help"), ("q", "quit")]);
+                theme::render_footer(f, bottom, theme, &keys);
+            }
+            HomeScreen::ConvertPlan => {
+                let (title, context, allow) = match &self.conversion {
+                    Some(c) => (
+                        format!("Convert to {}", c.request.to.as_str()),
+                        format!("\"{}\"", c.label),
+                        c.request.allow_running,
+                    ),
+                    None => (String::from("Convert"), String::new(), false),
+                };
+                f.render_widget(theme::header(theme, &title, &context), top);
+                let plan = self
+                    .conversion
+                    .as_ref()
+                    .and_then(|c| c.prepared.as_ref())
+                    .map(|p| p.plan.clone());
+                let error = self.conversion.as_ref().and_then(|c| c.error.clone());
+                if let Some(error) = error {
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(sanitize(&error), theme.danger())))
+                            .wrap(ratatui::widgets::Wrap { trim: true })
+                            .block(theme.panel("Cannot convert")),
+                        body,
+                    );
+                } else {
+                    theme::render_plan(f, body, theme, plan.as_ref(), &mut self.plan_scroll);
+                }
+                let blocked = plan.as_ref().is_none_or(Plan::has_refusals);
+                let running = if allow {
+                    "allow running ON"
+                } else {
+                    "allow running off"
+                };
+                let mut keys = vec![("r", running)];
+                if !blocked {
+                    keys.insert(0, ("enter", "convert"));
+                }
+                keys.extend([("esc", "back"), ("?", "help"), ("q", "quit")]);
+                theme::render_footer(f, bottom, theme, &keys);
             }
             HomeScreen::RestoreInput => {
                 f.render_widget(theme::header(theme, "Restore", "choose an archive"), top);
+                let field_width = usize::from(body.width).saturating_sub(8).max(4);
+                let shown = theme::truncate_left(&sanitize(&self.restore_input), field_width);
                 let lines = vec![
                     Line::from(Span::styled(
-                        "Path to a backup archive (.tar.gz or .tar.gz.age)",
+                        "Path to a backup archive (.tar.gz or .tar.gz.age). ~ is expanded.",
                         theme.muted(),
                     )),
                     Line::from(""),
@@ -674,18 +937,16 @@ impl HomeState {
                             format!("{} ", theme.icon(theme::Icon::Archive)),
                             theme.accent(),
                         ),
-                        Span::styled(sanitize(&self.restore_input), theme.strong()),
+                        Span::styled(shown, theme.strong()),
                         Span::styled("_", theme.accent()),
                     ]),
                 ];
                 f.render_widget(Paragraph::new(lines).block(theme.panel("Archive")), body);
-                f.render_widget(
-                    theme::footer(theme, &[("enter", "open"), ("esc", "back")]),
-                    bottom,
-                );
+                theme::render_footer(f, bottom, theme, &[("enter", "open"), ("esc", "back")]);
             }
             HomeScreen::Done => {}
         }
+        self.render_status(f, status_area, theme);
         if self.show_help {
             theme::render_help(f, theme, "Keys", &self.help_keys());
         }
@@ -702,60 +963,73 @@ pub fn run_home(claude_dir: &Path) -> Result<()> {
         "aisession-backup-{}.tar.gz",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     ));
-
-    let finished = with_terminal(|terminal| {
-        let Some(entries) = loading::scan_providers(terminal, &env, &ScanOptions::default())?
-        else {
-            return Ok(None);
-        };
-        let mut state = HomeState::new(entries);
-        loop {
-            if state.screen == HomeScreen::ConfirmBackup && state.plan.is_none() {
-                let req = state.build_backup_request(output.clone(), claude_dir);
-                state.plan_scroll = theme::Scroll::default();
-                match engine::plan_backup(&req) {
-                    Ok(plan) => state.set_plan(plan),
-                    Err(err) => state.set_plan(Plan::failed(format!("{err:#}"))),
+    let mut kept: Option<HomeState> = None;
+    loop {
+        let finished = with_terminal(|terminal| {
+            let mut state = match kept.take() {
+                Some(state) => state,
+                None => {
+                    let Some(entries) =
+                        loading::scan_providers(terminal, &env, &ScanOptions::default())?
+                    else {
+                        return Ok(None);
+                    };
+                    HomeState::new(entries)
                 }
-            } else if state.screen != HomeScreen::ConfirmBackup {
-                state.plan = None;
-            }
-            terminal.draw(|f| state.draw(f))?;
-            if state.screen == HomeScreen::Done {
-                return Ok(Some(state));
-            }
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    state.handle_key(key.code);
+            };
+            loop {
+                if state.screen == HomeScreen::ConfirmBackup && state.plan.is_none() {
+                    let req = state.build_backup_request(output.clone(), claude_dir);
+                    state.plan_scroll = theme::Scroll::default();
+                    match engine::plan_backup(&req) {
+                        Ok(plan) => state.set_plan(plan),
+                        Err(err) => state.set_plan(Plan::failed(format!("{err:#}"))),
+                    }
+                } else if state.screen != HomeScreen::ConfirmBackup {
+                    state.plan = None;
+                }
+                terminal.draw(|f| state.draw(f))?;
+                if state.screen == HomeScreen::Done {
+                    return Ok(Some(state));
+                }
+                if !event::poll(std::time::Duration::from_millis(120))? {
+                    state.frame = state.frame.wrapping_add(1);
+                    continue;
+                }
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        state.handle_key(key.code);
+                    }
                 }
             }
-        }
-    })?;
-    let Some(state) = finished else {
-        println!("Cancelled.");
-        return Ok(());
-    };
-
-    match state.outcome {
-        Some(HomeOutcome::BackupConfirmed) => {
-            let req = state.build_backup_request(output, claude_dir);
-            let report = engine::run_backup(&req)?;
-            print!(
-                "{}",
-                crate::ui::format_backup_report(&report, crate::ui::color_stdout())
-            );
-            Ok(())
-        }
-        Some(HomeOutcome::RestoreArchive(path)) => {
-            run_restore(&path, claude_dir, RestoreFlags::default())
-        }
-        Some(HomeOutcome::Convert { source, from, to }) => {
-            let request = crate::cli::conversion_request(source, from, to, claude_dir)?;
-            crate::cli::run_conversion(&request, false, false, false)
-        }
-        _ => {
+        })?;
+        let Some(mut state) = finished else {
             println!("Cancelled.");
-            Ok(())
+            return Ok(());
+        };
+        match state.outcome.take() {
+            Some(HomeOutcome::BackupConfirmed) => {
+                let req = state.build_backup_request(output, claude_dir);
+                let report = engine::run_backup(&req)?;
+                print!(
+                    "{}",
+                    crate::ui::format_backup_report(&report, crate::ui::color_stdout())
+                );
+                return Ok(());
+            }
+            Some(HomeOutcome::RestoreArchive(path)) => {
+                if restore_ui::run_restore_from_home(&path, claude_dir, RestoreFlags::default())? {
+                    state.restore_input = path.display().to_string();
+                    state.screen = HomeScreen::RestoreInput;
+                    kept = Some(state);
+                    continue;
+                }
+                return Ok(());
+            }
+            _ => {
+                println!("Cancelled.");
+                return Ok(());
+            }
         }
     }
 }

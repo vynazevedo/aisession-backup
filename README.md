@@ -8,7 +8,7 @@ AI session backup and migration for terminal coding tools: Claude Code, Codex,
 Grok, Gemini, Antigravity, Maestri and OpenCode.
 
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![version](https://img.shields.io/badge/version-3.3.0-success?style=flat-square)](Cargo.toml)
+[![version](https://img.shields.io/badge/version-3.4.0-success?style=flat-square)](Cargo.toml)
 [![CI](https://img.shields.io/github/actions/workflow/status/vynazevedo/aisession-backup/ci.yml?style=flat-square&label=CI&branch=main)](https://github.com/vynazevedo/aisession-backup/actions/workflows/ci.yml)
 [![rust](https://img.shields.io/badge/rust-1.85%2B-orange?style=flat-square)](https://www.rust-lang.org)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=flat-square)](#instalação)
@@ -155,9 +155,9 @@ que ficou de fora, e o relatório em `--json` traz as contagens.
   feche o Codex ou use `--allow-running`.
 
 Os formatos de sessão das duas ferramentas não são documentados e mudam entre
-versões. A conversão foi validada lendo de volta as sessões geradas a partir de 70
-sessões reais, de Claude Code 2.1 e Codex 0.16x. Retomar a sessão convertida na
-ferramenta de destino ainda não faz parte dos testes automáticos.
+versões. Por isso o CI abre a sessão convertida no CLI real da ferramenta de destino,
+em versões fixas, e só passa se a conversa aparecer na tela. Veja
+[Retomada verificada no CI](#retomada-verificada-no-ci).
 
 ---
 
@@ -304,8 +304,23 @@ Ainda não foram cobertos entre sistemas diferentes:
 
 - arquivos de Grok, Gemini, Antigravity, Maestri e OpenCode;
 - nomes de arquivo inválidos no Windows, como `a:b`;
-- nomes que só diferem por maiúsculas, ao restaurar em macOS ou Windows;
-- a retomada real de uma sessão com `claude --resume` depois do restore.
+- nomes que só diferem por maiúsculas, ao restaurar em macOS ou Windows.
+
+### Retomada verificada no CI
+
+O job `Resume check` instala o Claude Code e o Codex reais, em versões fixas, e prova
+que as sessões produzidas pela ferramenta retomam neles:
+
+| Cenário | Comando que precisa mostrar a conversa |
+|---------|----------------------------------------|
+| Sessão do Codex convertida para o Claude Code | `claude --resume` |
+| Sessão do Claude Code convertida para o Codex | `codex resume` |
+| Backup e restore do Claude Code com `-m`, sem o HOME de origem | `claude --resume` |
+| Backup e restore do Codex com `-m`, sem o HOME de origem | `codex resume` |
+
+Cada cenário roda num HOME temporário, com chaves de API falsas. A rede passa por um
+proxy local que recusa toda conexão, então nenhuma chamada a modelo acontece: o teste
+verifica que o histórico é exibido, não que o modelo responde.
 
 ---
 
@@ -396,43 +411,54 @@ provedores juntos. Tecle `b` para o backup ou `r` para o restore. Toda escrita p
 por uma tela com o plano real, com contadores por ação e risco e rolagem com `j`, `k`,
 `g` e `G`. Em qualquer tela de seleção ou de plano, `?` mostra todas as teclas.
 
-Cada provedor tem uma cor, e telas com 100 colunas ou mais mostram um painel de
-detalhes do diretório ou item selecionado. `NO_COLOR` desativa as cores. Para usar
-ícones, instale uma [Nerd Font](https://www.nerdfonts.com) no terminal e defina:
+Cada provedor tem uma cor. Em terminais com 110 colunas ou mais, a tela inicial mostra
+um painel Overview com o logo em pixel art, os totais, o tamanho por provedor e a
+atividade das últimas 12 semanas. As listas mostram um painel de detalhes a partir de
+100 colunas.
 
-```bash
-export AISESSION_BACKUP_ICONS=nerd
-```
+Os ícones usam formas Unicode presentes nas fontes comuns de terminal. Para outro
+conjunto, defina `AISESSION_BACKUP_ICONS`:
 
-Sem essa variável, a interface usa só texto, que funciona em qualquer terminal.
+| Valor | Ícones |
+|-------|--------|
+| `unicode` | Formas geométricas, como ● ◐ ○ ▸ ▾. É o padrão |
+| `nerd` | Ícones da [Nerd Font](https://www.nerdfonts.com), que precisa estar instalada |
+| `ascii` | Só texto ASCII, para terminais limitados. É o padrão com `TERM=dumb` |
+
+`NO_COLOR` desativa as cores, inclusive na pixel art.
 
 As telas de seleção mostram uma linha por diretório, com itens selecionados, tamanho,
 última atividade e quantidade por provedor. A ordem é da atividade mais recente para
 a mais antiga, e os itens sem diretório, como configurações, ficam no fim.
 
 ```text
-[x] > /work/app      4/4 | 310 MB | 2026-11-06 | claude 3, codex 1
-[-] v /work/api      1/2 |  95 MB | 2026-11-05 | claude 2
-    [x] corrigir autenticação  (claude | 60 MB | 2026-11-05)
-    [ ] revisar migrations     (claude | 35 MB | 2026-10-30)
-[ ] > (no directory) 0/1 |   2 MB | 2026-10-12 | codex 1
+● ▾ /work/infra                    4/4    1.8 KB 2026-11-09 claude 3 codex 1
+      ● k8s autoscaling                    434 B 2026-10-10 claude
+      ● rotate secrets job                 440 B 2026-10-09 claude
+◐ ▸ /work/shop/web                   1/2     892 B 2026-10-06 claude 2
+  ○ ▸ /work/shop/web/admin           0/1     466 B 2026-10-07 claude 1
 ```
+
+Subdiretórios aparecem indentados sob o diretório pai. O provedor só é mostrado quando
+a lista reúne mais de um.
 
 | Tecla | Ação na tela de seleção |
 |-------|-------------------------|
 | `espaço` | Marca ou desmarca o diretório inteiro ou o item |
 | `enter` | Abre ou fecha o diretório |
 | `l` ou `→` | Abre o diretório |
-| `h` ou `←` | Fecha o diretório |
+| `h` ou `←` | Fecha o diretório, sem sair da tela |
 | `a` e `n` | Marca ou desmarca tudo o que está visível |
 | `/` | Filtra por diretório, nome ou id |
-| `b` ou `p` | Segue para o backup ou para o restore |
-| `esc` | Volta |
+| `b` | Revisa o plano de backup |
+| `p` | No restore, segue para o mapeamento de paths |
+| `t` | Converte a sessão sob o cursor para a outra ferramenta, com plano na própria tela |
+| `esc` | Limpa o filtro ou volta uma tela |
 | `q` | Sai sem escrever |
 
-Com filtro ativo, marcar um diretório afeta só os itens visíveis dele. Um `[-]` indica
+Com filtro ativo, marcar um diretório afeta só os itens visíveis dele. Um `◐` indica
 seleção parcial. Diretórios são agrupados pelo `cwd` exato: `/work/app` e
-`/work/app/sub` ficam separados.
+`/work/app/sub` são grupos diferentes, com o segundo indentado sob o primeiro.
 
 No restore, o plano é recalculado a cada mudança, e o plano confirmado é o que
 será executado:
@@ -509,7 +535,7 @@ O que essas proteções não garantem:
 | `AISESSION_BACKUP_DATA_DIR` | Base do journal de restores |
 | `AISESSION_BACKUP_MAX_ARCHIVE_BYTES` | Limite do tamanho total extraído |
 | `NO_COLOR` | Desativa cores |
-| `AISESSION_BACKUP_ICONS` | `nerd` ativa ícones da Nerd Font na interface |
+| `AISESSION_BACKUP_ICONS` | Conjunto de ícones da interface: `unicode`, `nerd` ou `ascii` |
 
 ---
 

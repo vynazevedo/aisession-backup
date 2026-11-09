@@ -57,7 +57,7 @@ fn session_item(home: &Path, file: ItemFile, names: &BTreeMap<String, String>) -
         kind: ItemKind::Session,
         label,
         cwd,
-        updated_at: common::mtime(&path),
+        updated_at: common::last_timestamp(&path).or_else(|| common::mtime(&path)),
         files: vec![file],
     }
 }

@@ -736,8 +736,8 @@ fn list_and_scan_group_by_directory_and_flat_keeps_the_old_output() {
     let grouped = env.run(&["list"]);
     assert_eq!(code_of(&grouped), EXIT_OK);
     let text = String::from_utf8_lossy(&grouped.stdout);
-    assert_eq!(text.matches("/work/one | 2 item(s)").count(), 1);
-    assert_eq!(text.matches("/work/two | 1 item(s)").count(), 1);
+    assert_eq!(text.matches("/work/one | 2 items").count(), 1);
+    assert_eq!(text.matches("/work/two | 1 item").count(), 1);
 
     let flat = env.run(&["list", "--flat"]);
     assert_eq!(code_of(&flat), EXIT_OK);
@@ -746,7 +746,7 @@ fn list_and_scan_group_by_directory_and_flat_keeps_the_old_output() {
 
     let scan = env.run(&["scan", "--provider", "claude"]);
     assert_eq!(code_of(&scan), EXIT_OK);
-    assert!(String::from_utf8_lossy(&scan.stdout).contains("/work/one | 2 item(s)"));
+    assert!(String::from_utf8_lossy(&scan.stdout).contains("/work/one | 2 items"));
     let scan_flat = env.run(&["scan", "--provider", "claude", "--flat"]);
     assert_eq!(code_of(&scan_flat), EXIT_OK);
     assert!(String::from_utf8_lossy(&scan_flat.stdout).contains("PROVIDER"));
@@ -984,20 +984,34 @@ fn convert_codex_session_into_claude_and_roll_it_back() {
 }
 
 #[test]
-fn tui_t_key_converts_only_claude_and_codex_sessions() {
-    let codex_session = Item {
-        id: "x-1".into(),
+fn tui_t_key_opens_an_in_app_conversion_plan() {
+    let env = TestEnv::new();
+    let day = env.codex_dir.join("sessions/2026/01/01");
+    fs::create_dir_all(&day).unwrap();
+    let id = "66666666-6666-4666-8666-666666666666";
+    let rollout = day.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
+    let lines = [
+        serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":"/work/api"}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}),
+    ];
+    fs::write(
+        &rollout,
+        lines.iter().map(|l| format!("{l}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let session = Item {
+        id: id.into(),
         kind: ItemKind::Session,
         label: "codex work".into(),
         cwd: Some("/work/api".into()),
         updated_at: None,
         files: vec![ItemFile {
-            rel: "sessions/2026/01/01/rollout-2026-01-01T00-00-00-x-1.jsonl".into(),
+            rel: format!("sessions/2026/01/01/rollout-2026-01-01T00-00-00-{id}.jsonl"),
             size: 10,
             class: FileClass::Plain,
         }],
     };
-    let codex_config = Item {
+    let config = Item {
         id: "config".into(),
         kind: ItemKind::Config,
         label: "config".into(),
@@ -1005,14 +1019,24 @@ fn tui_t_key_converts_only_claude_and_codex_sessions() {
         updated_at: None,
         files: Vec::new(),
     };
-    let mut home = HomeState::new(vec![ProviderEntry {
-        id: ProviderId::Codex,
-        display_name: "Codex CLI".into(),
-        home: Some(PathBuf::from("/tmp/fake-codex")),
-        items: vec![codex_session, codex_config],
-        selected: vec![false, false],
-        scan_error: None,
-    }]);
+    let mut home = HomeState::new(vec![
+        ProviderEntry {
+            id: ProviderId::Codex,
+            display_name: "Codex CLI".into(),
+            home: Some(env.codex_dir.clone()),
+            items: vec![session, config],
+            selected: vec![false, false],
+            scan_error: None,
+        },
+        ProviderEntry {
+            id: ProviderId::Claude,
+            display_name: "Claude Code".into(),
+            home: Some(env.claude_dir.clone()),
+            items: Vec::new(),
+            selected: Vec::new(),
+            scan_error: None,
+        },
+    ]);
     home.handle_key(KeyCode::Enter);
     home.handle_key(KeyCode::Char('t'));
     assert_eq!(
@@ -1020,17 +1044,24 @@ fn tui_t_key_converts_only_claude_and_codex_sessions() {
         HomeScreen::ItemPicker,
         "a directory row is not a session"
     );
+    assert!(home.status.is_some());
     home.handle_key(KeyCode::Enter);
     home.handle_key(KeyCode::Down);
     home.handle_key(KeyCode::Char('t'));
-    assert_eq!(
-        home.outcome,
-        Some(HomeOutcome::Convert {
-            source: PathBuf::from(
-                "/tmp/fake-codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-x-1.jsonl"
-            ),
-            from: ProviderId::Codex,
-            to: ProviderId::Claude,
-        })
-    );
+    assert_eq!(home.screen, HomeScreen::ConvertPlan);
+    let conversion = home.conversion.as_ref().unwrap();
+    assert_eq!(conversion.request.source, rollout);
+    assert_eq!(conversion.request.to, ProviderId::Claude);
+    assert_eq!(conversion.label, "codex work");
+    assert!(conversion.error.is_none(), "{:?}", conversion.error);
+    home.handle_key(KeyCode::Char('y'));
+    assert_eq!(home.screen, HomeScreen::ItemPicker);
+    let (message, failed) = home.status.clone().unwrap();
+    assert!(!failed, "{message}");
+    assert!(message.contains("claude --resume"));
+    assert!(home.outcome.is_none());
+    let converted = fs::read_dir(env.claude_dir.join("projects/-work-api"))
+        .unwrap()
+        .count();
+    assert_eq!(converted, 1);
 }

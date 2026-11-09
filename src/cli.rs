@@ -763,25 +763,6 @@ fn cmd_convert(args: ConvertArgs) -> Result<()> {
     run_conversion(&request, args.dry_run, args.yes, args.json)
 }
 
-pub(crate) fn conversion_request(
-    source: PathBuf,
-    from: ProviderId,
-    to: ProviderId,
-    claude_dir: &Path,
-) -> Result<crate::convert::ConvertRequest> {
-    let target_home = default_provider_homes(claude_dir)
-        .remove(&to)
-        .context("target tool directory not found")?;
-    Ok(crate::convert::ConvertRequest {
-        source,
-        from: Some(from),
-        to,
-        target_home,
-        mappings: BTreeMap::new(),
-        allow_running: false,
-    })
-}
-
 pub(crate) fn run_conversion(
     request: &crate::convert::ConvertRequest,
     dry_run: bool,
@@ -792,11 +773,11 @@ pub(crate) fn run_conversion(
     let summary = &prepared.summary;
     if !json {
         eprintln!(
-            "{} session {} -> {} ({} message(s)) in {}",
+            "{} session {} -> {} ({}) in {}",
             summary.from.as_str(),
             sanitize(&summary.source_session),
             summary.to.as_str(),
-            summary.messages,
+            ui::plural(summary.messages, "message"),
             sanitize(&summary.cwd)
         );
     }

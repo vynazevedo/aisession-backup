@@ -94,9 +94,9 @@ pub fn format_date(value: Option<DateTime<Utc>>) -> String {
 
 fn group_line(group: &DirGroup) -> String {
     format!(
-        "{} | {} item(s) | {} | last {} | {}",
+        "{} | {} | {} | last {} | {}",
         group.title(),
-        group.members.len(),
+        crate::ui::plural(group.members.len(), "item"),
         human_size(group.size),
         format_date(group.latest),
         group.provider_summary()
