@@ -151,6 +151,11 @@ pub enum HomeScreen {
 pub enum HomeOutcome {
     BackupConfirmed,
     RestoreArchive(PathBuf),
+    Convert {
+        source: PathBuf,
+        from: ProviderId,
+        to: ProviderId,
+    },
     Cancelled,
 }
 
@@ -246,6 +251,31 @@ impl HomeState {
         self.picker_refs = refs;
         self.picker_all_providers = only_provider.is_none();
         self.screen = HomeScreen::ItemPicker;
+    }
+
+    pub fn convertible_current(&self) -> Option<(PathBuf, ProviderId, ProviderId)> {
+        let picker = self.picker.as_ref()?;
+        let Some(PickRow::Entry { entry, .. }) = picker.current() else {
+            return None;
+        };
+        let &(provider_index, item_index) = self.picker_refs.get(entry)?;
+        let provider = self.providers.get(provider_index)?;
+        let item = provider.items.get(item_index)?;
+        if item.kind != provider::ItemKind::Session {
+            return None;
+        }
+        let to = match provider.id {
+            ProviderId::Claude => ProviderId::Codex,
+            ProviderId::Codex => ProviderId::Claude,
+            _ => return None,
+        };
+        let home = provider.home.as_ref()?;
+        let file = item.files.iter().find(|file| {
+            file.rel.ends_with(".jsonl")
+                && (provider.id == ProviderId::Codex
+                    || file.rel.ends_with(&format!("{}.jsonl", item.id)))
+        })?;
+        Some((home.join(&file.rel), provider.id, to))
     }
 
     fn sync_picker_selection(&mut self) {
@@ -413,6 +443,12 @@ impl HomeState {
                     self.screen = HomeScreen::ConfirmBackup;
                 }
             }
+            KeyCode::Char('t') => {
+                if let Some((source, from, to)) = self.convertible_current() {
+                    self.outcome = Some(HomeOutcome::Convert { source, from, to });
+                    self.screen = HomeScreen::Done;
+                }
+            }
             KeyCode::Left | KeyCode::Char('h') => {
                 if !picker.handle_key(code) {
                     self.screen = HomeScreen::Providers;
@@ -484,6 +520,7 @@ impl HomeState {
             HomeScreen::ItemPicker => {
                 let mut keys = groups::PICKER_HELP_KEYS.to_vec();
                 keys.push(("b", "review the backup plan"));
+                keys.push(("t", "convert the session to the other tool"));
                 keys
             }
             _ => vec![
@@ -596,6 +633,11 @@ impl HomeState {
                 if selected > 0 {
                     keys.insert(0, ("b", "backup"));
                 }
+                match self.convertible_current() {
+                    Some((_, _, ProviderId::Codex)) => keys.insert(0, ("t", "to codex")),
+                    Some((_, _, _)) => keys.insert(0, ("t", "to claude")),
+                    None => {}
+                }
                 keys.push(("esc", "back"));
                 f.render_widget(theme::footer(theme, &keys), bottom);
             }
@@ -690,6 +732,10 @@ pub fn run_home(claude_dir: &Path) -> Result<()> {
         }
         Some(HomeOutcome::RestoreArchive(path)) => {
             run_restore(&path, claude_dir, RestoreFlags::default())
+        }
+        Some(HomeOutcome::Convert { source, from, to }) => {
+            let request = crate::cli::conversion_request(source, from, to, claude_dir)?;
+            crate::cli::run_conversion(&request, false, false, false)
         }
         _ => {
             println!("Cancelled.");
