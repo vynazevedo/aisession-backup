@@ -1163,3 +1163,147 @@ fn live_sqlite_databases_are_backed_up_consistently() {
         .unwrap();
     assert_eq!(check, "ok");
 }
+
+#[test]
+fn incremental_repository_backup_restore_and_prune() {
+    let env = TestEnv::new();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let cwd = "/work/repo-demo";
+    env.write_claude_session(id, cwd, "first message");
+    let session = env
+        .claude_dir
+        .join("projects")
+        .join(claudepath::encode(cwd))
+        .join(format!("{id}.jsonl"));
+    let mut big = fs::read_to_string(&session).unwrap();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let noise: String = (0..5_000_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'a' + (state % 26) as u8)
+        })
+        .collect();
+    let filler = serde_json::json!({"type":"user","cwd":cwd,"sessionId":id,"message":{"role":"user","content":noise}});
+    big.push_str(&format!("{filler}\n"));
+    fs::write(&session, &big).unwrap();
+
+    let repo = env.root.join("repo");
+    let repo_arg = repo.to_str().unwrap();
+    let with_pass = |args: &[&str], pass: &str| {
+        env.cmd()
+            .args(args)
+            .env("AISESSION_BACKUP_PASSPHRASE", pass)
+            .output()
+            .unwrap()
+    };
+    let init = with_pass(&["repo", "init", repo_arg, "--encrypt"], "correct horse");
+    assert_eq!(
+        code_of(&init),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let first = with_pass(
+        &["backup", "--all", "--repo", repo_arg, "--yes", "--json"],
+        "correct horse",
+    );
+    assert_eq!(
+        code_of(&first),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(first["new_chunks"].as_u64().unwrap() >= 1);
+
+    let extra = serde_json::json!({"type":"assistant","cwd":cwd,"sessionId":id,"message":{"role":"assistant","model":"m","content":[{"type":"text","text":"appended answer"}]}});
+    fs::write(&session, format!("{big}{extra}\n")).unwrap();
+    let second = with_pass(
+        &["backup", "--all", "--repo", repo_arg, "--yes", "--json"],
+        "correct horse",
+    );
+    assert_eq!(code_of(&second), EXIT_OK);
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(second["reused_chunks"].as_u64().unwrap() >= 1, "{second}");
+    assert!(
+        second["new_bytes"].as_u64().unwrap() < first["new_bytes"].as_u64().unwrap(),
+        "{first} {second}"
+    );
+
+    let wrong = with_pass(&["repo", "snapshots", repo_arg], "wrong");
+    assert_ne!(code_of(&wrong), EXIT_OK);
+    let listed = with_pass(&["repo", "snapshots", repo_arg, "--json"], "correct horse");
+    let snapshots: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(snapshots.as_array().unwrap().len(), 2);
+    let check = with_pass(&["repo", "check", repo_arg, "--read-data"], "correct horse");
+    assert_eq!(
+        code_of(&check),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+
+    let dest = env.root.join("restored/.claude");
+    let restore = with_pass(
+        &[
+            "restore",
+            "--repo",
+            repo_arg,
+            "--dest",
+            dest.to_str().unwrap(),
+            "--provider",
+            "claude",
+            "-m",
+            "/work:/srv",
+            "--allow-running",
+            "--yes",
+            "--json",
+        ],
+        "correct horse",
+    );
+    assert_eq!(
+        code_of(&restore),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let restored = fs::read_to_string(
+        dest.join("projects")
+            .join(claudepath::encode("/srv/repo-demo"))
+            .join(format!("{id}.jsonl")),
+    )
+    .unwrap();
+    assert!(restored.contains("appended answer"));
+    assert!(restored.contains("\"cwd\":\"/srv/repo-demo\""));
+
+    let prune = with_pass(
+        &[
+            "repo",
+            "prune",
+            repo_arg,
+            "--keep-last",
+            "1",
+            "--yes",
+            "--json",
+        ],
+        "correct horse",
+    );
+    assert_eq!(
+        code_of(&prune),
+        EXIT_OK,
+        "{}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let prune: serde_json::Value = serde_json::from_slice(&prune.stdout).unwrap();
+    assert_eq!(prune["snapshots_removed"].as_array().unwrap().len(), 1);
+    let check = with_pass(&["repo", "check", repo_arg, "--read-data"], "correct horse");
+    assert_eq!(code_of(&check), EXIT_OK);
+
+    let both = env.run(&["restore", "a.tar.gz", "--repo", repo_arg]);
+    assert_eq!(code_of(&both), EXIT_USAGE);
+    let conflict = env.run(&["backup", "--repo", repo_arg, "-o", "x.tar.gz"]);
+    assert_eq!(code_of(&conflict), EXIT_USAGE);
+}

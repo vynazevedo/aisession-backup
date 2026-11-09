@@ -326,21 +326,36 @@ pub fn run_backup(request: &BackupRequest) -> Result<BackupReport> {
     run_backup_after_scan(request, |_| Ok(()))
 }
 
-fn run_backup_after_scan(
+pub struct PreparedBackup {
+    pub manifest: crate::model::Manifest,
+    pub files: Vec<(String, PathBuf)>,
+    pub bytes: u64,
+    pub secret_findings: usize,
+    pub changed_during_backup: Vec<String>,
+    pub sqlite_snapshots: usize,
+    pub sqlite_fallbacks: Vec<String>,
+    _snapshots: tempfile::TempDir,
+    _staging: tempfile::TempDir,
+}
+
+pub fn prepare_backup(
     request: &BackupRequest,
+    workdir: &std::path::Path,
+) -> Result<PreparedBackup> {
+    prepare_backup_after_scan(request, workdir, |_| Ok(()))
+}
+
+fn prepare_backup_after_scan(
+    request: &BackupRequest,
+    workdir: &std::path::Path,
     after_scan: impl FnOnce(&BackupInputs) -> Result<()>,
-) -> Result<BackupReport> {
+) -> Result<PreparedBackup> {
     let mut input = collect_inputs(request, false, true)?;
     let plan = backup_plan(request, &input)?;
     if plan.has_refusals() {
         bail!("backup plan contains refusals")
     }
     after_scan(&input)?;
-    let parent = request
-        .output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
     let mut builder = tempfile::Builder::new();
     builder.prefix(".aisession-backup-snapshot-");
     #[cfg(unix)]
@@ -348,35 +363,64 @@ fn run_backup_after_scan(
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    let snapshots = builder.tempdir_in(parent)?;
+    let snapshots = builder.tempdir_in(workdir)?;
     let summary = snapshot_inputs(&mut input, snapshots.path())?;
-    let mut findings = 0;
+    let mut secret_findings = 0;
     let mut bytes = 0;
     for (name, path) in &input.files {
         bytes += std::fs::metadata(path)?.len();
-        findings += crate::secrets::scan_reader("archive", name, std::fs::File::open(path)?)?
-            .iter()
-            .map(|f| f.count)
-            .sum::<usize>();
+        secret_findings +=
+            crate::secrets::scan_reader("archive", name, std::fs::File::open(path)?)?
+                .iter()
+                .map(|f| f.count)
+                .sum::<usize>();
     }
+    Ok(PreparedBackup {
+        manifest: input.manifest,
+        files: input.files,
+        bytes,
+        secret_findings,
+        changed_during_backup: summary.changed,
+        sqlite_snapshots: summary.sqlite,
+        sqlite_fallbacks: summary.sqlite_fallbacks,
+        _snapshots: snapshots,
+        _staging: input._staging,
+    })
+}
+
+fn run_backup_after_scan(
+    request: &BackupRequest,
+    after_scan: impl FnOnce(&BackupInputs) -> Result<()>,
+) -> Result<BackupReport> {
+    let parent = request
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let prepared = prepare_backup_after_scan(request, parent, after_scan)?;
     crate::archive::write(
         &request.output,
         request.overwrite,
-        &input.manifest,
-        &input.files,
+        &prepared.manifest,
+        &prepared.files,
         &request.passphrase,
     )?;
     Ok(BackupReport {
         output: request.output.clone(),
         encrypted: matches!(request.passphrase, Passphrase::Value(_)),
-        sessions: input.manifest.sessions.len(),
-        provider_items: input.manifest.providers.iter().map(|p| p.items.len()).sum(),
-        files: input.files.len(),
-        bytes,
-        secret_findings: findings,
-        changed_during_backup: summary.changed,
-        sqlite_snapshots: summary.sqlite,
-        sqlite_fallbacks: summary.sqlite_fallbacks,
+        sessions: prepared.manifest.sessions.len(),
+        provider_items: prepared
+            .manifest
+            .providers
+            .iter()
+            .map(|p| p.items.len())
+            .sum(),
+        files: prepared.files.len(),
+        bytes: prepared.bytes,
+        secret_findings: prepared.secret_findings,
+        changed_during_backup: prepared.changed_during_backup,
+        sqlite_snapshots: prepared.sqlite_snapshots,
+        sqlite_fallbacks: prepared.sqlite_fallbacks,
     })
 }
 
@@ -968,8 +1012,15 @@ pub(crate) fn checked_dest(base: &std::path::Path, rel: &str) -> Result<PathBuf>
 }
 
 pub fn prepare_restore(request: RestoreRequest) -> Result<PreparedRestore> {
-    use crate::provider::FileClass;
     let staged = crate::archive::stage(&request.archive, &request.passphrase)?;
+    prepare_restore_from(request, staged)
+}
+
+pub fn prepare_restore_from(
+    request: RestoreRequest,
+    staged: crate::archive::StagedArchive,
+) -> Result<PreparedRestore> {
+    use crate::provider::FileClass;
     let mut planner = Planner {
         request: &request,
         staging: staged.staging.path(),

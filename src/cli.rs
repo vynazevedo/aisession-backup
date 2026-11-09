@@ -129,6 +129,13 @@ pub enum Commands {
         output: Option<String>,
         #[arg(long, help = "Overwrite output archive if it already exists")]
         overwrite: bool,
+        #[arg(
+            long,
+            value_name = "LOCATION",
+            conflicts_with_all = ["output", "encrypt", "overwrite"],
+            help = "Write an incremental snapshot to a repository (directory or s3://bucket/prefix)"
+        )]
+        repo: Option<String>,
         #[arg(long, help = "Print the backup plan and exit without writing")]
         dry_run: bool,
         #[arg(long, help = "Output JSON to stdout")]
@@ -138,8 +145,27 @@ pub enum Commands {
     },
     #[command(about = "Restore sessions and provider items from an archive")]
     Restore {
-        #[arg(value_name = "FILE", help = "Path to the backup archive")]
-        backup_file: String,
+        #[arg(
+            value_name = "FILE",
+            required_unless_present = "repo",
+            help = "Path to the backup archive"
+        )]
+        backup_file: Option<String>,
+        #[arg(
+            long,
+            value_name = "LOCATION",
+            conflicts_with = "backup_file",
+            help = "Restore from a repository (directory or s3://bucket/prefix)"
+        )]
+        repo: Option<String>,
+        #[arg(
+            long,
+            value_name = "ID",
+            default_value = "latest",
+            requires = "repo",
+            help = "Snapshot to restore from the repository"
+        )]
+        snapshot: String,
         #[arg(short, long, help = "Destination Claude directory")]
         dest: Option<String>,
         #[arg(
@@ -280,6 +306,14 @@ pub enum Commands {
         #[arg(long, help = "Output JSON to stdout")]
         json: bool,
     },
+    #[command(
+        about = "Manage incremental backup repositories",
+        long_about = "Manage incremental backup repositories.\n\nA repository stores deduplicated, compressed chunks and one small snapshot per backup. LOCATION is a directory or s3://bucket/prefix, with credentials from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and an optional AISESSION_BACKUP_S3_ENDPOINT for R2 or MinIO."
+    )]
+    Repo {
+        #[command(subcommand)]
+        action: RepoAction,
+    },
     #[command(about = "Generate shell completion scripts")]
     Completions {
         #[arg(
@@ -354,6 +388,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             encrypt,
             output,
             overwrite,
+            repo,
             dry_run,
             json,
             yes,
@@ -367,12 +402,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             encrypt,
             output,
             overwrite,
+            repo,
             dry_run,
             json,
             yes,
         }),
         Commands::Restore {
             backup_file,
+            repo,
+            snapshot,
             dest,
             provider_home,
             mappings,
@@ -390,6 +428,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             no_verify_checksum,
         } => cmd_restore(RestoreArgs {
             backup_file,
+            repo,
+            snapshot,
             dest,
             provider_home,
             mappings,
@@ -460,6 +500,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             yes,
             json,
         }),
+        Commands::Repo { action } => cmd_repo(action),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "aisession-backup", &mut io::stdout());
@@ -482,13 +523,16 @@ struct BackupArgs {
     encrypt: bool,
     output: Option<String>,
     overwrite: bool,
+    repo: Option<String>,
     dry_run: bool,
     json: bool,
     yes: bool,
 }
 
 struct RestoreArgs {
-    backup_file: String,
+    backup_file: Option<String>,
+    repo: Option<String>,
+    snapshot: String,
     dest: Option<String>,
     provider_home: Vec<String>,
     mappings: Option<String>,
@@ -712,6 +756,172 @@ pub(crate) fn resolve_decrypt_passphrase(path: &Path) -> Result<Passphrase> {
         return Ok(Passphrase::Value(pass));
     }
     Ok(Passphrase::None)
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RepoAction {
+    #[command(about = "Create an empty repository")]
+    Init {
+        #[arg(value_name = "LOCATION")]
+        location: String,
+        #[arg(long, help = "Encrypt chunks and snapshots with a passphrase")]
+        encrypt: bool,
+    },
+    #[command(about = "List the snapshots in a repository, newest first")]
+    Snapshots {
+        #[arg(value_name = "LOCATION")]
+        location: String,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(about = "Check snapshots and chunks for missing or corrupt data")]
+    Check {
+        #[arg(value_name = "LOCATION")]
+        location: String,
+        #[arg(long, help = "Also read and verify every stored chunk")]
+        read_data: bool,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(about = "Keep the newest snapshots and delete unreferenced data")]
+    Prune {
+        #[arg(value_name = "LOCATION")]
+        location: String,
+        #[arg(long, value_name = "N", help = "Number of newest snapshots to keep")]
+        keep_last: usize,
+        #[arg(long, help = "Show what would be removed without deleting")]
+        dry_run: bool,
+        #[arg(short, long, help = "Skip confirmation prompt")]
+        yes: bool,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+}
+
+fn cmd_repo(action: RepoAction) -> Result<()> {
+    match action {
+        RepoAction::Init { location, encrypt } => {
+            let backend = open_backend(&location)?;
+            let passphrase = match resolve_encrypt_passphrase(encrypt)? {
+                Passphrase::Value(value) => Some(value),
+                Passphrase::None => None,
+            };
+            crate::repo::Repository::init(backend, passphrase.as_deref())?;
+            println!(
+                "Repository created at {}{}",
+                sanitize(&location),
+                if encrypt { " (encrypted)" } else { "" }
+            );
+            Ok(())
+        }
+        RepoAction::Snapshots { location, json } => {
+            let snapshots = open_repository(&location)?.list_snapshots()?;
+            if json {
+                return ui::print_json(&snapshots);
+            }
+            if snapshots.is_empty() {
+                println!("No snapshots yet.");
+            }
+            for snapshot in &snapshots {
+                println!(
+                    "{}  {}  {}  {}  {}",
+                    sanitize(&snapshot.id),
+                    snapshot.created_at.format("%Y-%m-%d %H:%M"),
+                    sanitize(&snapshot.host),
+                    ui::plural(snapshot.files, "file"),
+                    ui::human_size(snapshot.total_bytes)
+                );
+            }
+            Ok(())
+        }
+        RepoAction::Check {
+            location,
+            read_data,
+            json,
+        } => {
+            let report = open_repository(&location)?.check(read_data)?;
+            let healthy = report.missing.is_empty() && report.corrupt.is_empty();
+            if json {
+                ui::print_json(&report)?;
+            } else {
+                println!(
+                    "{}: {}, {}, {} missing, {} corrupt",
+                    if healthy {
+                        "Repository OK"
+                    } else {
+                        "Repository has problems"
+                    },
+                    ui::plural(report.snapshots, "snapshot"),
+                    ui::plural(report.chunks, "chunk"),
+                    report.missing.len(),
+                    report.corrupt.len()
+                );
+                for problem in report.missing.iter().chain(&report.corrupt).take(20) {
+                    println!("  {}", sanitize(problem));
+                }
+            }
+            if healthy {
+                Ok(())
+            } else {
+                Err(CliExit::new(EXIT_VERIFY_FAILED, "repository check failed").into())
+            }
+        }
+        RepoAction::Prune {
+            location,
+            keep_last,
+            dry_run,
+            yes,
+            json,
+        } => {
+            if keep_last == 0 {
+                return Err(CliExit::new(EXIT_USAGE, "--keep-last must be at least 1").into());
+            }
+            let repository = open_repository(&location)?;
+            let preview = repository.prune(keep_last, true)?;
+            let report = if dry_run || preview.snapshots_removed.is_empty() {
+                preview
+            } else {
+                if !yes {
+                    if !io::stdin().is_terminal() {
+                        return Err(CliExit::new(
+                            EXIT_CONFIRM_REQUIRED,
+                            "confirmation required: pass --yes to prune without a TTY",
+                        )
+                        .into());
+                    }
+                    eprint!(
+                        "Delete {} and {}? [y/N]: ",
+                        ui::plural(preview.snapshots_removed.len(), "snapshot"),
+                        ui::plural(preview.chunks_removed.len(), "chunk")
+                    );
+                    io::stderr().flush()?;
+                    let mut line = String::new();
+                    io::stdin().lock().read_line(&mut line)?;
+                    if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                        return Err(
+                            CliExit::new(EXIT_CONFIRM_REQUIRED, "confirmation declined").into()
+                        );
+                    }
+                }
+                repository.prune(keep_last, false)?
+            };
+            if json {
+                return ui::print_json(&report);
+            }
+            println!(
+                "{}{} and {} ({})",
+                if report.dry_run {
+                    "Would remove "
+                } else {
+                    "Removed "
+                },
+                ui::plural(report.snapshots_removed.len(), "snapshot"),
+                ui::plural(report.chunks_removed.len(), "chunk"),
+                ui::human_size(report.bytes_removed)
+            );
+            Ok(())
+        }
+    }
 }
 
 struct ConvertArgs {
@@ -1023,7 +1233,153 @@ fn cmd_scan(provider_arg: Option<&str>, opts: ScanOptions, flat: bool, json: boo
     Ok(())
 }
 
+fn open_backend(location: &str) -> Result<Box<dyn crate::repo::Backend>> {
+    if crate::remote::is_remote(location) {
+        Ok(Box::new(crate::remote::S3Backend::from_env(location)?))
+    } else {
+        Ok(Box::new(crate::repo::LocalBackend::new(expand_path(
+            location,
+        ))?))
+    }
+}
+
+fn env_or_prompt_passphrase(prompt: &str) -> Result<String> {
+    if let Some(value) = crate::archive::env_setting("PASSPHRASE")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value);
+    }
+    if !io::stdin().is_terminal() {
+        return Err(CliExit::new(
+            EXIT_USAGE,
+            "passphrase required: set AISESSION_BACKUP_PASSPHRASE in non-interactive mode",
+        )
+        .into());
+    }
+    rpassword::prompt_password(prompt).context("reading passphrase")
+}
+
+fn open_repository(location: &str) -> Result<crate::repo::Repository> {
+    let backend = open_backend(location)?;
+    let passphrase = if crate::repo::requires_passphrase(backend.as_ref())? {
+        Some(env_or_prompt_passphrase("Repository passphrase: ")?)
+    } else {
+        None
+    };
+    crate::repo::Repository::open(backend, passphrase.as_deref())
+}
+
+#[derive(serde::Serialize)]
+struct RepoBackupReport {
+    repository: String,
+    #[serde(flatten)]
+    snapshot: crate::repo::SnapshotSummary,
+    sessions: usize,
+    provider_items: usize,
+    secret_findings: usize,
+    changed_during_backup: Vec<String>,
+    sqlite_snapshots: usize,
+    sqlite_fallbacks: Vec<String>,
+}
+
+fn cmd_backup_repo(request: &engine::BackupRequest, location: &str, json: bool) -> Result<()> {
+    let repository = open_repository(location)?;
+    let staging = crate::archive::staging_dir()?;
+    let prepared = engine::prepare_backup(request, staging.path())?;
+    let summary = repository.write_snapshot(
+        &prepared.manifest,
+        &prepared.files,
+        &prepared.manifest.source_host,
+    )?;
+    let report = RepoBackupReport {
+        repository: sanitize(location),
+        snapshot: summary,
+        sessions: prepared.manifest.sessions.len(),
+        provider_items: prepared
+            .manifest
+            .providers
+            .iter()
+            .map(|p| p.items.len())
+            .sum(),
+        secret_findings: prepared.secret_findings,
+        changed_during_backup: prepared.changed_during_backup,
+        sqlite_snapshots: prepared.sqlite_snapshots,
+        sqlite_fallbacks: prepared.sqlite_fallbacks,
+    };
+    if json {
+        return ui::print_json(&report);
+    }
+    let s = &report.snapshot;
+    println!(
+        "Snapshot {} written to {}",
+        sanitize(&s.snapshot_id),
+        report.repository
+    );
+    println!(
+        "  {} | {} | {} in the snapshot",
+        ui::plural(report.sessions, "session"),
+        ui::plural(report.provider_items, "provider item"),
+        ui::plural(s.files, "file")
+    );
+    println!(
+        "  New data stored: {} ({} new, {} reused) of {} total",
+        ui::human_size(s.new_bytes),
+        ui::plural(s.new_chunks, "chunk"),
+        ui::plural(s.reused_chunks, "chunk"),
+        ui::human_size(s.total_bytes)
+    );
+    if report.sqlite_snapshots > 0 {
+        println!(
+            "  SQLite: {} copied with the SQLite backup API and checked",
+            ui::plural(report.sqlite_snapshots, "database")
+        );
+    }
+    for reason in report.sqlite_fallbacks.iter().take(10) {
+        println!("  Warning: copied as a plain file: {}", sanitize(reason));
+    }
+    if !report.changed_during_backup.is_empty() {
+        println!(
+            "  Warning: {} changed during the backup",
+            ui::plural(report.changed_during_backup.len(), "file")
+        );
+    }
+    Ok(())
+}
+
 fn cmd_backup(args: BackupArgs) -> Result<()> {
+    if let Some(location) = args.repo.clone() {
+        let request = build_selection_request(
+            SelectionSpec {
+                provider: args.provider,
+                match_path: args.match_path,
+                full: args.full,
+                config: args.config,
+                include_state: args.include_state,
+                include_credentials: args.include_credentials,
+            },
+            PathBuf::from(format!("{}#new-snapshot", sanitize(&location))),
+            false,
+            Passphrase::None,
+        )?;
+        let plan = engine::plan_backup(&request)?;
+        if args.dry_run {
+            if args.json {
+                ui::print_json(&plan)?;
+            } else {
+                ui::print_plan(&plan, false);
+            }
+            return Ok(());
+        }
+        if plan.has_refusals() {
+            ui::print_plan(&plan, false);
+            return Err(
+                CliExit::new(EXIT_PLAN_REFUSED, "backup plan contains refused operations").into(),
+            );
+        }
+        confirm_or_abort(&plan, args.yes, args.json)?;
+        return cmd_backup_repo(&request, &location, args.json);
+    }
     let ext = if args.encrypt { "tar.gz.age" } else { "tar.gz" };
     let output_str = args.output.unwrap_or_else(|| {
         format!(
@@ -1080,9 +1436,49 @@ fn cmd_backup(args: BackupArgs) -> Result<()> {
     Ok(())
 }
 
+fn stage_repository_snapshot(
+    location: &str,
+    snapshot: &str,
+) -> Result<crate::archive::StagedArchive> {
+    let repository = open_repository(location)?;
+    let staging = crate::archive::staging_dir()?;
+    let (manifest, files) = repository.stage_snapshot(snapshot, staging.path())?;
+    let report = engine::VerifyReport {
+        encrypted: false,
+        schema_version: manifest.schema_version,
+        checked: files.len(),
+        mismatches: Vec::new(),
+        unexpected_entries: Vec::new(),
+        unsafe_entries: Vec::new(),
+    };
+    Ok(crate::archive::StagedArchive {
+        staging,
+        manifest,
+        files,
+        report,
+    })
+}
+
 fn cmd_restore(args: RestoreArgs) -> Result<()> {
     let claude_dir = resolve_claude_dir(args.dest.as_deref());
-    let archive = expand_path(&args.backup_file);
+    let (archive, staged) = match (&args.backup_file, &args.repo) {
+        (Some(file), None) => (expand_path(file), None),
+        (None, Some(location)) => (
+            PathBuf::from(format!(
+                "{}#{}",
+                sanitize(location),
+                sanitize(&args.snapshot)
+            )),
+            Some(stage_repository_snapshot(location, &args.snapshot)?),
+        ),
+        _ => {
+            return Err(CliExit::new(
+                EXIT_USAGE,
+                "pass either an archive file or --repo, not both",
+            )
+            .into())
+        }
+    };
     let mappings = parse_mappings(args.mappings.as_deref().unwrap_or(""))?;
     let only_providers = match args.provider.as_deref() {
         Some(raw) => {
@@ -1095,7 +1491,11 @@ fn cmd_restore(args: RestoreArgs) -> Result<()> {
         }
         None => None,
     };
-    let passphrase = resolve_decrypt_passphrase(&archive)?;
+    let passphrase = if staged.is_some() {
+        Passphrase::None
+    } else {
+        resolve_decrypt_passphrase(&archive)?
+    };
     let provider_homes = restore_provider_homes(
         args.dest.is_some(),
         &claude_dir,
@@ -1121,7 +1521,10 @@ fn cmd_restore(args: RestoreArgs) -> Result<()> {
         skip_verify: args.no_verify_checksum,
     };
 
-    let prepared = engine::prepare_restore(request)?;
+    let prepared = match staged {
+        Some(staged) => engine::prepare_restore_from(request, staged)?,
+        None => engine::prepare_restore(request)?,
+    };
     if args.dry_run {
         if args.json {
             ui::print_json(&prepared.plan)?;
