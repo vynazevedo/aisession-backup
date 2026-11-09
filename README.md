@@ -115,6 +115,50 @@ Sem terminal, mostra a ajuda.
 
 ---
 
+## Convertendo sessões entre Claude Code e Codex
+
+`convert` leva uma conversa de uma ferramenta para a outra. Por exemplo, para
+continuar no Claude Code uma sessão iniciada no Codex:
+
+```bash
+aisession-backup convert <id-da-sessão> --to claude --dry-run
+aisession-backup convert <id-da-sessão> --to claude
+cd /caminho/do/projeto && claude --resume <id-gerado>
+```
+
+A sessão de origem pode ser indicada pelo id, como aparece em `list` e `scan`, ou
+pelo caminho do arquivo. A ferramenta de origem é detectada pelo formato, e
+`--from` resolve ambiguidades. `-m origem:destino` muda o diretório do projeto, e
+`--dest` grava em outro diretório da ferramenta de destino. Na interface, a tecla
+`t` converte a sessão sob o cursor.
+
+| Item | O que acontece |
+|------|----------------|
+| Mensagens do usuário e do assistente | Convertidas, na ordem original |
+| Chamadas de ferramenta e resultados | Viram texto legível, com até 2.000 caracteres cada |
+| Raciocínio do modelo | Fica de fora. O do Codex é criptografado e o do Claude é assinado |
+| Imagens | Ficam de fora |
+| Contexto injetado pela ferramenta | Fica de fora, como `AGENTS.md` e lembretes de sistema |
+| Subagentes do Claude Code | Ficam de fora |
+
+A primeira mensagem da sessão convertida informa a origem. O plano lista tudo o
+que ficou de fora, e o relatório em `--json` traz as contagens.
+
+- **Idempotente.** O id da sessão gerada é derivado da sessão de origem. Converter
+  de novo resulta em `skip`, sem duplicar.
+- **Reversível.** Cada conversão grava um journal, e `rollback` remove a sessão
+  criada. No Codex, a entrada no `session_index.jsonl` também é desfeita.
+- **Ferramenta aberta.** Converter para o Claude Code cria um arquivo novo e é
+  seguro com ele aberto. Converter para o Codex altera o índice de sessões, então
+  feche o Codex ou use `--allow-running`.
+
+Os formatos de sessão das duas ferramentas não são documentados e mudam entre
+versões. A conversão foi validada lendo de volta as sessões geradas a partir de 70
+sessões reais, de Claude Code 2.1 e Codex 0.16x. Retomar a sessão convertida na
+ferramenta de destino ainda não faz parte dos testes automáticos.
+
+---
+
 ## Migrando entre Linux, macOS e Windows
 
 O arquivo de backup é portátil: pode ser gerado em qualquer um dos três sistemas e
@@ -275,7 +319,8 @@ Ainda não foram cobertos entre sistemas diferentes:
 | `list [arquivo]` | Lista sessões locais ou de um arquivo, agrupadas por diretório |
 | `restore <arquivo>` | Restaura sessões e itens de provedores |
 | `history` | Lista os restores registrados no journal |
-| `rollback <id>` | Desfaz um restore |
+| `rollback <id>` | Desfaz um restore ou uma conversão |
+| `convert <sessão> --to <ferramenta>` | Converte uma sessão entre Claude Code e Codex |
 | `completions <shell>` | Gera autocomplete para bash, zsh, fish, elvish ou powershell |
 | `version` | Mostra a versão |
 
