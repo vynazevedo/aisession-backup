@@ -10,7 +10,19 @@ use crate::ui::{human_size, sanitize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconSet {
     Text,
+    Unicode,
     Nerd,
+}
+
+impl IconSet {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ascii" | "text" | "plain" => Some(IconSet::Text),
+            "unicode" | "default" => Some(IconSet::Unicode),
+            "nerd" | "nerdfont" | "nerd-font" => Some(IconSet::Nerd),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,14 +66,15 @@ impl Theme {
 
     pub fn from_env() -> Self {
         let color = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
-        let icons = match crate::archive::env_setting("ICONS")
+        let dumb = std::env::var("TERM").is_ok_and(|term| term == "dumb");
+        let icons = crate::archive::env_setting("ICONS")
             .and_then(|value| value.into_string().ok())
-            .as_deref()
-            .map(str::trim)
-        {
-            Some(value) if value.eq_ignore_ascii_case("nerd") => IconSet::Nerd,
-            _ => IconSet::Text,
-        };
+            .and_then(|value| IconSet::parse(&value))
+            .unwrap_or(if dumb {
+                IconSet::Text
+            } else {
+                IconSet::Unicode
+            });
         Self::new(color, icons)
     }
 
@@ -79,6 +92,18 @@ impl Theme {
             (IconSet::Text, Icon::Search) => "/",
             (IconSet::Text, Icon::Clock) => "@",
             (IconSet::Text, Icon::Bolt) => "+",
+            (IconSet::Unicode, Icon::Folder) => "\u{25b8}",
+            (IconSet::Unicode, Icon::FolderOpen) => "\u{25be}",
+            (IconSet::Unicode, Icon::Check) => "\u{25cf}",
+            (IconSet::Unicode, Icon::Partial) => "\u{25d0}",
+            (IconSet::Unicode, Icon::Empty) => "\u{25cb}",
+            (IconSet::Unicode, Icon::Warning) => "\u{25b2}",
+            (IconSet::Unicode, Icon::Lock) => "\u{25a0}",
+            (IconSet::Unicode, Icon::Archive) => "\u{25c6}",
+            (IconSet::Unicode, Icon::Arrow) => "\u{2192}",
+            (IconSet::Unicode, Icon::Search) => "\u{25ce}",
+            (IconSet::Unicode, Icon::Clock) => "\u{25f7}",
+            (IconSet::Unicode, Icon::Bolt) => "\u{25b6}",
             (IconSet::Nerd, Icon::Folder) => "\u{f07b}",
             (IconSet::Nerd, Icon::FolderOpen) => "\u{f07c}",
             (IconSet::Nerd, Icon::Check) => "\u{f14a}",
@@ -97,14 +122,14 @@ impl Theme {
     pub fn spinner_len(&self) -> usize {
         match self.icons {
             IconSet::Text => TEXT_SPINNER.len(),
-            IconSet::Nerd => BRAILLE_SPINNER.len(),
+            IconSet::Unicode | IconSet::Nerd => BRAILLE_SPINNER.len(),
         }
     }
 
     pub fn spinner(&self, frame: usize) -> &'static str {
         match self.icons {
             IconSet::Text => TEXT_SPINNER[frame % TEXT_SPINNER.len()],
-            IconSet::Nerd => BRAILLE_SPINNER[frame % BRAILLE_SPINNER.len()],
+            IconSet::Unicode | IconSet::Nerd => BRAILLE_SPINNER[frame % BRAILLE_SPINNER.len()],
         }
     }
 
@@ -149,16 +174,16 @@ impl Theme {
     }
 
     pub fn border(&self) -> Style {
-        self.fg(Color::Indexed(239))
+        self.fg(Color::Indexed(245))
     }
 
     pub fn selected_row(&self) -> Style {
         if self.color {
             Style::default()
-                .bg(Color::Indexed(236))
+                .bg(Color::Indexed(238))
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().add_modifier(Modifier::REVERSED)
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         }
     }
 
@@ -179,7 +204,7 @@ impl Theme {
             "codex" => Color::Indexed(42),
             "grok" => Color::Indexed(252),
             "gemini" => Color::Indexed(75),
-            "agy" => Color::Indexed(141),
+            "agy" | "antigravity" => Color::Indexed(141),
             "maestri" => Color::Indexed(220),
             "opencode" => Color::Indexed(51),
             _ => Color::Indexed(250),
@@ -214,16 +239,85 @@ pub fn header<'a>(theme: &Theme, screen: &str, context: &str) -> Paragraph<'a> {
     Paragraph::new(Line::from(spans))
 }
 
+pub fn plural(count: usize, word: &str) -> String {
+    crate::ui::plural(count, word)
+}
+
+pub fn truncate_left(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let tail: String = text.chars().skip(count - (width - 1)).collect();
+    format!("\u{2026}{tail}")
+}
+
+pub fn home_relative(path: &std::path::Path) -> String {
+    let text = sanitize(&path.display().to_string());
+    if let Some(home) = dirs::home_dir() {
+        let home = home.display().to_string();
+        if !home.is_empty() && home != "/" {
+            if let Some(rest) = text.strip_prefix(&home) {
+                if rest.is_empty() || rest.starts_with(['/', '\\']) {
+                    return format!("~{rest}");
+                }
+            }
+        }
+    }
+    text
+}
+
+pub fn chip_spans(theme: &Theme, key: &str, label: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(format!(" {key} "), theme.key()),
+        Span::styled(format!(" {label}"), theme.muted()),
+    ]
+}
+
+fn chip_width(key: &str, label: &str) -> usize {
+    key.chars().count() + label.chars().count() + 3
+}
+
+pub fn chip_lines(theme: &Theme, keys: &[(&str, &str)], width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (key, label) in keys {
+        let needed = chip_width(key, label);
+        let gap = if spans.is_empty() { 0 } else { 2 };
+        if !spans.is_empty() && used + gap + needed > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        } else if gap > 0 {
+            spans.push(Span::raw("  "));
+            used += gap;
+        }
+        spans.extend(chip_spans(theme, key, label));
+        used += needed;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+pub fn render_footer(f: &mut Frame, area: Rect, theme: &Theme, keys: &[(&str, &str)]) {
+    f.render_widget(Paragraph::new(chip_lines(theme, keys, area.width)), area);
+}
+
 pub fn footer<'a>(theme: &Theme, keys: &[(&str, &str)]) -> Paragraph<'a> {
     let mut spans = Vec::new();
     for (index, (key, label)) in keys.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(format!(" {key} "), theme.key()));
-        spans.push(Span::styled(format!(" {label}"), theme.muted()));
+        spans.extend(chip_spans(theme, key, label));
     }
-    Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true })
+    Paragraph::new(Line::from(spans))
 }
 
 pub fn status_line<'a>(theme: &Theme, message: &str, danger: bool) -> Paragraph<'a> {
@@ -258,15 +352,29 @@ pub fn split_with_details(area: Rect) -> (Rect, Option<Rect>) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .spacing(1)
         .split(area);
     (chunks[0], Some(chunks[1]))
 }
 
-pub fn render_help(f: &mut Frame, theme: &Theme, title: &str, keys: &[(&str, &str)]) {
+pub fn dim_frame(f: &mut Frame, _theme: &Theme) {
     let area = f.area();
-    let width = area.width.saturating_sub(4).min(64);
-    let height = (keys.len() as u16 + 4).min(area.height.saturating_sub(2));
-    if width < 10 || height < 3 {
+    let buffer = f.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buffer[(x, y)];
+            cell.set_symbol(" ");
+            cell.set_style(Style::reset());
+        }
+    }
+}
+
+pub fn render_help(f: &mut Frame, theme: &Theme, title: &str, keys: &[(&str, &str)]) {
+    dim_frame(f, theme);
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(68);
+    let height = (keys.len() as u16 + 5).min(area.height.saturating_sub(2));
+    if width < 10 || height < 4 {
         return;
     }
     let popup = Rect {
@@ -275,15 +383,16 @@ pub fn render_help(f: &mut Frame, theme: &Theme, title: &str, keys: &[(&str, &st
         width,
         height,
     };
-    let lines: Vec<Line> = keys
-        .iter()
-        .map(|(key, label)| {
-            Line::from(vec![
-                Span::styled(format!(" {key:>9} "), theme.accent()),
-                Span::raw(format!("  {label}")),
-            ])
-        })
-        .collect();
+    let mut lines = vec![
+        Line::from(chip_spans(theme, "esc", "close this help")),
+        Line::from(""),
+    ];
+    lines.extend(keys.iter().map(|(key, label)| {
+        Line::from(vec![
+            Span::styled(format!(" {key:>10} "), theme.accent()),
+            Span::raw(format!("  {label}")),
+        ])
+    }));
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(lines)
@@ -293,12 +402,11 @@ pub fn render_help(f: &mut Frame, theme: &Theme, title: &str, keys: &[(&str, &st
     );
 }
 
-fn count_span(theme: &Theme, label: &str, count: usize, style: Style) -> Span<'static> {
-    let style = if count == 0 { theme.muted() } else { style };
-    Span::styled(format!("{label} {count}"), style)
+pub fn plan_lines(plan: Option<&Plan>, theme: &Theme) -> Vec<Line<'static>> {
+    plan_lines_width(plan, theme, 120)
 }
 
-pub fn plan_lines(plan: Option<&Plan>, theme: &Theme) -> Vec<Line<'static>> {
+pub fn plan_lines_width(plan: Option<&Plan>, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let Some(plan) = plan else {
         return vec![Line::from(Span::styled(
             "Calculating the plan...",
@@ -306,39 +414,56 @@ pub fn plan_lines(plan: Option<&Plan>, theme: &Theme) -> Vec<Line<'static>> {
         ))];
     };
     let summary = plan.summary();
-    let gap = || Span::raw("   ");
-    let mut lines = vec![
-        Line::from(vec![
-            count_span(theme, "create", summary.create, theme.success()),
-            gap(),
-            count_span(theme, "overwrite", summary.overwrite, theme.warning()),
-            gap(),
-            count_span(theme, "merge", summary.merge, theme.info()),
-            gap(),
-            count_span(theme, "skip", summary.skip, theme.muted()),
-            gap(),
-            count_span(theme, "refuse", summary.refuse, theme.danger()),
-            gap(),
-            Span::styled(human_size(summary.bytes), theme.strong()),
-        ]),
-        Line::from(vec![
-            Span::styled("risk ", theme.muted()),
-            count_span(
-                theme,
-                "executes code",
-                summary.executes_code,
-                theme.danger(),
-            ),
-            gap(),
-            count_span(theme, "sensitive", summary.sensitive, theme.warning()),
-        ]),
-    ];
+    let mut counts: Vec<Span<'static>> = Vec::new();
+    for (label, count, style) in [
+        ("create", summary.create, theme.success()),
+        ("overwrite", summary.overwrite, theme.warning()),
+        ("merge", summary.merge, theme.info()),
+        ("skip", summary.skip, theme.muted()),
+        ("refuse", summary.refuse, theme.danger()),
+    ] {
+        if count > 0 {
+            counts.push(Span::styled(format!("{label} {count}"), style));
+            counts.push(Span::raw("   "));
+        }
+    }
+    if counts.is_empty() {
+        counts.push(Span::styled("nothing to do", theme.muted()));
+        counts.push(Span::raw("   "));
+    }
+    counts.push(Span::styled(human_size(summary.bytes), theme.strong()));
+    let mut lines = vec![Line::from(counts)];
+    let mut risks: Vec<Span<'static>> = Vec::new();
+    if summary.executes_code > 0 {
+        risks.push(Span::styled(
+            format!("{} executes code", plural(summary.executes_code, "item")),
+            theme.danger(),
+        ));
+    }
+    if summary.sensitive > 0 {
+        if !risks.is_empty() {
+            risks.push(Span::raw("   "));
+        }
+        risks.push(Span::styled(
+            format!("{} sensitive (SENS)", plural(summary.sensitive, "item")),
+            theme.warning(),
+        ));
+    }
+    if !risks.is_empty() {
+        risks.insert(0, Span::styled("risk  ", theme.muted()));
+        lines.push(Line::from(risks));
+    }
     if summary.refuse > 0 {
         lines.push(Line::from(Span::styled(
             format!(
-                "{} Blocked: {} operation(s) refused. Nothing will be written until they are resolved.",
+                "{} Blocked: {} refused. Nothing will be written until {} resolved.",
                 theme.icon(Icon::Warning),
-                summary.refuse
+                plural(summary.refuse, "operation"),
+                if summary.refuse == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                }
             ),
             theme.danger(),
         )));
@@ -363,7 +488,12 @@ pub fn plan_lines(plan: Option<&Plan>, theme: &Theme) -> Vec<Line<'static>> {
             Risk::Sensitive => Span::styled(" SENS ", theme.warning()),
             Risk::ExecutesCode => Span::styled(" EXEC ", theme.danger()),
         };
-        let mut spans = vec![
+        let fixed = 9 + 6 + 10 + 10;
+        let dest = truncate_left(
+            &home_relative(&op.dest),
+            width.saturating_sub(fixed).max(12),
+        );
+        lines.push(Line::from(vec![
             Span::styled(format!("{label:<9}"), style),
             risk,
             Span::styled(
@@ -371,19 +501,28 @@ pub fn plan_lines(plan: Option<&Plan>, theme: &Theme) -> Vec<Line<'static>> {
                 theme.provider(&op.provider),
             ),
             Span::styled(format!("{:>9} ", human_size(op.size)), theme.muted()),
-            Span::raw(sanitize(&op.dest.display().to_string())),
-        ];
+            Span::raw(dest),
+        ]));
         let reason = match &op.action {
             Action::Skip(reason) | Action::Refuse(reason) => sanitize(reason),
             _ => String::new(),
         };
         let note = sanitize(&op.note);
-        for extra in [reason, note] {
-            if !extra.is_empty() {
-                spans.push(Span::styled(format!("  {extra}"), theme.muted()));
-            }
+        let extra: Vec<String> = [reason, note]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !extra.is_empty() {
+            let reason_style = if matches!(op.action, Action::Refuse(_)) {
+                theme.danger()
+            } else {
+                theme.muted()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", " ".repeat(fixed), extra.join("  ")),
+                reason_style,
+            )));
         }
-        lines.push(Line::from(spans));
     }
     lines
 }
@@ -420,16 +559,16 @@ pub fn render_plan(
     plan: Option<&Plan>,
     scroll: &mut Scroll,
 ) {
-    let lines = plan_lines(plan, theme);
+    let lines = plan_lines_width(plan, theme, usize::from(area.width.saturating_sub(2)));
     scroll.clamp(lines.len(), area.height);
     let title = format!(
-        "Plan  {} {} operation(s)",
-        theme.icon(Icon::Bolt),
-        plan.map(|p| p.ops.len()).unwrap_or(0)
+        "Plan  {}",
+        plural(plan.map(|p| p.ops.len()).unwrap_or(0), "operation")
     );
     f.render_widget(
         Paragraph::new(lines)
             .block(theme.panel(&title))
+            .wrap(Wrap { trim: false })
             .scroll((scroll.offset, 0)),
         area,
     );
@@ -481,9 +620,18 @@ mod tests {
     }
 
     #[test]
+    fn icon_sets_parse_from_their_names() {
+        assert_eq!(IconSet::parse("ASCII"), Some(IconSet::Text));
+        assert_eq!(IconSet::parse(" nerd "), Some(IconSet::Nerd));
+        assert_eq!(IconSet::parse("unicode"), Some(IconSet::Unicode));
+        assert_eq!(IconSet::parse("emoji"), None);
+    }
+
+    #[test]
     fn text_icons_are_ascii_and_nerd_icons_are_single_glyphs() {
         let text = Theme::new(true, IconSet::Text);
         let nerd = Theme::new(true, IconSet::Nerd);
+        let unicode = Theme::new(true, IconSet::Unicode);
         for icon in [
             Icon::Folder,
             Icon::FolderOpen,
@@ -500,6 +648,11 @@ mod tests {
         ] {
             assert!(text.icon(icon).is_ascii());
             assert_eq!(nerd.icon(icon).chars().count(), 1);
+            assert_eq!(unicode.icon(icon).chars().count(), 1);
+            assert!(unicode
+                .icon(icon)
+                .chars()
+                .all(|c| ('\u{2190}'..='\u{25ff}').contains(&c)));
         }
     }
 
@@ -526,7 +679,7 @@ mod tests {
         let theme = Theme::new(true, IconSet::Text);
         let lines = plan_lines(Some(&plan()), &theme);
         let rendered = text(&lines);
-        assert!(rendered.contains("Blocked: 1 operation(s) refused"));
+        assert!(rendered.contains("Blocked: 1 operation refused"));
         assert!(rendered.contains("REFUSE"));
         assert!(rendered.contains("EXEC"));
         assert!(!rendered.chars().any(|c| c.is_control() && c != '\n'));
@@ -548,6 +701,45 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn chips_wrap_only_between_whole_chips() {
+        let theme = Theme::new(false, IconSet::Text);
+        let keys = [
+            ("space", "select"),
+            ("enter", "open/close"),
+            ("q", "quit"),
+            ("?", "help"),
+        ];
+        let lines = chip_lines(&theme, &keys, 30);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect();
+            assert!(text.chars().count() <= 30, "{text}");
+            for (key, label) in keys {
+                assert_eq!(
+                    text.contains(&format!(" {key} ")),
+                    text.contains(&format!(" {label}"))
+                );
+            }
+        }
+        let single = chip_lines(&theme, &[("verylongkey", "an even longer label")], 5);
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn helpers_truncate_from_the_left_and_pluralize() {
+        assert_eq!(truncate_left("/a/b/c/.claude", 8), "\u{2026}.claude");
+        assert_eq!(truncate_left("short", 10), "short");
+        assert_eq!(truncate_left("abcdef", 4), "\u{2026}def");
+        assert_eq!(truncate_left("abcdef", 0), "");
+        assert_eq!(plural(1, "file"), "1 file");
+        assert_eq!(plural(3, "file"), "3 files");
     }
 
     #[test]

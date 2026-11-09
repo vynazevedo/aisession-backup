@@ -569,3 +569,11 @@ pub fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{text}");
     Ok(())
 }
+
+pub fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{count} {word}s")
+    }
+}

@@ -14,7 +14,7 @@ use crate::remap;
 use crate::ui::sanitize;
 
 use super::groups::{GroupPicker, PICKER_HELP_KEYS, PICKER_KEYS};
-use super::theme::{self, Icon, Scroll, Theme};
+use super::theme::{self, Icon, Scroll};
 use super::{current_user, with_terminal, Tui};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -48,6 +48,8 @@ pub struct RestoreApp {
     pub report: Option<RestoreReport>,
     pub confirmed: bool,
     pub cancelled: bool,
+    pub can_go_back: bool,
+    pub went_back: bool,
     pub passphrase: Passphrase,
     pub provider_homes: BTreeMap<ProviderId, PathBuf>,
     pub mapping_error: Option<String>,
@@ -92,6 +94,8 @@ impl RestoreApp {
             provider_homes: BTreeMap::new(),
             mapping_error: None,
             prepared: None,
+            can_go_back: false,
+            went_back: false,
         }
     }
 
@@ -217,6 +221,13 @@ impl RestoreApp {
                     return;
                 }
                 match code {
+                    KeyCode::Esc if !self.picker.filter.is_empty() => {
+                        self.picker.handle_key(code);
+                    }
+                    KeyCode::Esc if self.can_go_back => {
+                        self.went_back = true;
+                        self.step = RestoreStep::Done;
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => {
                         self.cancelled = true;
                         self.step = RestoreStep::Done;
@@ -373,25 +384,40 @@ impl RestoreApp {
         let theme = theme::current();
         let [top, body, bottom] = theme::frame_layout(f.area());
         let m = &self.manifest;
+        let origin = if m.source_host.trim().is_empty() {
+            format!("from {}", sanitize(&m.source_os))
+        } else {
+            format!(
+                "from {} ({})",
+                sanitize(&m.source_host),
+                sanitize(&m.source_os)
+            )
+        };
         let context = format!(
-            "{}/{} selected  |  from {} ({})",
+            "{} of {} selected  |  {origin}",
             self.picker.selected_count(),
             self.picker.entries.len(),
-            sanitize(&m.source_host),
-            sanitize(&m.source_os)
         );
         f.render_widget(theme::header(theme, "Restore", &context), top);
         self.picker
             .render(f, body, theme, "Directories in the archive");
-        let mut keys = PICKER_KEYS.to_vec();
+        let mut keys: Vec<(&str, &str)> = PICKER_KEYS.to_vec();
+        let esc = self.picker.esc_label();
+        if esc != "back" || self.can_go_back {
+            keys.push(("esc", esc));
+        }
         if self.selected_count() > 0 {
-            keys.insert(0, ("p", "proceed"));
+            keys.insert(0, ("p", "map paths"));
         }
         keys.push(("q", "quit"));
-        f.render_widget(theme::footer(theme, &keys), bottom);
+        theme::render_footer(f, bottom, theme, &keys);
         if self.show_help {
             let mut keys = PICKER_HELP_KEYS.to_vec();
-            keys.push(("p", "map paths and review the plan"));
+            if !self.can_go_back {
+                keys.retain(|(key, _)| *key != "esc");
+                keys.push(("esc", "leave or clear the filter, or quit"));
+            }
+            keys.push(("p", "map paths, then review the plan"));
             theme::render_help(f, theme, "Keys", &keys);
         }
     }
@@ -407,11 +433,21 @@ impl RestoreApp {
         );
         f.render_widget(theme::header(theme, "Path mapping", &context), top);
 
+        let unchanged = self.rows.iter().filter(|row| row.value == row.root).count();
+        let summary = if unchanged == self.rows.len() {
+            format!(
+                "{} keep their paths. Type a new destination to move one, or press enter.",
+                directories(self.rows.len())
+            )
+        } else {
+            format!(
+                "{} of {} move to a new path.",
+                self.rows.len() - unchanged,
+                directories(self.rows.len())
+            )
+        };
         let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                "Type the destination of each directory. Leave it unchanged to keep the path.",
-                theme.muted(),
-            )),
+            Line::from(Span::styled(summary, theme.muted())),
             Line::from(""),
         ];
         for (i, row) in self.rows.iter().enumerate() {
@@ -420,7 +456,10 @@ impl RestoreApp {
                 Span::styled(if focused { "> " } else { "  " }, theme.accent()),
                 Span::styled(format!("{} ", theme.icon(Icon::Folder)), theme.accent()),
                 Span::styled(sanitize(&row.root), theme.strong()),
-                Span::styled(format!("  {} item(s)", row.count), theme.muted()),
+                Span::styled(
+                    format!("  {}", theme::plural(row.count, "item")),
+                    theme.muted(),
+                ),
             ]));
             let value_style = if focused {
                 theme.selected_row()
@@ -450,39 +489,27 @@ impl RestoreApp {
         );
         match &self.mapping_error {
             Some(err) => f.render_widget(theme::status_line(theme, err, true), bottom),
-            None => f.render_widget(
-                theme::footer(
-                    theme,
-                    &[
-                        ("enter", "review plan"),
-                        ("tab", "next"),
-                        ("shift-tab", "previous"),
-                        ("type", "edit"),
-                        ("esc", "back"),
-                    ],
-                ),
-                bottom,
-            ),
+            None => {
+                let mut keys = vec![("enter", "review plan"), ("type", "edit")];
+                if self.rows.len() > 1 {
+                    keys.extend([("tab", "next"), ("shift-tab", "previous")]);
+                }
+                keys.push(("esc", "back"));
+                theme::render_footer(f, bottom, theme, &keys);
+            }
         }
     }
 
-    fn toggle_spans(&self, theme: &Theme) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        for (key, label, on) in [
-            ("r", "allow-running", self.flags.allow_running),
-            ("x", "exec-config", self.flags.allow_exec_config),
-            ("c", "credentials", self.flags.allow_credentials),
-            ("o", "overwrite", self.flags.overwrite_config),
-        ] {
-            spans.push(Span::styled(format!(" {key} "), theme.key()));
-            spans.push(Span::styled(format!(" {label} "), theme.muted()));
-            spans.push(if on {
-                Span::styled("ON  ", theme.warning())
-            } else {
-                Span::styled("off  ", theme.muted())
-            });
-        }
-        spans
+    fn toggle_labels(&self) -> Vec<String> {
+        [
+            ("allow running", self.flags.allow_running),
+            ("exec config", self.flags.allow_exec_config),
+            ("credentials", self.flags.allow_credentials),
+            ("overwrite", self.flags.overwrite_config),
+        ]
+        .iter()
+        .map(|(label, on)| format!("{label} {}", if *on { "ON" } else { "off" }))
+        .collect()
     }
 
     fn draw_preview(&mut self, f: &mut Frame) {
@@ -497,31 +524,23 @@ impl RestoreApp {
             theme::header(
                 theme,
                 title,
-                &format!("{} item(s) selected", self.selected_count()),
+                &format!("{} selected", theme::plural(self.selected_count(), "item")),
             ),
             top,
         );
         theme::render_plan(f, body, theme, self.plan.as_ref(), &mut self.plan_scroll);
         let blocked = self.plan.as_ref().is_some_and(Plan::has_refusals);
-        let mut keys = theme::PLAN_KEYS.to_vec();
-        keys.insert(
-            0,
-            if blocked {
-                ("blocked", "resolve REFUSE first")
-            } else {
-                ("enter", "restore")
-            },
-        );
+        let labels = self.toggle_labels();
+        let mut keys: Vec<(&str, &str)> = Vec::new();
+        if !blocked {
+            keys.push(("enter", "restore"));
+        }
+        for (key, label) in ["r", "x", "c", "o"].into_iter().zip(labels.iter()) {
+            keys.push((key, label.as_str()));
+        }
+        keys.extend(theme::PLAN_KEYS);
         keys.extend([("esc", "back"), ("?", "help"), ("q", "quit")]);
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
-            .split(bottom);
-        f.render_widget(theme::footer(theme, &keys), rows[0]);
-        f.render_widget(
-            Paragraph::new(Line::from(self.toggle_spans(theme))),
-            rows[1],
-        );
+        theme::render_footer(f, bottom, theme, &keys);
         if self.show_help {
             theme::render_help(
                 f,
@@ -582,7 +601,7 @@ impl RestoreApp {
                 .wrap(Wrap { trim: false }),
             body,
         );
-        f.render_widget(theme::footer(theme, &[("enter", "exit")]), bottom);
+        theme::render_footer(f, bottom, theme, &[("enter", "exit")]);
     }
 }
 
@@ -591,14 +610,32 @@ pub fn run_restore(
     claude_dir: &Path,
     flags: super::RestoreFlags,
 ) -> Result<()> {
+    run_restore_with(backup_path, claude_dir, flags, false).map(|_| ())
+}
+
+pub fn run_restore_from_home(
+    backup_path: &Path,
+    claude_dir: &Path,
+    flags: super::RestoreFlags,
+) -> Result<bool> {
+    run_restore_with(backup_path, claude_dir, flags, true)
+}
+
+fn run_restore_with(
+    backup_path: &Path,
+    claude_dir: &Path,
+    flags: super::RestoreFlags,
+    can_go_back: bool,
+) -> Result<bool> {
     let passphrase = crate::cli::resolve_decrypt_passphrase(backup_path)?;
     let archive = backup_path.to_path_buf();
     let stage_passphrase = passphrase.clone();
     let finished = with_terminal(|t| {
         let Some(staged) = super::loading::run_with_loading(
             t,
-            "Verifying and extracting the archive",
-            (ProviderId::Claude, "Archive"),
+            "Opening the archive",
+            "Checking every checksum and extracting to a private temporary folder.",
+            (ProviderId::Claude, "Archive", "verifying and extracting"),
             move || crate::archive::stage(&archive, &stage_passphrase),
         )?
         else {
@@ -611,17 +648,21 @@ pub fn run_restore(
         let mut app = RestoreApp::new(staged.manifest, backup_path, claude_dir, flags);
         app.passphrase = passphrase;
         app.provider_homes = crate::cli::default_provider_homes(claude_dir);
+        app.can_go_back = can_go_back;
         app.run(t)?;
         Ok(Some(app))
     })?;
     let Some(mut app) = finished else {
         println!("Cancelled.");
-        return Ok(());
+        return Ok(false);
     };
+    if app.went_back {
+        return Ok(true);
+    }
 
     if app.cancelled || !app.confirmed {
         println!("Cancelled.");
-        return Ok(());
+        return Ok(false);
     }
 
     let Some(prepared) = app.prepared.take() else {
@@ -629,7 +670,7 @@ pub fn run_restore(
     };
     if flags.dry_run {
         crate::ui::print_plan(&prepared.plan, false);
-        return Ok(());
+        return Ok(false);
     }
     let report = engine::apply_restore(prepared)?;
     print!(
@@ -642,5 +683,13 @@ pub fn run_restore(
             report.failed.len()
         );
     }
-    Ok(())
+    Ok(false)
+}
+
+fn directories(count: usize) -> String {
+    if count == 1 {
+        "1 directory".to_string()
+    } else {
+        format!("{count} directories")
+    }
 }

@@ -738,7 +738,7 @@ pub fn prepare_at(request: &ConvertRequest, now: DateTime<Utc>) -> Result<Prepar
             risk: Risk::Sensitive,
             size: rendered.bytes.len() as u64,
             rewrites: 0,
-            note: format!("{} message(s)", transcript.turns.len()),
+            note: crate::ui::plural(transcript.turns.len(), "message"),
         });
         writes.push(Write::Create {
             rel: rendered.rel.clone(),
@@ -778,8 +778,8 @@ pub fn prepare_at(request: &ConvertRequest, now: DateTime<Utc>) -> Result<Prepar
     }
     if dropped.sidechain > 0 {
         plan.warnings.push(format!(
-            "{} subagent message(s) were left out",
-            dropped.sidechain
+            "{} left out",
+            crate::ui::plural(dropped.sidechain, "subagent message")
         ));
     }
     let summary = ConvertSummary {

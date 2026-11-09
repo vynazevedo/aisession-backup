@@ -95,6 +95,9 @@ impl BackupApp {
                     return;
                 }
                 match code {
+                    KeyCode::Esc if !self.picker.filter.is_empty() => {
+                        self.picker.handle_key(code);
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => {
                         self.action = Some(BackupAction::Cancel);
                         self.step = BackupStep::Done;
@@ -181,7 +184,7 @@ impl BackupApp {
         let selected = self.selected_count();
         if self.step == BackupStep::Confirm {
             f.render_widget(
-                theme::header(theme, "Backup plan", &format!("{selected} session(s)")),
+                theme::header(theme, "Backup plan", &theme::plural(selected, "session")),
                 top,
             );
             theme::render_plan(f, body, theme, self.plan.as_ref(), &mut self.plan_scroll);
@@ -190,23 +193,29 @@ impl BackupApp {
                 keys.insert(0, ("enter", "write backup"));
             }
             keys.extend([("esc", "back"), ("q", "quit")]);
-            f.render_widget(theme::footer(theme, &keys), bottom);
+            theme::render_footer(f, bottom, theme, &keys);
         } else {
             f.render_widget(
                 theme::header(
                     theme,
                     "Backup",
-                    &format!("{selected}/{} session(s) selected", self.sessions.len()),
+                    &format!(
+                        "{selected} of {} selected",
+                        theme::plural(self.sessions.len(), "session")
+                    ),
                 ),
                 top,
             );
             self.picker.render(f, body, theme, "Directories");
-            let mut keys = PICKER_KEYS.to_vec();
+            let mut keys: Vec<(&str, &str)> = PICKER_KEYS.to_vec();
             if selected > 0 {
                 keys.insert(0, ("b", "backup"));
             }
+            if self.picker.esc_label() != "back" {
+                keys.push(("esc", self.picker.esc_label()));
+            }
             keys.push(("q", "quit"));
-            f.render_widget(theme::footer(theme, &keys), bottom);
+            theme::render_footer(f, bottom, theme, &keys);
         }
         if self.show_help {
             let keys: Vec<(&str, &str)> = if self.step == BackupStep::Confirm {
@@ -233,7 +242,8 @@ pub fn run_backup(claude_dir: &Path, output: &Path, opts: backup::BackupOptions)
         let Some(loaded) = super::loading::run_with_loading(
             t,
             "Reading sessions",
-            (crate::provider::ProviderId::Claude, "Claude Code"),
+            "Reading Claude Code sessions. Nothing is written while this runs.",
+            (crate::provider::ProviderId::Claude, "Claude Code", ""),
             move || discover::load_sessions(&dir),
         )?
         else {

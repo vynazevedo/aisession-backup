@@ -307,7 +307,7 @@ fn backup_plan(request: &BackupRequest, input: &BackupInputs) -> Result<Plan> {
             .map(|(_, p)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
             .sum(),
         rewrites: 0,
-        note: format!("{} files", input.files.len()),
+        note: crate::ui::plural(input.files.len(), "file"),
     });
     Ok(plan)
 }
