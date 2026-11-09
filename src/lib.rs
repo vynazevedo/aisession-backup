@@ -18,6 +18,7 @@ pub mod repo;
 pub mod safety;
 pub mod search;
 pub mod secrets;
+pub mod sessions;
 pub mod sqlite_snapshot;
 pub mod tui;
 pub mod ui;
