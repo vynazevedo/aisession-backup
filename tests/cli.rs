@@ -1307,3 +1307,87 @@ fn incremental_repository_backup_restore_and_prune() {
     let conflict = env.run(&["backup", "--repo", repo_arg, "-o", "x.tar.gz"]);
     assert_eq!(code_of(&conflict), EXIT_USAGE);
 }
+
+#[test]
+fn tui_search_screen_selects_and_converts_results() {
+    let env = TestEnv::new();
+    env.write_claude_session(
+        "99999999-9999-4999-8999-999999999999",
+        "/work/find",
+        "needle in a haystack",
+    );
+    let session = env
+        .claude_dir
+        .join("projects")
+        .join(claudepath::encode("/work/find"))
+        .join("99999999-9999-4999-8999-999999999999.jsonl");
+    let item = Item {
+        id: "99999999-9999-4999-8999-999999999999".into(),
+        kind: ItemKind::Session,
+        label: "needle in a haystack".into(),
+        cwd: Some("/work/find".into()),
+        updated_at: None,
+        files: vec![ItemFile {
+            rel: "projects/-work-find/99999999-9999-4999-8999-999999999999.jsonl".into(),
+            size: 10,
+            class: FileClass::Plain,
+        }],
+    };
+    let mut home = HomeState::new(vec![
+        ProviderEntry {
+            id: ProviderId::Claude,
+            display_name: "Claude Code".into(),
+            home: Some(env.claude_dir.clone()),
+            items: vec![item],
+            selected: vec![false],
+            scan_error: None,
+        },
+        ProviderEntry {
+            id: ProviderId::Codex,
+            display_name: "Codex CLI".into(),
+            home: Some(env.codex_dir.clone()),
+            items: Vec::new(),
+            selected: Vec::new(),
+            scan_error: None,
+        },
+    ]);
+    home.handle_key(KeyCode::Char('s'));
+    assert_eq!(home.screen, HomeScreen::Search);
+    for c in "needle".chars() {
+        home.handle_key(KeyCode::Char(c));
+    }
+    home.handle_key(KeyCode::Char('?'));
+    assert!(!home.show_help, "typing ? goes into the query");
+    home.handle_key(KeyCode::Backspace);
+    home.handle_key(KeyCode::Enter);
+    assert_eq!(home.pending_search.as_deref(), Some("needle"));
+    let query = home.pending_search.take().unwrap();
+    let hits = aisession_backup::search::search(
+        &query,
+        &aisession_backup::provider::LocateEnv {
+            user_home: Some(env.home.clone()),
+            overrides: std::collections::BTreeMap::from([(
+                ProviderId::Claude,
+                env.claude_dir.clone(),
+            )]),
+        },
+        &aisession_backup::search::SEARCHABLE,
+        10,
+    )
+    .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].path, session);
+    home.set_search_results(hits);
+    home.handle_key(KeyCode::Char(' '));
+    assert_eq!(home.total_selected_items(), 1);
+    home.handle_key(KeyCode::Char('t'));
+    assert_eq!(home.screen, HomeScreen::ConvertPlan);
+    assert_eq!(
+        home.conversion.as_ref().unwrap().request.to,
+        ProviderId::Codex
+    );
+    home.handle_key(KeyCode::Esc);
+    assert_eq!(home.screen, HomeScreen::Search);
+    home.handle_key(KeyCode::Esc);
+    assert_eq!(home.screen, HomeScreen::Providers);
+}
