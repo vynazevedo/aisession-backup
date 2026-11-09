@@ -431,6 +431,8 @@ Sem `--provider`, o backup considera só o Claude Code.
 | `--include-state` | Inclui bancos de estado e histórico dos provedores |
 | `--include-credentials` | Inclui credenciais de login. Exige `--encrypt` |
 | `--encrypt` | Criptografa com senha usando age |
+| `--redact` | Troca segredos detectados por `[REDACTED:tipo]` na cópia do backup |
+| `--repo <LOCAL>` | Grava um snapshot incremental num repositório, em vez de um arquivo |
 | `-o, --output` | Arquivo de saída |
 | `--overwrite` | Permite substituir um arquivo de saída existente |
 | `--dry-run` | Mostra o plano e sai sem escrever |
@@ -573,6 +575,10 @@ O fluxo prioriza não perder dados e não executar nada inesperado:
 - **Saída limpa.** Sequências de controle vindas de manifestos são removidas
   antes da exibição.
 - **Senha fora do argv.** Use o prompt ou `AISESSION_BACKUP_PASSPHRASE`.
+- **Redaction opcional.** `backup --redact` troca chaves de API, tokens Bearer, chaves
+  da AWS e blocos de chave privada por `[REDACTED:tipo]` na cópia que vai para o
+  backup. Só arquivos de texto são alterados, o JSON continua válido e os arquivos
+  originais não mudam. O relatório informa quantos segredos foram trocados.
 
 O que essas proteções não garantem:
 
