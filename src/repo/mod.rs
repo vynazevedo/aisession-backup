@@ -72,6 +72,13 @@ pub struct CheckReport {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedDocument {
+    body: String,
+    mac: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
     format_version: u32,
     id: String,
@@ -319,13 +326,36 @@ impl Repository {
         Ok(plaintext)
     }
 
+    fn seal_document(&self, document: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption {
+            Some(enc) => Ok(serde_json::to_vec(&SealedDocument {
+                body: String::from_utf8(document.to_vec())?,
+                mac: enc.mac(document),
+            })?),
+            None => Ok(document.to_vec()),
+        }
+    }
+
+    fn open_document(&self, plaintext: Vec<u8>) -> Result<Vec<u8>> {
+        let Some(enc) = &self.encryption else {
+            return Ok(plaintext);
+        };
+        let sealed: SealedDocument =
+            serde_json::from_slice(&plaintext).context("snapshot is not authenticated")?;
+        if !enc.verify_mac(sealed.body.as_bytes(), &sealed.mac) {
+            bail!("snapshot authentication failed; it was not written with this repository key")
+        }
+        Ok(sealed.body.into_bytes())
+    }
+
     fn read_snapshot(&self, id: &str) -> Result<Snapshot> {
         let bytes = self
             .backend
             .get(&snapshot_key(id)?)?
             .with_context(|| format!("missing snapshot {id}"))?;
-        let snapshot: Snapshot = serde_json::from_slice(&self.decode(&bytes, DOCUMENT_LIMIT)?)
-            .context("invalid snapshot document")?;
+        let document = self.open_document(self.decode(&bytes, DOCUMENT_LIMIT)?)?;
+        let snapshot: Snapshot =
+            serde_json::from_slice(&document).context("invalid snapshot document")?;
         snapshot.validate(id)?;
         Ok(snapshot)
     }
@@ -428,10 +458,10 @@ impl Repository {
         if document.len() > DOCUMENT_LIMIT {
             bail!("snapshot document exceeds size limit")
         }
-        if !self
-            .backend
-            .put_if_absent(&snapshot_key(&id)?, &self.encode(&document)?)?
-        {
+        if !self.backend.put_if_absent(
+            &snapshot_key(&id)?,
+            &self.encode(&self.seal_document(&document)?)?,
+        )? {
             bail!("snapshot id collision")
         }
         lock.release()?;

@@ -484,3 +484,87 @@ fn concurrent_atomic_create_has_exactly_one_winner() {
     assert_eq!(bytes.len(), 1024);
     assert!(bytes.iter().all(|byte| *byte == bytes[0]));
 }
+
+#[test]
+fn hmac_matches_rfc_4231() {
+    assert_eq!(
+        hex::encode(crypto::hmac_sha256(
+            b"Jefe",
+            b"what do ya want for nothing?"
+        )),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+    let long_key = [0xaau8; 131];
+    assert_eq!(
+        hex::encode(crypto::hmac_sha256(
+            &long_key,
+            b"Test Using Larger Than Block-Size Key - Hash Key First"
+        )),
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+    );
+}
+
+#[test]
+fn forged_snapshots_are_rejected_in_encrypted_repositories() {
+    let (temp, backend, repo) = setup(Some("synthetic password"));
+    let file = source(&temp, "a", b"genuine content");
+    let summary = repo
+        .write_snapshot(&manifest(), std::slice::from_ref(&file), "host")
+        .unwrap();
+    let id = summary.snapshot_id.clone();
+    let key = snapshot_key(&id).unwrap();
+    let enc = repo.encryption.as_ref().unwrap();
+    let stored = backend.get(&key).unwrap().unwrap();
+    let sealed: SealedDocument =
+        serde_json::from_slice(&enc.decrypt(&stored, DOCUMENT_LIMIT).unwrap()).unwrap();
+
+    let tampered_body = sealed
+        .body
+        .replace("\"host\":\"host\"", "\"host\":\"attacker\"");
+    assert_ne!(tampered_body, sealed.body);
+    let tampered = serde_json::to_vec(&SealedDocument {
+        body: tampered_body.clone(),
+        mac: sealed.mac.clone(),
+    })
+    .unwrap();
+    backend.put(&key, &enc.encrypt(&tampered).unwrap()).unwrap();
+    let err = repo
+        .stage_snapshot(&id, &temp.path().join("stage1"))
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("authentication failed"),
+        "{err:#}"
+    );
+
+    let recipient: age::x25519::Recipient = enc.recipient().parse().unwrap();
+    let forged = serde_json::to_vec(&SealedDocument {
+        body: tampered_body,
+        mac: "0".repeat(64),
+    })
+    .unwrap();
+    let ciphertext = {
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .unwrap();
+        let mut out = Vec::new();
+        let mut writer = encryptor.wrap_output(&mut out).unwrap();
+        writer.write_all(&forged).unwrap();
+        writer.finish().unwrap();
+        out
+    };
+    backend.put(&key, &ciphertext).unwrap();
+    assert!(repo
+        .stage_snapshot(&id, &temp.path().join("stage2"))
+        .is_err());
+
+    let unwrapped = enc.encrypt(sealed.body.as_bytes()).unwrap();
+    backend.put(&key, &unwrapped).unwrap();
+    let err = repo.list_snapshots().unwrap_err();
+    assert!(format!("{err:#}").contains("not authenticated"), "{err:#}");
+
+    let restored = serde_json::to_vec(&sealed).unwrap();
+    backend.put(&key, &enc.encrypt(&restored).unwrap()).unwrap();
+    assert!(repo
+        .stage_snapshot(&id, &temp.path().join("stage3"))
+        .is_ok());
+}

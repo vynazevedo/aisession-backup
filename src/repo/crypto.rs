@@ -3,6 +3,23 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(block.map(|b| b ^ 0x36));
+    inner.update(message);
+    let mut outer = Sha256::new();
+    outer.update(block.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
 pub(crate) struct Encryption {
     identity: age::x25519::Identity,
     recipient: age::x25519::Recipient,
@@ -61,6 +78,27 @@ impl Encryption {
         }
         Ok(encryption)
     }
+    fn mac_key(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"aisession-backup/snapshot-mac/v1");
+        hash.update(self.identity.to_string().expose_secret().as_bytes());
+        hash.finalize().into()
+    }
+
+    pub fn mac(&self, bytes: &[u8]) -> String {
+        hex::encode(hmac_sha256(&self.mac_key(), bytes))
+    }
+
+    pub fn verify_mac(&self, bytes: &[u8], mac: &str) -> bool {
+        let expected = self.mac(bytes);
+        expected.len() == mac.len()
+            && expected
+                .bytes()
+                .zip(mac.bytes())
+                .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                == 0
+    }
+
     pub fn id(&self, bytes: &[u8]) -> String {
         let mut hash = Sha256::new();
         hash.update(self.identity.to_string().expose_secret().as_bytes());
