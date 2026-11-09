@@ -524,13 +524,11 @@ pub fn write_claude(t: &Transcript, cwd: &str, now: DateTime<Utc>) -> Rendered {
 pub fn write_codex(t: &Transcript, cwd: &str, now: DateTime<Utc>) -> Rendered {
     let sid = derived_uuid(&format!("codex:{}:{}", t.provider.as_str(), t.id));
     let mut out = Vec::new();
-    let mut ordinal = 0u64;
-    let mut line = |out: &mut Vec<u8>, ts: &str, kind: &str, payload: Value| {
+    let line = |out: &mut Vec<u8>, ts: &str, kind: &str, payload: Value| {
         push_json(
             out,
-            &json!({"timestamp": ts, "type": kind, "payload": payload, "ordinal": ordinal}),
+            &json!({"timestamp": ts, "type": kind, "payload": payload}),
         );
-        ordinal += 1;
     };
     let start = stamp(now);
     line(
@@ -542,36 +540,17 @@ pub fn write_codex(t: &Transcript, cwd: &str, now: DateTime<Utc>) -> Rendered {
             "session_id": sid,
             "timestamp": start,
             "cwd": cwd,
-            "originator": "aisession-backup",
+            "originator": "codex_cli_rs",
             "cli_version": "0.0.0",
             "source": "cli",
-            "thread_source": "user",
             "model_provider": "openai",
         }),
     );
-    for (index, (role, text, ts)) in messages(t).into_iter().enumerate() {
-        let when = ts.unwrap_or(now);
-        let ts = stamp(when);
-        let item_id = derived_uuid(&format!("{sid}:item:{index}"));
-        let (role_name, content_type, item) = match role {
-            Role::User => (
-                "user",
-                "input_text",
-                json!({
-                    "type": "UserMessage",
-                    "id": item_id,
-                    "content": [{"type": "text", "text": text, "text_elements": []}],
-                }),
-            ),
-            Role::Assistant => (
-                "assistant",
-                "output_text",
-                json!({
-                    "type": "AgentMessage",
-                    "id": item_id,
-                    "content": [{"type": "Text", "text": text}],
-                }),
-            ),
+    for (role, text, ts) in messages(t) {
+        let ts = stamp(ts.unwrap_or(now));
+        let (role_name, content_type, event) = match role {
+            Role::User => ("user", "input_text", "user_message"),
+            Role::Assistant => ("assistant", "output_text", "agent_message"),
         };
         line(
             &mut out,
@@ -587,14 +566,7 @@ pub fn write_codex(t: &Transcript, cwd: &str, now: DateTime<Utc>) -> Rendered {
             &mut out,
             &ts,
             "event_msg",
-            json!({
-                "type": "item_completed",
-                "thread_id": sid,
-                "turn_id": derived_uuid(&format!("{sid}:turn:{index}")),
-                "started_at_ms": when.timestamp_millis(),
-                "completed_at_ms": when.timestamp_millis(),
-                "item": item,
-            }),
+            json!({"type": event, "message": text}),
         );
     }
     let mut index_line = Vec::new();
@@ -1098,17 +1070,19 @@ mod tests {
             .collect();
         assert_eq!(values[0]["type"], "session_meta");
         assert_eq!(values[0]["payload"]["cwd"], "/srv/app");
-        let items: Vec<&str> = values
+        let events: Vec<&str> = values
             .iter()
             .filter(|v| v["type"] == "event_msg")
-            .map(|v| v["payload"]["item"]["type"].as_str().unwrap())
+            .map(|v| v["payload"]["type"].as_str().unwrap())
             .collect();
-        assert_eq!(items, vec!["UserMessage", "AgentMessage"]);
-        let ordinals: Vec<u64> = values
+        assert_eq!(events, vec!["user_message", "agent_message"]);
+        let shown: Vec<&str> = values
             .iter()
-            .map(|v| v["ordinal"].as_u64().unwrap())
+            .filter(|v| v["type"] == "event_msg")
+            .map(|v| v["payload"]["message"].as_str().unwrap())
             .collect();
-        assert_eq!(ordinals, (0..values.len() as u64).collect::<Vec<_>>());
+        assert!(shown[0].contains("Fix the login bug"));
+        assert!(shown[1].contains("Fixed."));
         let index: Value = serde_json::from_slice(rendered.index_line.as_ref().unwrap()).unwrap();
         assert_eq!(index["id"], rendered.session_id.as_str());
         let back = read_codex(&rendered.bytes).unwrap();
