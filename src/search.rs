@@ -6,7 +6,7 @@ use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 
 use crate::convert::{Part, Role};
-use crate::provider::{ItemKind, LocateEnv, ProviderId, ScanOptions};
+use crate::provider::{LocateEnv, ProviderId};
 use crate::ui::sanitize;
 
 pub const SEARCHABLE: [ProviderId; 2] = [ProviderId::Claude, ProviderId::Codex];
@@ -153,30 +153,11 @@ pub fn search(
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
     let query = Query::parse(raw_query)?;
-    let mut candidates = Vec::new();
-    for prov in crate::provider::registry() {
-        let id = prov.id();
-        if !providers.contains(&id) || !SEARCHABLE.contains(&id) {
-            continue;
-        }
-        let Some(home) = prov.locate(env).filter(|home| home.exists()) else {
-            continue;
-        };
-        let inventory = prov.scan(&home, &ScanOptions::default())?;
-        for item in inventory.items {
-            if item.kind != ItemKind::Session {
-                continue;
-            }
-            let Some(file) = item.files.iter().find(|file| {
-                file.rel.ends_with(".jsonl")
-                    && (id == ProviderId::Codex
-                        || file.rel.ends_with(&format!("{}.jsonl", item.id)))
-            }) else {
-                continue;
-            };
-            candidates.push((id, home.join(&file.rel), item));
-        }
-    }
+    let candidates: Vec<(ProviderId, PathBuf, crate::provider::Item)> =
+        crate::sessions::session_files(env, providers)?
+            .into_iter()
+            .map(|file| (file.provider, file.path(), file.item))
+            .collect();
     let results = crate::discover::parallel_map(&candidates, |(provider, path, item)| {
         search_file(*provider, path, &query)
             .ok()

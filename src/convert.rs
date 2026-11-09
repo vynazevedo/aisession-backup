@@ -664,7 +664,7 @@ fn codex_session_exists(home: &Path, session_id: &str) -> bool {
         })
 }
 
-fn resume_hint(to: ProviderId, cwd: &str, session_id: &str) -> String {
+pub(crate) fn resume_hint(to: ProviderId, cwd: &str, session_id: &str) -> String {
     let quoted = if cwd.contains(char::is_whitespace) {
         format!("\"{cwd}\"")
     } else {
@@ -900,6 +900,21 @@ pub fn find_session(
                     found.push((ProviderId::Codex, entry.into_path()));
                 }
             }
+        }
+    }
+    if found.len() > 1 && found.iter().all(|(p, _)| *p == ProviderId::Claude) {
+        let present: Vec<(ProviderId, PathBuf)> = found
+            .iter()
+            .filter(|(provider, path)| {
+                read_source(path)
+                    .ok()
+                    .and_then(|bytes| read(*provider, &bytes).ok())
+                    .is_some_and(|t| !t.cwd.trim().is_empty() && Path::new(&t.cwd).is_dir())
+            })
+            .cloned()
+            .collect();
+        if present.len() == 1 {
+            found = present;
         }
     }
     match found.len() {

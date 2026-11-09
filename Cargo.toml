@@ -1,6 +1,6 @@
 [package]
 name = "aisession-backup"
-version = "3.5.0"
+version = "3.6.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Backup, restore and migrate AI coding tool sessions and config across machines with plans, rollback and path remapping"

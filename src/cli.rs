@@ -341,6 +341,93 @@ pub enum Commands {
         json: bool,
     },
     #[command(
+        about = "Show one session: summary, or the full transcript as Markdown or HTML",
+        long_about = "Show one Claude Code or Codex session.\n\nThe default prints a summary with turns, tool calls and token usage. --format markdown or html renders the whole conversation as a readable document; --redact masks secrets in it. Terminal escapes are stripped and HTML output loads nothing external."
+    )]
+    Show {
+        #[arg(value_name = "SESSION", help = "Session id or path to a session file")]
+        session: String,
+        #[arg(long, value_name = "TOOL", help = "Source tool, detected when omitted")]
+        from: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = ShowFormat::Summary,
+            help = "Output format"
+        )]
+        format: ShowFormat,
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            help = "Write to a new file instead of stdout"
+        )]
+        output: Option<String>,
+        #[arg(
+            long,
+            help = "Replace API keys, tokens and private keys with placeholders"
+        )]
+        redact: bool,
+    },
+    #[command(
+        about = "Token usage by tool, model and project",
+        long_about = "Token usage by tool, model and project.\n\nCounts come from the usage records Claude Code and Codex write into their sessions. Nothing is sent anywhere."
+    )]
+    Stats {
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Only sessions active in the last N days (0 for all)"
+        )]
+        days: u32,
+        #[arg(
+            short,
+            long,
+            help = "Comma-separated providers to count (claude,codex)"
+        )]
+        provider: Option<String>,
+        #[arg(long, default_value_t = 10, help = "Rows per table")]
+        limit: usize,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(
+        about = "Check that a session can be resumed and print the command",
+        long_about = "Check that a session can be resumed and print the command.\n\nThe working directory must exist on this machine. A missing tool binary or a running tool is reported as a warning. Exits with 5 when a blocking check fails."
+    )]
+    Resume {
+        #[arg(value_name = "SESSION", help = "Session id or path to a session file")]
+        session: String,
+        #[arg(long, value_name = "TOOL", help = "Source tool, detected when omitted")]
+        from: Option<String>,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(
+        about = "Point sessions at a project folder that moved",
+        long_about = "Point sessions at a project folder that moved.\n\nClaude Code sessions recorded under OLD are copied into the project folder for NEW, and the originals are kept. Codex sessions and trusted projects are rewritten in place. Every change is journaled, so `rollback` undoes it."
+    )]
+    Relocate {
+        #[arg(value_name = "OLD", help = "Folder the sessions were recorded in")]
+        old: String,
+        #[arg(value_name = "NEW", help = "Folder the project lives in now")]
+        new: String,
+        #[arg(
+            short,
+            long,
+            help = "Comma-separated providers to update (claude,codex)"
+        )]
+        provider: Option<String>,
+        #[arg(long, help = "Allow writing while the tool is running")]
+        allow_running: bool,
+        #[arg(long, help = "Print the plan and exit without writing")]
+        dry_run: bool,
+        #[arg(short, long, help = "Skip confirmation prompt")]
+        yes: bool,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(
         about = "Manage incremental backup repositories",
         long_about = "Manage incremental backup repositories.\n\nA repository stores deduplicated, compressed chunks and one small snapshot per backup. LOCATION is a directory or s3://bucket/prefix, with credentials from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and an optional AISESSION_BACKUP_S3_ENDPOINT for R2 or MinIO."
     )]
@@ -544,6 +631,41 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             limit,
             json,
         } => cmd_search(&query.join(" "), provider.as_deref(), limit, json),
+        Commands::Show {
+            session,
+            from,
+            format,
+            output,
+            redact,
+        } => cmd_show(&session, from.as_deref(), format, output.as_deref(), redact),
+        Commands::Stats {
+            days,
+            provider,
+            limit,
+            json,
+        } => cmd_stats(days, provider.as_deref(), limit, json),
+        Commands::Resume {
+            session,
+            from,
+            json,
+        } => cmd_resume(&session, from.as_deref(), json),
+        Commands::Relocate {
+            old,
+            new,
+            provider,
+            allow_running,
+            dry_run,
+            yes,
+            json,
+        } => cmd_relocate(RelocateArgs {
+            old,
+            new,
+            provider,
+            allow_running,
+            dry_run,
+            yes,
+            json,
+        }),
         Commands::Repo { action } => cmd_repo(action),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -815,6 +937,185 @@ fn cmd_search(query: &str, provider: Option<&str>, limit: usize, json: bool) -> 
         print!("{}", crate::search::format_hits(&hits, ui::color_stdout()));
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ShowFormat {
+    Summary,
+    Markdown,
+    Html,
+    Json,
+}
+
+fn find_transcript_session(reference: &str, from: Option<&str>) -> Result<(ProviderId, PathBuf)> {
+    let from = from.map(convert_tool).transpose()?;
+    let claude_dir = resolve_claude_dir(None);
+    let homes = default_provider_homes(&claude_dir);
+    crate::convert::find_session(reference, from, &homes)
+}
+
+fn cmd_show(
+    reference: &str,
+    from: Option<&str>,
+    format: ShowFormat,
+    output: Option<&str>,
+    redact: bool,
+) -> Result<()> {
+    let (provider, path) = find_transcript_session(reference, from)?;
+    let (info, transcript) = crate::sessions::inspect(provider, &path)?;
+    let rendered = match format {
+        ShowFormat::Summary => crate::sessions::render_summary(&info),
+        ShowFormat::Markdown => crate::sessions::render_markdown(&info, &transcript),
+        ShowFormat::Html => crate::sessions::render_html(&info, &transcript),
+        ShowFormat::Json => {
+            let mut text = serde_json::to_string_pretty(&info)?;
+            text.push('\n');
+            text
+        }
+    };
+    let (bytes, masked) = if redact {
+        crate::secrets::redact(rendered.as_bytes())
+    } else {
+        (rendered.into_bytes(), 0)
+    };
+    match output {
+        Some(target) => {
+            let target = expand_path(target);
+            let mut file = crate::safety::create_private_new(&target)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            eprintln!("Wrote {}", sanitize(&target.display().to_string()));
+        }
+        None => io::stdout().write_all(&bytes)?,
+    }
+    if masked > 0 {
+        eprintln!("Redacted {}", ui::plural(masked, "secret"));
+    }
+    Ok(())
+}
+
+fn cmd_stats(days: u32, provider: Option<&str>, limit: usize, json: bool) -> Result<()> {
+    let (_, ids) = parse_providers(provider, false)?;
+    let claude_dir = resolve_claude_dir(None);
+    let env = locate_env_with_claude(&claude_dir);
+    let since = (days > 0).then(|| chrono::Utc::now() - chrono::Duration::days(i64::from(days)));
+    let stats = crate::sessions::collect_stats(&env, &ids, since)?;
+    if json {
+        ui::print_json(&stats)
+    } else {
+        print!(
+            "{}",
+            crate::sessions::format_stats(&stats, limit.clamp(1, 1000), ui::color_stdout())
+        );
+        Ok(())
+    }
+}
+
+fn cmd_resume(reference: &str, from: Option<&str>, json: bool) -> Result<()> {
+    let (provider, path) = find_transcript_session(reference, from)?;
+    let (_, transcript) = crate::sessions::inspect(provider, &path)?;
+    let claude_dir = resolve_claude_dir(None);
+    let homes = default_provider_homes(&claude_dir);
+    let running = provider::registry()
+        .into_iter()
+        .find(|prov| prov.id() == provider)
+        .and_then(|prov| {
+            homes
+                .get(&provider)
+                .and_then(|home| prov.running_hint(home))
+        });
+    let plan = crate::sessions::plan_resume(
+        provider,
+        &transcript,
+        std::env::var_os("PATH").as_deref(),
+        running,
+    );
+    if json {
+        ui::print_json(&plan)?;
+    } else {
+        print!("{}", crate::sessions::format_resume(&plan));
+    }
+    if plan.blocked() {
+        return Err(CliExit::new(EXIT_PLAN_REFUSED, "the session cannot be resumed here").into());
+    }
+    Ok(())
+}
+
+struct RelocateArgs {
+    old: String,
+    new: String,
+    provider: Option<String>,
+    allow_running: bool,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+}
+
+fn cmd_relocate(args: RelocateArgs) -> Result<()> {
+    let (_, providers) = parse_providers(args.provider.as_deref(), false)?;
+    let old = args.old.trim_end_matches(['/', '\\']).to_string();
+    let new = args.new.trim_end_matches(['/', '\\']).to_string();
+    let mappings = parse_mappings(&format!("{old}:{new}"))
+        .map_err(|err| CliExit::new(EXIT_USAGE, format!("{err:#}")))?;
+    let claude_dir = resolve_claude_dir(None);
+    let request = crate::sessions::RelocateRequest {
+        mappings,
+        providers,
+        env: locate_env_with_claude(&claude_dir),
+        allow_running: args.allow_running,
+    };
+    let prepared = crate::sessions::prepare_relocation(&request)?;
+    if args.dry_run {
+        if args.json {
+            ui::print_json(&prepared.plan)?;
+        } else {
+            ui::print_plan(&prepared.plan, false);
+        }
+        return Ok(());
+    }
+    if prepared.plan.has_refusals() {
+        if args.json {
+            ui::print_json(&prepared.plan)?;
+        } else {
+            ui::print_plan(&prepared.plan, false);
+        }
+        return Err(CliExit::new(
+            EXIT_PLAN_REFUSED,
+            "relocation plan contains refused operations",
+        )
+        .into());
+    }
+    if prepared.plan.ops.iter().all(|op| {
+        !matches!(
+            op.action,
+            crate::plan::Action::Create | crate::plan::Action::Overwrite
+        )
+    }) {
+        if args.json {
+            return ui::print_json(&crate::sessions::RelocateReport {
+                sessions: prepared.sessions,
+                written: 0,
+                journal_id: None,
+            });
+        }
+        ui::print_plan(&prepared.plan, false);
+        println!("Nothing to relocate.");
+        return Ok(());
+    }
+    confirm_or_abort(&prepared.plan, args.yes, args.json)?;
+    let report = crate::sessions::apply_relocation(prepared)?;
+    if args.json {
+        return ui::print_json(&report);
+    }
+    println!(
+        "Relocated {} ({} written)",
+        ui::plural(report.sessions, "session"),
+        ui::plural(report.written, "file")
+    );
+    if let Some(id) = &report.journal_id {
+        println!("  Undo with: aisession-backup rollback {}", sanitize(id));
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
