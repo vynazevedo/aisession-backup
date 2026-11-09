@@ -37,6 +37,12 @@ pub struct Theme {
 
 static CURRENT: OnceLock<Theme> = OnceLock::new();
 
+const TEXT_SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+const BRAILLE_SPINNER: [&str; 10] = [
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
+
 pub fn current() -> &'static Theme {
     CURRENT.get_or_init(Theme::from_env)
 }
@@ -85,6 +91,20 @@ impl Theme {
             (IconSet::Nerd, Icon::Search) => "\u{f002}",
             (IconSet::Nerd, Icon::Clock) => "\u{f017}",
             (IconSet::Nerd, Icon::Bolt) => "\u{f0e7}",
+        }
+    }
+
+    pub fn spinner_len(&self) -> usize {
+        match self.icons {
+            IconSet::Text => TEXT_SPINNER.len(),
+            IconSet::Nerd => BRAILLE_SPINNER.len(),
+        }
+    }
+
+    pub fn spinner(&self, frame: usize) -> &'static str {
+        match self.icons {
+            IconSet::Text => TEXT_SPINNER[frame % TEXT_SPINNER.len()],
+            IconSet::Nerd => BRAILLE_SPINNER[frame % BRAILLE_SPINNER.len()],
         }
     }
 

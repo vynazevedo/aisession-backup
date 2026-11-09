@@ -428,6 +428,7 @@ fn tui_state_machines_and_tty_guard_work_without_terminal() {
         home: Some(PathBuf::from("/tmp/fake-claude")),
         items: vec![item],
         selected: vec![false],
+        scan_error: None,
     }]);
 
     assert_eq!(home.screen, HomeScreen::Providers);
@@ -1010,6 +1011,7 @@ fn tui_t_key_converts_only_claude_and_codex_sessions() {
         home: Some(PathBuf::from("/tmp/fake-codex")),
         items: vec![codex_session, codex_config],
         selected: vec![false, false],
+        scan_error: None,
     }]);
     home.handle_key(KeyCode::Enter);
     home.handle_key(KeyCode::Char('t'));

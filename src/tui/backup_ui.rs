@@ -228,17 +228,39 @@ impl BackupApp {
 }
 
 pub fn run_backup(claude_dir: &Path, output: &Path, opts: backup::BackupOptions) -> Result<()> {
-    let sessions = discover::load_sessions(claude_dir)?;
-    if sessions.is_empty() {
-        println!(
-            "No sessions found in {}",
-            sanitize(&claude_dir.display().to_string())
-        );
-        return Ok(());
-    }
-
-    let mut app = BackupApp::new(sessions);
-    let action = with_terminal(|t| app.run(t, claude_dir, output, opts))?;
+    let dir = claude_dir.to_path_buf();
+    let finished = with_terminal(|t| {
+        let Some(loaded) = super::loading::run_with_loading(
+            t,
+            "Reading sessions",
+            (crate::provider::ProviderId::Claude, "Claude Code"),
+            move || discover::load_sessions(&dir),
+        )?
+        else {
+            return Ok(None);
+        };
+        let sessions = loaded?;
+        if sessions.is_empty() {
+            return Ok(Some(None));
+        }
+        let mut app = BackupApp::new(sessions);
+        let action = app.run(t, claude_dir, output, opts)?;
+        Ok(Some(Some((app, action))))
+    })?;
+    let (app, action) = match finished {
+        None => {
+            println!("Cancelled.");
+            return Ok(());
+        }
+        Some(None) => {
+            println!(
+                "No sessions found in {}",
+                sanitize(&claude_dir.display().to_string())
+            );
+            return Ok(());
+        }
+        Some(Some(found)) => found,
+    };
 
     if action == BackupAction::Cancel {
         println!("Cancelled.");
