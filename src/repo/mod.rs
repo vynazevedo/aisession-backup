@@ -137,12 +137,22 @@ fn valid_digest(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+fn canonical_snapshot_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 42
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && bytes[8] == b'T'
+        && bytes[9..24].iter().all(u8::is_ascii_digit)
+        && bytes[24] == b'Z'
+        && bytes[25] == b'-'
+        && bytes[26..]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
 fn snapshot_key(id: &str) -> Result<String> {
-    if id.is_empty()
-        || id.len() > 128
-        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        bail!("invalid snapshot id: {id:?}")
+    if !canonical_snapshot_id(id) {
+        bail!("invalid snapshot id: {}", crate::ui::sanitize(id))
     }
     Ok(format!("snapshots/{id}.json"))
 }
@@ -176,6 +186,9 @@ impl Snapshot {
     fn validate(&self, id: &str) -> Result<()> {
         if self.format_version != FORMAT_VERSION || self.id != id {
             bail!("snapshot version or id mismatch")
+        }
+        if !id.starts_with(&self.created_at.format("%Y%m%dT%H%M%S%9fZ-").to_string()) {
+            bail!("snapshot creation time does not match its id")
         }
         validate_paths(self.files.keys())?;
         for file in self.files.values() {
