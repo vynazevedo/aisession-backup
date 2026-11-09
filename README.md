@@ -195,6 +195,75 @@ copiado: as sessões são lidas na hora, em paralelo.
 
 ---
 
+## Lendo, retomando e reorganizando sessões
+
+### Ver uma sessão
+
+`show` mostra o resumo de uma sessão do Claude Code ou do Codex: diretório, datas,
+turnos, chamadas de ferramenta, tokens e modelos. Com `--format markdown` ou
+`--format html`, gera a conversa inteira como documento legível:
+
+```bash
+aisession-backup show 3f2a9c1e-...
+aisession-backup show 3f2a9c1e-... --format markdown --redact -o sessao.md
+aisession-backup show 3f2a9c1e-... --format html -o sessao.html
+```
+
+`--redact` troca chaves de API, tokens e chaves privadas por `[REDACTED:tipo]`.
+Sequências de terminal são removidas, o HTML não carrega nada externo e `-o`
+nunca sobrescreve um arquivo existente.
+
+### Uso de tokens
+
+`stats` soma os tokens que o Claude Code e o Codex registram nas próprias sessões
+e mostra o total por ferramenta, por modelo e por projeto:
+
+```bash
+aisession-backup stats              # últimos 30 dias
+aisession-backup stats --days 0     # desde sempre
+aisession-backup stats --provider codex --json
+```
+
+Cada mensagem do Claude Code conta uma vez, mesmo quando aparece em várias linhas.
+No Codex, a entrada em cache é separada da entrada nova. Nada sai da máquina.
+
+### Retomar com segurança
+
+`resume` confere se a sessão pode ser retomada nesta máquina e mostra o comando:
+
+```bash
+aisession-backup resume 3f2a9c1e-...
+#   [ok  ] directory recorded: /home/voce/projetos/api
+#   [ok  ] directory exists: found on this machine
+#   [ok  ] claude installed: /usr/local/bin/claude
+#   [ok  ] claude idle: no running process found
+#
+# cd /home/voce/projetos/api && claude --resume 3f2a9c1e-...
+```
+
+Se o diretório não existe, o comando falha com o código 5 e indica o `relocate`.
+Ferramenta ausente ou aberta aparece só como aviso.
+
+### Projeto mudou de pasta
+
+`relocate` aponta as sessões para o novo lugar do projeto:
+
+```bash
+aisession-backup relocate /home/voce/antigo /home/voce/projetos --dry-run
+aisession-backup relocate /home/voce/antigo /home/voce/projetos
+```
+
+- **Claude Code:** cada sessão gravada sob o path antigo é copiada para a pasta
+  do novo path, com o `cwd` reescrito. O original continua onde estava.
+- **Codex:** sessões e projetos confiáveis do `config.toml` são reescritos no
+  lugar.
+
+Tudo passa pelo plano e pelo journal, então `rollback` desfaz. Rodar de novo não
+duplica nada, e o comando recusa enquanto a ferramenta estiver aberta, a menos
+que você passe `--allow-running`.
+
+---
+
 ## Convertendo sessões entre Claude Code e Codex
 
 `convert` leva uma conversa de uma ferramenta para a outra. Por exemplo, para
@@ -414,15 +483,19 @@ verifica que o histórico é exibido, não que o modelo responde.
 | `list [arquivo]` | Lista sessões locais ou de um arquivo, agrupadas por diretório |
 | `restore <arquivo>` | Restaura sessões e itens de provedores |
 | `history` | Lista os restores registrados no journal |
-| `rollback <id>` | Desfaz um restore ou uma conversão |
+| `rollback <id>` | Desfaz um restore, uma conversão ou um relocate |
 | `convert <sessão> --to <ferramenta>` | Converte uma sessão entre Claude Code e Codex |
 | `completions <shell>` | Gera autocomplete para bash, zsh, fish, elvish ou powershell |
 | `search <palavras>` | Procura no conteúdo das sessões do Claude Code e do Codex |
+| `show <sessão>` | Resumo da sessão, ou a conversa em Markdown ou HTML |
+| `stats` | Tokens por ferramenta, modelo e projeto |
+| `resume <sessão>` | Confere se a sessão pode ser retomada e mostra o comando |
+| `relocate <antigo> <novo>` | Aponta as sessões para a nova pasta do projeto |
 | `repo init \| snapshots \| check \| prune` | Gerencia um repositório de backup incremental |
 | `version` | Mostra a versão |
 
 `doctor`, `scan`, `audit`, `backup`, `verify`, `list`, `restore`, `history` e
-`rollback` aceitam `--json`, cuja saída não é agrupada. `list` e `scan` aceitam
+`rollback`, `stats`, `resume` e `relocate` aceitam `--json`, cuja saída não é agrupada. `list` e `scan` aceitam
 `--flat` para listar item por item, sem agrupar.
 
 ### backup
@@ -704,6 +777,7 @@ existe no Linux, a única plataforma com essa detecção.
 | `sqlite_snapshot` | Cópia consistente de bancos SQLite |
 | `convert` | Conversão de sessões entre Claude Code e Codex |
 | `search` | Busca no conteúdo das sessões |
+| `sessions` | Leitura das sessões, tokens, documentos, checagem de resume e relocate |
 | `discover`, `backup`, `config`, `claudepath`, `model` | Domínio do Claude Code e manifesto |
 | `cli`, `ui`, `tui` | Linha de comando, formatação e interface interativa |
 
