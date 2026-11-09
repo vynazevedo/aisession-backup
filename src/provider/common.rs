@@ -119,6 +119,25 @@ pub fn mtime(path: &Path) -> Option<DateTime<Utc>> {
     Some(modified.into())
 }
 
+pub fn last_timestamp(path: &Path) -> Option<DateTime<Utc>> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TAIL).read_to_end(&mut bytes).ok()?;
+    let mut lines: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    lines.iter().rev().find_map(|line| {
+        let value: Value = serde_json::from_slice(line).ok()?;
+        value.get("timestamp")?.as_str()?.parse().ok()
+    })
+}
+
 pub fn newest_mtime(home: &Path, files: &[ItemFile]) -> Option<DateTime<Utc>> {
     files
         .iter()
@@ -298,6 +317,25 @@ pub fn home_child(env: &super::LocateEnv, child: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn last_timestamp_reads_the_final_line_even_in_large_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        let mut body = String::new();
+        body.push_str("{\"timestamp\":\"2026-01-01T00:00:00Z\",\"pad\":\"");
+        body.push_str(&"x".repeat(200_000));
+        body.push_str("\"}\n");
+        body.push_str("{\"timestamp\":\"2026-03-04T05:06:07Z\"}\n");
+        body.push_str("not json\n");
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(
+            super::last_timestamp(&path).unwrap().to_rfc3339(),
+            "2026-03-04T05:06:07+00:00"
+        );
+        std::fs::write(&path, "{}\n").unwrap();
+        assert!(super::last_timestamp(&path).is_none());
+    }
+
     use super::*;
     use serde_json::json;
 
