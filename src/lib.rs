@@ -16,6 +16,7 @@ pub mod remap;
 pub mod remote;
 pub mod repo;
 pub mod safety;
+pub mod search;
 pub mod secrets;
 pub mod sqlite_snapshot;
 pub mod tui;

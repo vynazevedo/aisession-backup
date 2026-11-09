@@ -307,6 +307,28 @@ pub enum Commands {
         json: bool,
     },
     #[command(
+        about = "Search the content of Claude Code and Codex sessions",
+        long_about = "Search the content of Claude Code and Codex sessions.\n\nEvery word must appear in the session, in any order and case. Text injected by the tools is ignored. Nothing is indexed or copied: the sessions are read on demand."
+    )]
+    Search {
+        #[arg(value_name = "WORDS", required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(
+            short,
+            long,
+            help = "Comma-separated providers to search (claude,codex)"
+        )]
+        provider: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 20,
+            help = "Maximum number of sessions to show"
+        )]
+        limit: usize,
+        #[arg(long, help = "Output JSON to stdout")]
+        json: bool,
+    },
+    #[command(
         about = "Manage incremental backup repositories",
         long_about = "Manage incremental backup repositories.\n\nA repository stores deduplicated, compressed chunks and one small snapshot per backup. LOCATION is a directory or s3://bucket/prefix, with credentials from AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and an optional AISESSION_BACKUP_S3_ENDPOINT for R2 or MinIO."
     )]
@@ -500,6 +522,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             yes,
             json,
         }),
+        Commands::Search {
+            query,
+            provider,
+            limit,
+            json,
+        } => cmd_search(&query.join(" "), provider.as_deref(), limit, json),
         Commands::Repo { action } => cmd_repo(action),
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -756,6 +784,19 @@ pub(crate) fn resolve_decrypt_passphrase(path: &Path) -> Result<Passphrase> {
         return Ok(Passphrase::Value(pass));
     }
     Ok(Passphrase::None)
+}
+
+fn cmd_search(query: &str, provider: Option<&str>, limit: usize, json: bool) -> Result<()> {
+    let (_, ids) = parse_providers(provider, false)?;
+    let claude_dir = resolve_claude_dir(None);
+    let env = locate_env_with_claude(&claude_dir);
+    let hits = crate::search::search(query, &env, &ids, limit.clamp(1, 1000))?;
+    if json {
+        ui::print_json(&hits)
+    } else {
+        print!("{}", crate::search::format_hits(&hits, ui::color_stdout()));
+        Ok(())
+    }
 }
 
 #[derive(Subcommand, Debug)]
